@@ -169,6 +169,8 @@ module m_global_parameters
     integer :: perturb_sph_fluid    !< Fluid to be perturbed with perturb_sph flag
     real(wp), dimension(num_fluids_max) :: fluid_rho
 
+    real(wp), allocatable, dimension(:) :: chem_diffusion_coeffs
+
     logical :: elliptic_smoothing
     integer :: elliptic_smoothing_iters
 
@@ -880,6 +882,11 @@ contains
         chemxb = species_idx%beg
         chemxe = species_idx%end
 
+        if (chemistry) then
+            allocate(chem_diffusion_coeffs(num_species))
+            chem_diffusion_coeffs = 0._wp
+        end if
+
         call s_configure_coordinate_bounds(recon_type, weno_polyn, muscl_polyn, &
                                            igr_order, buff_size, &
                                            idwint, idwbuff, viscous, &
@@ -989,6 +996,10 @@ contains
             if (p > 0) then
                 deallocate (z_cc, z_cb)
             end if
+        end if
+
+        if (allocated(chem_diffusion_coeffs)) then
+            deallocate(chem_diffusion_coeffs)
         end if
 
         deallocate (proc_coords)
