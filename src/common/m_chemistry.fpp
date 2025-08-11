@@ -129,4 +129,35 @@ contains
 
     end subroutine s_compute_chemistry_reaction_flux
 
+    subroutine s_compute_chemistry_diffusion_flux(rhs_vf, q_cons_qp, q_T_sf, q_prim_qp, &
+        dq_prim_dx_qp, dq_prim_dy_qp, dq_prim_dz_qp, bounds)
+
+        type(scalar_field), dimension(sys_size), intent(inout) :: rhs_vf
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons_qp, q_prim_qp
+        type(scalar_field), intent(in) :: q_T_sf
+        type(vector_field), dimension(sys_size), intent(in) :: dq_prim_dx_qp, dq_prim_dy_qp, dq_prim_dz_qp
+        type(int_bounds_info), dimension(1:3), intent(in) :: bounds
+
+        integer :: x, y, z, eqn
+        real(wp) :: rho, D
+
+        $:GPU_PARALLEL_LOOP(collapse=3)
+        do z = bounds(3)%beg, bounds(3)%end
+            do y = bounds(2)%beg, bounds(2)%end
+                do x = bounds(1)%beg, bounds(1)%end
+                    rho = q_cons_qp(contxe)%sf(x, y, z)
+                    $:GPU_LOOP(parallelism='[seq]')
+                    do eqn = chemxb, chemxe
+                        D = chem_diffusion_coeffs(eqn - chemxb + 1)
+                        rhs_vf(eqn)%sf(x, y, z) = rhs_vf(eqn)%sf(x, y, z) + &
+                            rho*D*(dq_prim_dx_qp(eqn)%sf(x, y, z) + &
+                                   dq_prim_dy_qp(eqn)%sf(x, y, z) + &
+                                   dq_prim_dz_qp(eqn)%sf(x, y, z))
+                    end do
+                end do
+            end do
+        end do
+
+    end subroutine s_compute_chemistry_diffusion_flux
+
 end module m_chemistry
