@@ -456,6 +456,9 @@ module m_global_parameters
     type(chemistry_parameters) :: chem_params
     $:GPU_DECLARE(create='[chem_params]')
 
+    real(wp), allocatable, dimension(:) :: chem_diffusion_coeffs
+    $:GPU_DECLARE(create='[chem_diffusion_coeffs]')
+
     !> @name Physical bubble parameters (see Ando 2010, Preston 2007)
     !> @{
 

@@ -367,7 +367,7 @@ contains
             @:PROHIBIT(surface_tension .and. f_is_default(patch_icpp(i)%cf_val), &
                 "patch_icpp(i)%cf_val must be set if surface_tension is enabled")
         end do
-#endif MFC_PRE_PROCESS
+#endif
 
     end subroutine s_check_inputs_surface_tension
 
