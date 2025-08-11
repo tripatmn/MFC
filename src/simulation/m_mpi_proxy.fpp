@@ -128,6 +128,10 @@ contains
             #:for VAR in [ 'gamma_method' ]
                 call MPI_BCAST(chem_params%${VAR}$, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
             #:endfor
+
+            if (chem_params%diffusion) then
+                call MPI_BCAST(chem_diffusion_coeffs, chemxe - chemxb + 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
+            end if
         end if
 
         if (bubbles_lagrange) then

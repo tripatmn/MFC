@@ -966,6 +966,13 @@ contains
             end if
         end if
 
+        if (chemistry .and. chem_params%diffusion) then
+            call nvtxStartRange("RHS-CHEM-DIFFUSION")
+            call s_compute_chemistry_diffusion_flux(rhs_vf, q_cons_qp%vf, q_T_sf, q_prim_qp%vf, &
+                dq_prim_dx_qp, dq_prim_dy_qp, dq_prim_dz_qp, idwint)
+            call nvtxEndRange
+        end if
+
         if (chemistry .and. chem_params%reactions) then
             call nvtxStartRange("RHS-CHEM-REACTIONS")
             call s_compute_chemistry_reaction_flux(rhs_vf, q_cons_qp%vf, q_T_sf, q_prim_qp%vf, idwint)

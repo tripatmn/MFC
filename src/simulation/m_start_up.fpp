@@ -46,6 +46,7 @@ module m_start_up
     use m_rhs                  !< Right-hane-side (RHS) evaluation procedures
 
     use m_chemistry            !< Chemistry module
+    use m_thermochem, only: num_species, get_mix_diff_coeffs
 
     use m_data_output          !< Run-time info & solution data output procedures
 
@@ -1466,7 +1467,18 @@ contains
         ! parallel computational domain decomposition. Neither procedure has to be
         ! carried out if the simulation is in fact not truly executed in parallel.
 
+        if (chemistry .and. chem_params%diffusion) then
+            @:ALLOCATE(chem_diffusion_coeffs(num_species))
+            if (proc_rank == 0) then
+                call get_mix_diff_coeffs(dflt_T_guess, chem_diffusion_coeffs)
+            end if
+        end if
+
         call s_mpi_bcast_user_inputs()
+
+        if (chemistry .and. chem_params%diffusion) then
+            $:GPU_UPDATE(device='[chem_diffusion_coeffs]')
+        end if
 
         call s_initialize_parallel_io()
 

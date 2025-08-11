@@ -80,7 +80,7 @@ case = {
     "bc_x%end": -3,
     # Chemistry
     "chemistry": "F" if not args.chemistry else "T",
-    "chem_params%diffusion": "F",
+    "chem_params%diffusion": "T",
     "chem_params%reactions": "T",
     "cantera_file": ctfile,
     # Formatted Database Files Structure Parameters

@@ -964,6 +964,16 @@ When ``cyl_coord = 'T'`` is set in 2D the following constraints must be met:
 
 ## Enumerations
 
+### 17. Chemistry Parameters
+
+| Parameter               | Type    | Description                                         |
+| ---:                    | :----:  | :---                                                |
+| `chem_params%reactions` | Logical | Enable chemical reaction source terms               |
+| `chem_params%diffusion` | Logical | Enable Fickian species diffusion using Cantera data |
+
+Setting `chem_params%diffusion` to `T` activates computation of diffusion fluxes
+based on mixture-averaged coefficients provided by Cantera.
+
 ### Boundary conditions
 
 | #    | Type           | Description |
