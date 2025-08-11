@@ -144,6 +144,7 @@ module m_global_parameters
     integer :: c_idx                               !< Index of color function
     type(int_bounds_info) :: species_idx           !< Indexes of first & last concentration eqns.
     integer :: damage_idx                          !< Index of damage state variable (D) for continuum damage model
+    real(wp), allocatable, dimension(:) :: chem_diffusion_coeffs
     !> @}
 
     ! Cell Indices for the (local) interior points (O-m, O-n, 0-p).
@@ -761,6 +762,8 @@ contains
             species_idx%beg = sys_size + 1
             species_idx%end = sys_size + num_species
             sys_size = species_idx%end
+            allocate(chem_diffusion_coeffs(num_species))
+            chem_diffusion_coeffs = 0._wp
         else
             species_idx%beg = 1
             species_idx%end = 1
@@ -966,6 +969,10 @@ contains
             ! Deallocating the grid variables, only used for the 1D simulations,
             ! and containing the defragmented computational domain grid data
             deallocate (x_root_cb, x_root_cc)
+        end if
+
+        if (allocated(chem_diffusion_coeffs)) then
+            deallocate(chem_diffusion_coeffs)
         end if
 
         deallocate (proc_coords)
