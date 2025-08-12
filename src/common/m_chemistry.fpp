@@ -153,6 +153,7 @@ contains
                             rho*D*(dq_prim_dx_qp(1)%vf(eqn)%sf(x, y, z) + &
                                    dq_prim_dy_qp(1)%vf(eqn)%sf(x, y, z) + &
                                    dq_prim_dz_qp(1)%vf(eqn)%sf(x, y, z))
+
                     end do
                 end do
             end do
