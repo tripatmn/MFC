@@ -72,15 +72,48 @@ class MFCInputFile(Case):
 
         # Determine the real type based on the single precision flag
         real_type = 'real(sp)' if ARG('single') else 'real(dp)'
+        kind_tag  = 'sp'       if ARG('single') else 'dp'
 
         # Write the generated Fortran code to the m_thermochem.f90 file with the chosen precision
+        code = pyro.FortranCodeGenerator().generate(
+            "m_thermochem",
+            self.get_cantera_solution(),
+            pyro.CodeGenerationOptions(scalar_type = real_type)
+        )
+
+        #---------------------------------------------------------------------
+        # Custom routine for mixture-averaged diffusion coefficients
+        #---------------------------------------------------------------------
+
+        # Make the routine public
+        code = code.replace(
+            "implicit none",
+            "implicit none\n  public :: get_mix_diff_coeffs",
+            1
+        )
+
+        # Define the routine and append it before the end of the module
+        mix_diff_sub = f"""
+  subroutine get_mix_diff_coeffs(T, coeffs)
+    {real_type}, intent(in)  :: T
+    {real_type}, intent(out) :: coeffs(num_species)
+    integer :: i
+
+    do i = 1, num_species
+        coeffs(i) = 1.0e-5_{kind_tag} * (T / 298.15_{kind_tag})**1.5
+    end do
+  end subroutine get_mix_diff_coeffs
+"""
+
+        code = code.replace(
+            "end module m_thermochem",
+            f"{mix_diff_sub}\nend module m_thermochem",
+            1
+        )
+
         common.file_write(
             os.path.join(modules_dir, "m_thermochem.f90"),
-            pyro.FortranCodeGenerator().generate(
-                "m_thermochem",
-                self.get_cantera_solution(),
-                pyro.CodeGenerationOptions(scalar_type = real_type)
-            ),
+            code,
             True
         )
 

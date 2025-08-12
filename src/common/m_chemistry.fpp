@@ -135,7 +135,7 @@ contains
         type(scalar_field), dimension(sys_size), intent(inout) :: rhs_vf
         type(scalar_field), dimension(sys_size), intent(in) :: q_cons_qp, q_prim_qp
         type(scalar_field), intent(in) :: q_T_sf
-        type(vector_field), dimension(sys_size), intent(in) :: dq_prim_dx_qp, dq_prim_dy_qp, dq_prim_dz_qp
+        type(vector_field), dimension(1), intent(in) :: dq_prim_dx_qp, dq_prim_dy_qp, dq_prim_dz_qp
         type(int_bounds_info), dimension(1:3), intent(in) :: bounds
 
         integer :: x, y, z, eqn
@@ -150,9 +150,9 @@ contains
                     do eqn = chemxb, chemxe
                         D = chem_diffusion_coeffs(eqn - chemxb + 1)
                         rhs_vf(eqn)%sf(x, y, z) = rhs_vf(eqn)%sf(x, y, z) + &
-                           rho*D*(dq_prim_dx_qp(eqn)%sf(x, y, z) + &
-                                   dq_prim_dy_qp(eqn)%sf(x, y, z) + &
-                                   dq_prim_dz_qp(eqn)%sf(x, y, z))
+                            rho*D*(dq_prim_dx_qp(1)%vf(eqn)%sf(x, y, z) + &
+                                   dq_prim_dy_qp(1)%vf(eqn)%sf(x, y, z) + &
+                                   dq_prim_dz_qp(1)%vf(eqn)%sf(x, y, z))
 
                     end do
                 end do
