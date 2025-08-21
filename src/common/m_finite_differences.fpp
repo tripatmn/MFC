@@ -1,5 +1,3 @@
-#:include 'macros.fpp'
-
 module m_finite_differences
 
     use m_global_parameters
@@ -17,8 +15,7 @@ contains
         integer :: x, y, z !< Generic loop iterators
 
         real(wp) :: divergence
-
-        $:GPU_PARALLEL_LOOP(collapse=3, private='[divergence]')
+        !$acc parallel loop collapse(3) gang vector default(present) private(divergence)
         do x = ix_s%beg, ix_s%end
             do y = iy_s%beg, iy_s%end
                 do z = iz_s%beg, iz_s%end
@@ -69,17 +66,17 @@ contains
     !!  @param q Number of cells in the s-coordinate direction
     !!  @param s_cc Locations of the cell-centers in the s-coordinate direction
     !!  @param fd_coeff_s Finite-diff. coefficients in the s-coordinate direction
-    pure subroutine s_compute_finite_difference_coefficients(q, s_cc, fd_coeff_s, local_buff_size, &
+    pure subroutine s_compute_finite_difference_coefficients(q, s_cc, fd_coeff_s, buff_size, &
                                                              fd_number_in, fd_order_in, offset_s)
 
         integer :: lB, lE !< loop bounds
         integer, intent(IN) :: q
-        integer, intent(IN) :: local_buff_size, fd_number_in, fd_order_in
+        integer, intent(IN) :: buff_size, fd_number_in, fd_order_in
         type(int_bounds_info), optional, intent(IN) :: offset_s
         real(wp), allocatable, dimension(:, :), intent(INOUT) :: fd_coeff_s
 
         real(wp), &
-            dimension(-local_buff_size:q + local_buff_size), &
+            dimension(-buff_size:q + buff_size), &
             intent(IN) :: s_cc
 
         integer :: i !< Generic loop iterator

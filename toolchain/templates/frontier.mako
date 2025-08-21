@@ -44,12 +44,6 @@ echo
     export MPICH_GPU_SUPPORT_ENABLED=0
 % endif
 
-%if unified:
-    export CRAY_ACC_USE_UNIFIED_MEM=1
-% endif
-
-ulimit -s unlimited
-
 % for target in targets:
     ${helpers.run_prologue(target)}
 
@@ -62,7 +56,7 @@ ulimit -s unlimited
     % else:
         (set -x; srun \
         % if engine == 'interactive':
-                --unbuffered --nodes ${nodes} --ntasks-per-node ${tasks_per_node} \
+                --nodes ${nodes} --ntasks-per-node ${tasks_per_node} \
                 --cpus-per-task 7                                    \
             % if gpu:
                 --gpus-per-task 1 --gpu-bind closest                 \

@@ -35,11 +35,3 @@
   path: benchmarks/hypo_hll/case.py
   args: []
 
-# Benchmark igr_T_viscous_T
-# Additional Benchmarked Features
-# - igr : T
-# - viscous : T
-# - igr_order : 5
-- slug: igr
-  path: benchmarks/igr/case.py
-  args: []

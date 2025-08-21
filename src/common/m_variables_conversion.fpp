@@ -4,6 +4,12 @@
 
 #:include 'macros.fpp'
 #:include 'case.fpp'
+#:if 'GPU_DECLARE' not in MACROS
+#:def GPU_DECLARE(create=None, destroy=None)
+#:
+#:enddef
+#:endif
+
 
 !> @brief This module consists of subroutines used in the conversion of the
 !!              conservative variables into the primitive ones and vice versa. In
@@ -969,7 +975,7 @@ contains
                             f = W - pres + (1 - 1/(2*Ga**2))*B2 - S**2/(2*W**2) - E - D
 
                             ! The first equation below corrects a typo in (Mignone & Bodo, 2006)
-                            ! m2*W**2 → 2*m2*W**2, which would cancel with the 2* in other terms
+                            ! m2*W**2 ? 2*m2*W**2, which would cancel with the 2* in other terms
                             ! This corrected version is not used as the second equation empirically converges faster.
                             ! First equation is kept for further investigation.
                             ! dGa_dW = -Ga**3 * ( S**2*(3*W**2+3*W*B2+B2**2) + m2*W**2 ) / (W**3 * (W+B2)**3) ! first (corrected)
@@ -1639,12 +1645,11 @@ contains
         real(wp), intent(out) :: c
 
         real(wp) :: blkmod1, blkmod2
-        real(wp) :: Tolerance
 
         integer :: q
 
         if (chemistry) then
-            if (avg_state == 1 .and. abs(c_c) > Tolerance) then
+            if (avg_state == 1 .and. abs(c_c) > verysmall) then
                 c = sqrt(c_c - (gamma - 1.0_wp)*(vel_sum - H))
             else
                 c = sqrt((1.0_wp + 1.0_wp/gamma)*pres/rho)

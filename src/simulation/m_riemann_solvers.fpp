@@ -646,6 +646,9 @@ contains
                             end if
 
                             if (viscous) then
+                                if (chemistry) then
+                                    call compute_viscosity_and_inversion(T_L, Ys_L, T_R, Ys_R, Re_L(1), Re_R(1))
+                                end if
                                 $:GPU_LOOP(parallelism='[seq]')
                                 do i = 1, 2
                                     Re_avg_rs${XYZ}$_vf(j, k, l, i) = 2._wp/(1._wp/Re_L(i) + 1._wp/Re_R(i))
@@ -2595,6 +2598,9 @@ contains
                                                               vel_avg_rms, c_sum_Yi_Phi, c_avg)
 
                                 if (viscous) then
+                                    if (chemistry) then
+                                        call compute_viscosity_and_inversion(T_L, Ys_L, T_R, Ys_R, Re_L(1), Re_R(1))
+                                    end if
                                     $:GPU_LOOP(parallelism='[seq]')
                                     do i = 1, 2
                                         Re_avg_rs${XYZ}$_vf(j, k, l, i) = 2._wp/(1._wp/Re_L(i) + 1._wp/Re_R(i))
@@ -2902,7 +2908,7 @@ contains
     end subroutine s_hllc_riemann_solver
 
     !> HLLD Riemann solver resolves 5 of the 7 waves of MHD equations:
-        !!      1 entropy wave, 2 AlfvÃ©n waves, 2 fast magnetosonic waves.
+        !!      1 entropy wave, 2 Alfvén waves, 2 fast magnetosonic waves.
     subroutine s_hlld_riemann_solver(qL_prim_rsx_vf, qL_prim_rsy_vf, qL_prim_rsz_vf, &
                                      dqL_prim_dx_vf, dqL_prim_dy_vf, dqL_prim_dz_vf, &
                                      qL_prim_vf, &
@@ -3083,15 +3089,15 @@ contains
                             ! Compute the star flux using HLL relation
                             F_starL = F_L + s_L*(U_starL - U_L)
                             F_starR = F_R + s_R*(U_starR - U_R)
-                            ! Compute the rotational (AlfvÃ©n) speeds
+                            ! Compute the rotational (Alfvén) speeds
                             s_starL = s_M - abs(B%L(1))/sqrt(rhoL_star)
                             s_starR = s_M + abs(B%L(1))/sqrt(rhoR_star)
-                            ! Compute the doubleâ€“star states [Miyoshi Eqns. (59)-(62)]
+                            ! Compute the double–star states [Miyoshi Eqns. (59)-(62)]
                             sqrt_rhoL_star = sqrt(rhoL_star); sqrt_rhoR_star = sqrt(rhoR_star)
                             vL_star = vel%L(2); wL_star = vel%L(3)
                             vR_star = vel%R(2); wR_star = vel%R(3)
 
-                            ! (6) Compute the doubleâ€“star states [Miyoshi Eqns. (59)-(62)]
+                            ! (6) Compute the double–star states [Miyoshi Eqns. (59)-(62)]
                             denom_ds = sqrt_rhoL_star + sqrt_rhoR_star
                             sign_Bx = sign(1._wp, B%L(1))
                             v_double = (sqrt_rhoL_star*vL_star + sqrt_rhoR_star*vR_star + (B%R(2) - B%L(2))*sign_Bx)/denom_ds
@@ -3702,6 +3708,21 @@ contains
                 end do
             end if
 
+            if (chem_params%diffusion) then
+                $:GPU_PARALLEL_LOOP(collapse=4)
+                do i = E_idx, chemxe
+                    do l = is3%beg, is3%end
+                        do k = is2%beg, is2%end
+                            do j = is1%beg, is1%end
+                                if (i == E_idx .or. i >= chemxb) then
+                                    flux_src_vf(i)%sf(j, k, l) = 0._wp
+                                end if
+                            end do
+                        end do
+                    end do
+                end do
+            end if
+
             if (qbmm) then
 
                 $:GPU_PARALLEL_LOOP(collapse=4)
@@ -3732,6 +3753,21 @@ contains
                 end do
             end if
 
+            if (chem_params%diffusion) then
+                $:GPU_PARALLEL_LOOP(collapse=4)
+                do i = E_idx, chemxe
+                    do l = is3%beg, is3%end
+                        do j = is1%beg, is1%end
+                            do k = is2%beg, is2%end
+                                if (i == E_idx .or. i >= chemxb) then
+                                    flux_src_vf(i)%sf(k, j, l) = 0._wp
+                                end if
+                            end do
+                        end do
+                    end do
+                end do
+            end if
+
             if (qbmm) then
                 $:GPU_PARALLEL_LOOP(collapse=4)
                 do i = 1, 4
@@ -3755,6 +3791,21 @@ contains
                         do k = is2%beg, is2%end
                             do l = is3%beg, is3%end
                                 flux_src_vf(i)%sf(l, k, j) = 0._wp
+                            end do
+                        end do
+                    end do
+                end do
+            end if
+
+            if (chem_params%diffusion) then
+                $:GPU_PARALLEL_LOOP(collapse=4)
+                do i = E_idx, chemxe
+                    do j = is1%beg, is1%end
+                        do k = is2%beg, is2%end
+                            do l = is3%beg, is3%end
+                                if (i == E_idx .or. i >= chemxb) then
+                                    flux_src_vf(i)%sf(l, k, j) = 0._wp
+                                end if
                             end do
                         end do
                     end do

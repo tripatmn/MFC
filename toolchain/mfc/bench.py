@@ -125,6 +125,7 @@ def diff():
             if not math.isfinite(lhs_summary[target.name]["exec"]) or not math.isfinite(rhs_summary[target.name]["exec"]):
                 err = 1
                 cons.print(f"lhs_summary or rhs_summary reports non-real exec time for {target.name} - Case: {slug}")
+
             try:
                 exec_time_value = lhs_summary[target.name]["exec"] / rhs_summary[target.name]["exec"]
                 if exec_time_value < 0.9:
@@ -138,10 +139,10 @@ def diff():
                     grind_time_value = lhs_summary[target.name]["grind"] / rhs_summary[target.name]["grind"]
                     speedups[i] += f" & Grind: {grind_time_value:.2f}"
                     if grind_time_value <0.95:
-                        cons.print(f"[bold red]Error[/bold red]: Benchmarking failed since grind time speedup for {target.name} below acceptable threshold (<0.95) - Case: {slug}")
-                        err = 1
+                        raise MFCException(f"Benchmarking failed since grind time speedup for {target.name} below acceptable threshold (<0.98) - Case: {slug}")
             except Exception as _:
-                pass
+                err = 1
+                cons.print(f"lhs_summary or rhs_summary reports non-real grind time for {target.name} - Case: {slug}")
 
         table.add_row(f"[magenta]{slug}[/magenta]", *speedups)
 

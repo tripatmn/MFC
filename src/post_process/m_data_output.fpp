@@ -105,7 +105,7 @@ module m_data_output
 
     ! Generic error flags utilized in the handling, checking and the reporting
     ! of the input and output operations errors with a formatted database file
-    integer, private :: err
+    integer, private :: err, ierr
 
 contains
 
@@ -477,8 +477,6 @@ contains
         ! Generic string used to store the location of a particular file
         character(LEN=len_trim(case_dir) + 3*name_len) :: file_loc
 
-        integer :: ierr !< Generic flag used to identify and report database errors
-
         ! Silo-HDF5 Database Format
 
         if (format == 1) then
@@ -651,8 +649,6 @@ contains
 
         ! Generic loop iterator
         integer :: i
-
-        integer :: ierr !< Generic flag used to identify and report database errors
 
         ! Silo-HDF5 Database Format
 
@@ -863,8 +859,6 @@ contains
 
         ! Generic loop iterator
         integer :: i, j, k
-
-        integer :: ierr !< Generic flag used to identify and report database errors
 
         ! Silo-HDF5 Database Format
 
@@ -1112,8 +1106,7 @@ contains
         logical :: lg_bub_file, file_exist
 
         integer, dimension(2) :: gsizes, lsizes, start_idx_part
-        integer :: ifile, tot_data
-        integer :: ierr !< Generic flag used to identify and report MPI errors
+        integer :: ifile, ierr, tot_data
         integer :: i
 
         write (file_loc, '(A,I0,A)') 'lag_bubbles_mpi_io_', t_step, '.dat'
@@ -1336,7 +1329,7 @@ contains
                         rho = rho + adv(l)*q_prim_vf(l)%sf(i, j, k)
                     end do
 
-                    H = ((gamma + 1._wp)*pres + pi_inf)/rho
+                    H = ((gamma + 1_wp)*pres + pi_inf)/rho
 
                     call s_compute_speed_of_sound(pres, rho, &
                                                   gamma, pi_inf, &
@@ -1398,8 +1391,6 @@ contains
         !              only has to close the file associated with the local sub-
         !              domain, because one associated with the entire domain is
         !              not generated.
-
-        integer :: ierr !< Generic flag used to identify and report database errors
 
         ! Silo-HDF5 database format
         if (format == 1) then

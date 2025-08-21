@@ -1,4 +1,5 @@
 # Rayleigh-Taylor Instability (2D)
 
 ## Final Condition and Linear Theory
-<img src='result.png' height='MAX_HEIGHT'/>
+<img src='final_condition.png' height='MAX_HEIGHT'/>
+<img src='linear_theory.png' height='MAX_HEIGHT'/>

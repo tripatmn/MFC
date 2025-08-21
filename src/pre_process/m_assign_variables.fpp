@@ -3,7 +3,6 @@
 !! @brief Contains module m_assign_variables
 
 #:include 'case.fpp'
-#:include 'macros.fpp'
 
 module m_assign_variables
 
@@ -104,7 +103,7 @@ contains
         !! @param patch_id_fp Array to track patch ids
     pure subroutine s_assign_patch_mixture_primitive_variables(patch_id, j, k, l, &
                                                                eta, q_prim_vf, patch_id_fp)
-        $:GPU_ROUTINE(parallelism='[seq]')
+        !$acc routine seq
 
         integer, intent(in) :: patch_id
         integer, intent(in) :: j, k, l
@@ -182,7 +181,7 @@ contains
         end if
 
         ! Updating the patch identities bookkeeping variable
-        if (1._wp - eta < 1.e-16_wp) patch_id_fp(j, k, l) = patch_id
+        if (1._wp - eta < 1e-16_wp) patch_id_fp(j, k, l) = patch_id
 
     end subroutine s_assign_patch_mixture_primitive_variables
 
@@ -200,8 +199,8 @@ contains
         real(wp) :: pres_mag, loc, n_tait, B_tait, p0
         real(wp) :: R3bar, n0, ratio, nH, vfH, velH, rhoH, deno
 
-        p0 = 101325._wp
-        pres_mag = 1.e-1_wp
+        p0 = 101325
+        pres_mag = 1e-1_wp
         loc = x_cc(177)
         n_tait = fluid_pp(1)%gamma
         B_tait = fluid_pp(1)%pi_inf
@@ -215,7 +214,7 @@ contains
 
         if (qbmm) then
             do i = 1, nb
-                q_prim_vf(bubxb + 1 + (i - 1)*nmom)%sf(j, k, l) = q_prim_vf(bubxb + 1 + (i - 1)*nmom)%sf(j, k, l)*((p0 - fluid_pp(1)%pv)/(q_prim_vf(E_idx)%sf(j, k, l)*p0 - fluid_pp(1)%pv))**(1._wp/3._wp)
+                q_prim_vf(bubxb + 1 + (i - 1)*nmom)%sf(j, k, l) = q_prim_vf(bubxb + 1 + (i - 1)*nmom)%sf(j, k, l)*((p0 - fluid_pp(1)%pv)/(q_prim_vf(E_idx)%sf(j, k, l)*p0 - fluid_pp(1)%pv))**(1/3._wp)
             end do
         end if
 
@@ -277,7 +276,7 @@ contains
         !! @param patch_id_fp Array to track patch ids
     impure subroutine s_assign_patch_species_primitive_variables(patch_id, j, k, l, &
                                                                  eta, q_prim_vf, patch_id_fp)
-        $:GPU_ROUTINE(parallelism='[seq]')
+        !$acc routine seq
 
         integer, intent(in) :: patch_id
         integer, intent(in) :: j, k, l
@@ -341,12 +340,10 @@ contains
 
         ! Computing Mixture Variables of Current Patch
 
-        if (.not. igr .or. num_fluids > 1) then
-            ! Volume fraction(s)
-            do i = adv_idx%beg, adv_idx%end
-                q_prim_vf(i)%sf(j, k, l) = patch_icpp(patch_id)%alpha(i - E_idx)
-            end do
-        end if
+        ! Volume fraction(s)
+        do i = adv_idx%beg, adv_idx%end
+            q_prim_vf(i)%sf(j, k, l) = patch_icpp(patch_id)%alpha(i - E_idx)
+        end do
 
         if (mpp_lim .and. bubbles_euler) then
             !adjust volume fractions, according to modeled gas void fraction
@@ -386,12 +383,10 @@ contains
             end do
         end if
 
-        if (.not. igr .or. num_fluids > 1) then
-            ! Volume fraction(s)
-            do i = adv_idx%beg, adv_idx%end
-                q_prim_vf(i)%sf(j, k, l) = patch_icpp(smooth_patch_id)%alpha(i - E_idx)
-            end do
-        end if
+        ! Volume fraction(s)
+        do i = adv_idx%beg, adv_idx%end
+            q_prim_vf(i)%sf(j, k, l) = patch_icpp(smooth_patch_id)%alpha(i - E_idx)
+        end do
 
         if (mpp_lim .and. bubbles_euler) then
             !adjust volume fractions, according to modeled gas void fraction
@@ -409,8 +404,8 @@ contains
         ! Bubbles euler variables
         if (bubbles_euler) then
             do i = 1, nb
-                muR = R0(i)*patch_icpp(smooth_patch_id)%r0
-                muV = patch_icpp(smooth_patch_id)%v0
+                muR = R0(i)*patch_icpp(smooth_patch_id)%r0 ! = R0(i)
+                muV = V0(i)*patch_icpp(smooth_patch_id)%v0 ! = 0
                 if (qbmm) then
                     ! Initialize the moment set
                     if (dist_type == 1) then
@@ -462,14 +457,12 @@ contains
             (eta*patch_icpp(patch_id)%pres &
              + (1._wp - eta)*orig_prim_vf(E_idx))
 
-        if (.not. igr .or. num_fluids > 1) then
-            ! Volume fractions \alpha
-            do i = adv_idx%beg, adv_idx%end
-                q_prim_vf(i)%sf(j, k, l) = &
-                    eta*patch_icpp(patch_id)%alpha(i - E_idx) &
-                    + (1._wp - eta)*orig_prim_vf(i)
-            end do
-        end if
+        ! Volume fractions \alpha
+        do i = adv_idx%beg, adv_idx%end
+            q_prim_vf(i)%sf(j, k, l) = &
+                eta*patch_icpp(patch_id)%alpha(i - E_idx) &
+                + (1._wp - eta)*orig_prim_vf(i)
+        end do
 
         if (mhd) then
             if (n == 0) then ! 1D: By, Bz
@@ -616,8 +609,8 @@ contains
         ! Smoothed bubble variables
         if (bubbles_euler) then
             do i = 1, nb
-                muR = R0(i)*patch_icpp(patch_id)%r0
-                muV = patch_icpp(patch_id)%v0
+                muR = R0(i)*patch_icpp(patch_id)%r0 ! = 1*R0(i)
+                muV = V0(i)*patch_icpp(patch_id)%v0 ! = 1*V0(i)
                 if (qbmm) then
                     ! Initialize the moment set
                     if (dist_type == 1) then
@@ -636,6 +629,12 @@ contains
                         q_prim_vf(bub_idx%fullmom(i, 0, 2))%sf(j, k, l) = muV**2 + sigV**2
                     end if
                 else
+                    ! q_prim_vf(bub_idx%rs(i))%sf(j,k,l) = &
+                    !     (eta * R0(i)*patch_icpp(patch_id)%r0 &
+                    !     + (1._wp-eta)*orig_prim_vf(bub_idx%rs(i)))
+                    ! q_prim_vf(bub_idx%vs(i))%sf(j,k,l) = &
+                    !     (eta * V0(i)*patch_icpp(patch_id)%v0 &
+                    !     + (1._wp-eta)*orig_prim_vf(bub_idx%vs(i)))
                     q_prim_vf(bub_idx%rs(i))%sf(j, k, l) = muR
                     q_prim_vf(bub_idx%vs(i))%sf(j, k, l) = muV
 
@@ -688,7 +687,7 @@ contains
         end if
 
         ! Updating the patch identities bookkeeping variable
-        if (1._wp - eta < 1.e-16_wp) patch_id_fp(j, k, l) = patch_id
+        if (1._wp - eta < 1e-16_wp) patch_id_fp(j, k, l) = patch_id
 
     end subroutine s_assign_patch_species_primitive_variables
 

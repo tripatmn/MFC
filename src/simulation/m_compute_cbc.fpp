@@ -2,8 +2,6 @@
 !! @file m_compute_cbc.f90
 !! @brief CBC computation module
 
-#:include 'macros.fpp'
-
 module m_compute_cbc
     use m_global_parameters
     implicit none
@@ -20,7 +18,7 @@ module m_compute_cbc
 contains
     !> Base L1 calculation
     pure function f_base_L1(lambda, rho, c, dpres_ds, dvel_ds) result(L1)
-        $:GPU_ROUTINE(parallelism='[seq]')
+        !$acc routine seq
         real(wp), dimension(3), intent(in) :: lambda
         real(wp), intent(in) :: rho, c, dpres_ds
         real(wp), dimension(num_dims), intent(in) :: dvel_ds
@@ -30,7 +28,7 @@ contains
 
     !> Fill density L variables
     pure subroutine s_fill_density_L(L, lambda_factor, lambda2, c, mf, dalpha_rho_ds, dpres_ds)
-        $:GPU_ROUTINE(parallelism='[seq]')
+        !$acc routine seq
         real(wp), dimension(sys_size), intent(inout) :: L
         real(wp), intent(in) :: lambda_factor, lambda2, c
         real(wp), dimension(num_fluids), intent(in) :: mf, dalpha_rho_ds
@@ -44,7 +42,7 @@ contains
 
     !> Fill velocity L variables
     pure subroutine s_fill_velocity_L(L, lambda_factor, lambda2, dvel_ds)
-        $:GPU_ROUTINE(parallelism='[seq]')
+        !$acc routine seq
         real(wp), dimension(sys_size), intent(inout) :: L
         real(wp), intent(in) :: lambda_factor, lambda2
         real(wp), dimension(num_dims), intent(in) :: dvel_ds
@@ -57,7 +55,7 @@ contains
 
     !> Fill advection L variables
     pure subroutine s_fill_advection_L(L, lambda_factor, lambda2, dadv_ds)
-        $:GPU_ROUTINE(parallelism='[seq]')
+        !$acc routine seq
         real(wp), dimension(sys_size), intent(inout) :: L
         real(wp), intent(in) :: lambda_factor, lambda2
         real(wp), dimension(num_fluids), intent(in) :: dadv_ds
@@ -70,7 +68,7 @@ contains
 
     !> Fill chemistry L variables
     pure subroutine s_fill_chemistry_L(L, lambda_factor, lambda2, dYs_ds)
-        $:GPU_ROUTINE(parallelism='[seq]')
+        !$acc routine seq
         real(wp), dimension(sys_size), intent(inout) :: L
         real(wp), intent(in) :: lambda_factor, lambda2
         real(wp), dimension(num_species), intent(in) :: dYs_ds
@@ -85,9 +83,11 @@ contains
 
     !> Slip wall CBC (Thompson 1990, pg. 451)
     pure subroutine s_compute_slip_wall_L(lambda, L, rho, c, dpres_ds, dvel_ds)
-        $:GPU_ROUTINE(function_name='s_compute_slip_wall_L',parallelism='[seq]', &
-            & cray_inline=True)
-
+#ifdef _CRAYFTN
+        !DIR$ INLINEALWAYS s_compute_slip_wall_L
+#else
+        !$acc routine seq
+#endif
         real(wp), dimension(3), intent(in) :: lambda
         real(wp), dimension(sys_size), intent(inout) :: L
         real(wp), intent(in) :: rho, c, dpres_ds
@@ -101,9 +101,11 @@ contains
 
     !> Nonreflecting subsonic buffer CBC (Thompson 1987, pg. 13)
     pure subroutine s_compute_nonreflecting_subsonic_buffer_L(lambda, L, rho, c, mf, dalpha_rho_ds, dpres_ds, dvel_ds, dadv_ds, dYs_ds)
-        $:GPU_ROUTINE(function_name='s_compute_nonreflecting_subsonic_buffer_L', &
-            & parallelism='[seq]', cray_inline=True)
-
+#ifdef _CRAYFTN
+        !DIR$ INLINEALWAYS s_compute_nonreflecting_subsonic_buffer_L
+#else
+        !$acc routine seq
+#endif
         real(wp), dimension(3), intent(in) :: lambda
         real(wp), dimension(sys_size), intent(inout) :: L
         real(wp), intent(in) :: rho, c
@@ -114,24 +116,26 @@ contains
         real(wp), dimension(num_species), intent(in) :: dYs_ds
         real(wp) :: lambda_factor
 
-        lambda_factor = (5.e-1_wp - 5.e-1_wp*sign(1._wp, lambda(1)))
+        lambda_factor = (5e-1_wp - 5e-1_wp*sign(1._wp, lambda(1)))
         L(1) = lambda_factor*lambda(1)*(dpres_ds - rho*c*dvel_ds(dir_idx(1)))
 
-        lambda_factor = (5.e-1_wp - 5.e-1_wp*sign(1._wp, lambda(2)))
+        lambda_factor = (5e-1_wp - 5e-1_wp*sign(1._wp, lambda(2)))
         call s_fill_density_L(L, lambda_factor, lambda(2), c, mf, dalpha_rho_ds, dpres_ds)
         call s_fill_velocity_L(L, lambda_factor, lambda(2), dvel_ds)
         call s_fill_advection_L(L, lambda_factor, lambda(2), dadv_ds)
         call s_fill_chemistry_L(L, lambda_factor, lambda(2), dYs_ds)
 
-        lambda_factor = (5.e-1_wp - 5.e-1_wp*sign(1._wp, lambda(3)))
+        lambda_factor = (5e-1_wp - 5e-1_wp*sign(1._wp, lambda(3)))
         L(advxe) = lambda_factor*lambda(3)*(dpres_ds + rho*c*dvel_ds(dir_idx(1)))
     end subroutine s_compute_nonreflecting_subsonic_buffer_L
 
     !> Nonreflecting subsonic inflow CBC (Thompson 1990, pg. 455)
     pure subroutine s_compute_nonreflecting_subsonic_inflow_L(lambda, L, rho, c, dpres_ds, dvel_ds)
-        $:GPU_ROUTINE(function_name='s_compute_nonreflecting_subsonic_inflow_L', &
-            & parallelism='[seq]', cray_inline=True)
-
+#ifdef _CRAYFTN
+        !DIR$ INLINEALWAYS s_compute_nonreflecting_subsonic_inflow_L
+#else
+        !$acc routine seq
+#endif
         real(wp), dimension(3), intent(in) :: lambda
         real(wp), dimension(sys_size), intent(inout) :: L
         real(wp), intent(in) :: rho, c, dpres_ds
@@ -144,9 +148,11 @@ contains
 
     !> Nonreflecting subsonic outflow CBC (Thompson 1990, pg. 454)
     pure subroutine s_compute_nonreflecting_subsonic_outflow_L(lambda, L, rho, c, mf, dalpha_rho_ds, dpres_ds, dvel_ds, dadv_ds, dYs_ds)
-        $:GPU_ROUTINE(function_name='s_compute_nonreflecting_subsonic_outflow_L', &
-            & parallelism='[seq]', cray_inline=True)
-
+#ifdef _CRAYFTN
+        !DIR$ INLINEALWAYS s_compute_nonreflecting_subsonic_outflow_L
+#else
+        !$acc routine seq
+#endif
         real(wp), dimension(3), intent(in) :: lambda
         real(wp), dimension(sys_size), intent(inout) :: L
         real(wp), intent(in) :: rho, c
@@ -166,9 +172,11 @@ contains
 
     !> Force-free subsonic outflow CBC (Thompson 1990, pg. 454)
     pure subroutine s_compute_force_free_subsonic_outflow_L(lambda, L, rho, c, mf, dalpha_rho_ds, dpres_ds, dvel_ds, dadv_ds)
-        $:GPU_ROUTINE(function_name='s_compute_force_free_subsonic_outflow_L', &
-            & parallelism='[seq]', cray_inline=True)
-
+#ifdef _CRAYFTN
+        !DIR$ INLINEALWAYS s_compute_force_free_subsonic_outflow_L
+#else
+        !$acc routine seq
+#endif
         real(wp), dimension(3), intent(in) :: lambda
         real(wp), dimension(sys_size), intent(inout) :: L
         real(wp), intent(in) :: rho, c
@@ -186,9 +194,11 @@ contains
 
     !> Constant pressure subsonic outflow CBC (Thompson 1990, pg. 455)
     pure subroutine s_compute_constant_pressure_subsonic_outflow_L(lambda, L, rho, c, mf, dalpha_rho_ds, dpres_ds, dvel_ds, dadv_ds)
-        $:GPU_ROUTINE(function_name='s_compute_constant_pressure_subsonic_outflow_L', &
-            & parallelism='[seq]', cray_inline=True)
-
+#ifdef _CRAYFTN
+        !DIR$ INLINEALWAYS s_compute_constant_pressure_subsonic_outflow_L
+#else
+        !$acc routine seq
+#endif
         real(wp), dimension(3), intent(in) :: lambda
         real(wp), dimension(sys_size), intent(inout) :: L
         real(wp), intent(in) :: rho, c
@@ -206,9 +216,11 @@ contains
 
     !> Supersonic inflow CBC (Thompson 1990, pg. 453)
     pure subroutine s_compute_supersonic_inflow_L(L)
-        $:GPU_ROUTINE(function_name='s_compute_supersonic_inflow_L', &
-            & parallelism='[seq]', cray_inline=True)
-
+#ifdef _CRAYFTN
+        !DIR$ INLINEALWAYS s_compute_supersonic_inflow_L
+#else
+        !$acc routine seq
+#endif
         real(wp), dimension(sys_size), intent(inout) :: L
         L(1:advxe) = 0._wp
         if (chemistry) L(chemxb:chemxe) = 0._wp
@@ -216,9 +228,11 @@ contains
 
     !> Supersonic outflow CBC (Thompson 1990, pg. 453)
     pure subroutine s_compute_supersonic_outflow_L(lambda, L, rho, c, mf, dalpha_rho_ds, dpres_ds, dvel_ds, dadv_ds, dYs_ds)
-        $:GPU_ROUTINE(function_name='s_compute_supersonic_outflow_L', &
-            & parallelism='[seq]', cray_inline=True)
-
+#ifdef _CRAYFTN
+        !DIR$ INLINEALWAYS s_compute_supersonic_outflow_L
+#else
+        !$acc routine seq
+#endif
         real(wp), dimension(3), intent(in) :: lambda
         real(wp), dimension(sys_size), intent(inout) :: L
         real(wp), intent(in) :: rho, c

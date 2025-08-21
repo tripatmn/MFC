@@ -42,8 +42,13 @@ module m_mpi_proxy
     !! immersed boundary markers, for a single computational domain boundary
     !! at the time, from the relevant neighboring processor.
 
+    !> @name Generic flags used to identify and report MPI errors
+    !> @{
+    integer, private :: ierr
+    !> @}
+
     integer :: i_halo_size
-    $:GPU_DECLARE(create='[i_halo_size]')
+    !$acc declare create(i_halo_size)
 
 contains
 
@@ -57,16 +62,16 @@ contains
                                             & (m + 2*gp_layers + 1)* &
                                             & (n + 2*gp_layers + 1)* &
                                             & (p + 2*gp_layers + 1)/ &
-                                            & (cells_bounds%mnp_min + 2*gp_layers + 1)
+                                            & (min(m, n, p) + 2*gp_layers + 1)
                 else
                     i_halo_size = -1 + gp_layers* &
-                                            & (cells_bounds%mn_max + 2*gp_layers + 1)
+                                            & (max(m, n) + 2*gp_layers + 1)
                 end if
             else
                 i_halo_size = -1 + gp_layers
             end if
 
-            $:GPU_UPDATE(device='[i_halo_size]')
+            !$acc update device(i_halo_size)
             @:ALLOCATE(ib_buff_send(0:i_halo_size), ib_buff_recv(0:i_halo_size))
         end if
 #endif
@@ -83,7 +88,6 @@ contains
 #ifdef MFC_MPI
 
         integer :: i, j !< Generic loop iterator
-        integer :: ierr !< Generic flag used to identify and report MPI errors
 
         call MPI_BCAST(case_dir, len(case_dir), MPI_CHARACTER, 0, MPI_COMM_WORLD, ierr)
 
@@ -98,14 +102,13 @@ contains
             & 'wave_speeds', 'avg_state', 'precision', 'bc_x%beg', 'bc_x%end', &
             & 'bc_y%beg', 'bc_y%end', 'bc_z%beg', 'bc_z%end',  'fd_order',     &
             & 'num_probes', 'num_integrals', 'bubble_model', 'thermal',        &
-            & 'num_source', 'relax_model', 'num_ibs', 'n_start',    &
-            & 'num_bc_patches', 'num_igr_iters', 'num_igr_warm_start_iters', &
-            & 'adap_dt_max_iters' ]
+            & 'R0_type', 'num_source', 'relax_model', 'num_ibs', 'n_start',    &
+            & 'num_bc_patches']
             call MPI_BCAST(${VAR}$, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
         #:endfor
 
         #:for VAR in [ 'run_time_info','cyl_coord', 'mpp_lim',     &
-            &  'mp_weno', 'rdma_mpi', 'powell', 'cont_damage', 'bc_io', &
+            &  'mp_weno', 'rdma_mpi', 'weno_flat', 'riemann_flat', &
             & 'weno_Re_flux', 'alt_soundspeed', 'null_weights', 'mixture_err',   &
             & 'parallel_io', 'hypoelasticity', 'bubbles_euler', 'polytropic',    &
             & 'polydisperse', 'qbmm', 'acoustic_source', 'probe_wrt', 'integral_wrt',   &
@@ -114,9 +117,9 @@ contains
             & 'bc_x%grcbc_in', 'bc_x%grcbc_out', 'bc_x%grcbc_vel_out',          &
             & 'bc_y%grcbc_in', 'bc_y%grcbc_out', 'bc_y%grcbc_vel_out',          &
             & 'bc_z%grcbc_in', 'bc_z%grcbc_out', 'bc_z%grcbc_vel_out',          &
-            & 'cfl_adap_dt', 'cfl_const_dt', 'cfl_dt', 'surface_tension',       &
-            & 'shear_stress', 'bulk_stress', 'bubbles_lagrange',                &
-            & 'hyperelasticity', 'down_sample', 'int_comp' ]
+            & 'cfl_adap_dt', 'cfl_const_dt', 'cfl_dt', 'surface_tension',        &
+            & 'viscous', 'shear_stress', 'bulk_stress', 'bubbles_lagrange',     &
+            & 'hyperelasticity', 'bc_io', 'powell', 'cont_damage' ]
             call MPI_BCAST(${VAR}$, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
         #:endfor
 
@@ -128,10 +131,6 @@ contains
             #:for VAR in [ 'gamma_method' ]
                 call MPI_BCAST(chem_params%${VAR}$, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
             #:endfor
-
-            if (chem_params%diffusion) then
-                call MPI_BCAST(chem_diffusion_coeffs, chemxe - chemxb + 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
-            end if
         end if
 
         if (bubbles_lagrange) then
@@ -158,9 +157,8 @@ contains
             & 'bc_x%pres_in','bc_x%pres_out','bc_y%pres_in','bc_y%pres_out', 'bc_z%pres_in','bc_z%pres_out', &
             & 'x_domain%beg', 'x_domain%end', 'y_domain%beg', 'y_domain%end',    &
             & 'z_domain%beg', 'z_domain%end', 'x_a', 'x_b', 'y_a', 'y_b', 'z_a', &
-            & 'z_b', 't_stop', 't_save', 'cfl_target', 'Bx0', 'alf_factor',  &
-            & 'tau_star', 'cont_damage_s', 'alpha_bar', 'adap_dt_tol', &
-            & 'ic_eps', 'ic_beta' ]
+            & 'z_b', 't_stop', 't_save', 'cfl_target', 'Bx0',  &
+            & 'tau_star', 'cont_damage_s', 'alpha_bar', 'adap_dt_tol' ]
             call MPI_BCAST(${VAR}$, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
         #:endfor
 
@@ -181,14 +179,6 @@ contains
             call MPI_BCAST(wenoz_q, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
             call MPI_BCAST(mhd, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
             call MPI_BCAST(relativity, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
-            call MPI_BCAST(igr, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
-            call MPI_BCAST(igr_order, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
-            call MPI_BCAST(igr_pres_lim, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
-            call MPI_BCAST(igr_iter_solver, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
-            call MPI_BCAST(viscous, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
-            call MPI_BCAST(recon_type, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
-            call MPI_BCAST(muscl_order, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
-            call MPI_BCAST(muscl_lim, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
         #:endif
 
         do i = 1, num_fluids_max
@@ -264,7 +254,6 @@ contains
         integer :: pack_offset, unpack_offset
 
 #ifdef MFC_MPI
-        integer :: ierr !< Generic flag used to identify and report MPI errors
 
         call nvtxStartRange("IB-MARKER-COMM-PACKBUF")
 
@@ -308,7 +297,7 @@ contains
         #:for mpi_dir in [1, 2, 3]
             if (mpi_dir == ${mpi_dir}$) then
                 #:if mpi_dir == 1
-                    $:GPU_PARALLEL_LOOP(collapse=3,private='[r]')
+                    !$acc parallel loop collapse(3) gang vector default(present) private(r)
                     do l = 0, p
                         do k = 0, n
                             do j = 0, gp_layers - 1
@@ -318,7 +307,7 @@ contains
                         end do
                     end do
                 #:elif mpi_dir == 2
-                    $:GPU_PARALLEL_LOOP(collapse=3,private='[r]')
+                    !$acc parallel loop collapse(3) gang vector default(present) private(r)
                     do l = 0, p
                         do k = 0, gp_layers - 1
                             do j = -gp_layers, m + gp_layers
@@ -329,7 +318,7 @@ contains
                         end do
                     end do
                 #:else
-                    $:GPU_PARALLEL_LOOP(collapse=3,private='[r]')
+                    !$acc parallel loop collapse(3) gang vector default(present) private(r)
                     do l = 0, gp_layers - 1
                         do k = -gp_layers, n + gp_layers
                             do j = -gp_layers, m + gp_layers
@@ -356,7 +345,7 @@ contains
         #:for mpi_dir in [1, 2, 3]
             if (mpi_dir == ${mpi_dir}$) then
                 #:if mpi_dir == 1
-                    $:GPU_PARALLEL_LOOP(collapse=3,private='[r]')
+                    !$acc parallel loop collapse(3) gang vector default(present) private(r)
                     do l = 0, p
                         do k = 0, n
                             do j = -gp_layers, -1
@@ -366,7 +355,7 @@ contains
                         end do
                     end do
                 #:elif mpi_dir == 2
-                    $:GPU_PARALLEL_LOOP(collapse=3,private='[r]')
+                    !$acc parallel loop collapse(3) gang vector default(present) private(r)
                     do l = 0, p
                         do k = -gp_layers, -1
                             do j = -gp_layers, m + gp_layers
@@ -378,7 +367,7 @@ contains
                     end do
                 #:else
                     ! Unpacking buffer from bc_z%beg
-                    $:GPU_PARALLEL_LOOP(collapse=3,private='[r]')
+                    !$acc parallel loop collapse(3) gang vector default(present) private(r)
                     do l = -gp_layers, -1
                         do k = -gp_layers, n + gp_layers
                             do j = -gp_layers, m + gp_layers
@@ -402,7 +391,6 @@ contains
         real(wp), intent(inout), dimension(1:num_freq) :: phi_rn
 
 #ifdef MFC_MPI
-        integer :: ierr !< Generic flag used to identify and report MPI errors
         call MPI_BCAST(phi_rn, num_freq, mpi_p, 0, MPI_COMM_WORLD, ierr)
 #endif
 

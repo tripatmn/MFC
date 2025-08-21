@@ -118,7 +118,6 @@ print(
             "adv_n": "T",
             # adap_dt
             "adap_dt": "T",
-            "adap_dt_max_iters": 200,
             # Gas compression model
             "polytropic": "T",
             "thermal": 1,
