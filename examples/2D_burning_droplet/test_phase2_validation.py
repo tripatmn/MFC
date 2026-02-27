@@ -44,11 +44,15 @@ args, _ = parser.parse_known_args()
 # =============================================================================
 # DOMAIN PARAMETERS
 # =============================================================================
-# 1D domain for simplicity
+# 2D domain (thin in y) so ParaView can load the grid; x is the main flow direction
+# n must be >= (num_stcls_min*weno_order - 1) = 5*3 - 1 = 14 for WENO stencil
 Nx = 199
-Lx = 1.0e-3  # 1 mm domain
+Ny = 14
+Lx = 1.0e-3   # 1 mm in x
+Ly = 0.2e-3   # 0.2 mm in y (thin slice for ParaView)
 
 dx = Lx / Nx
+dy = Ly / Ny
 
 # =============================================================================
 # FLUID PROPERTIES (Stiffened Gas EOS)
@@ -125,7 +129,8 @@ Y_N2_air = 0.767
 # =============================================================================
 dt = 1.0e-9  # 1 ns time step
 t_stop = args.steps
-t_save = max(1, t_stop // 5)  # Save more frequently for visualization
+# Save every step so that by 20% of the run we have 20 time steps written (e.g. 101 steps → 20 saves at 20%)
+t_save = 1
 
 # =============================================================================
 # CASE DICTIONARY
@@ -137,14 +142,16 @@ case = {
     "run_time_info": "T",
     
     # -------------------------------------------------------------------------
-    # Domain
+    # Domain (2D thin slice for ParaView)
     # -------------------------------------------------------------------------
     "m": Nx,
-    "n": 0,
+    "n": Ny,
     "p": 0,
     
     "x_domain%beg": 0.0,
     "x_domain%end": Lx,
+    "y_domain%beg": 0.0,
+    "y_domain%end": Ly,
     
     "dt": dt,
     "t_step_start": 0,
@@ -162,11 +169,13 @@ case = {
     "time_stepper": 3,  # 3rd order TVD RK
     
     # -------------------------------------------------------------------------
-    # Numerics
+    # Numerics (MUSCL instead of WENO for robustness; previously got to ~20% with 1D WENO)
     # -------------------------------------------------------------------------
-    "weno_order": 3,
-    "weno_eps": 1.0e-16,
-    "mapped_weno": "T",
+    "recon_type": 2,       # 2 = MUSCL
+    "weno_order": 0,      # not used when recon_type=2
+    "weno_eps": 1.0e-6,   # required by validator when weno_order != 1; ignored for MUSCL
+    "muscl_order": 2,
+    "muscl_lim": 3,       # 3 = Van Albada (smooth limiter)
     "riemann_solver": 2,  # HLLC
     "wave_speeds": 1,
     "avg_state": 2,
@@ -176,7 +185,9 @@ case = {
     # -------------------------------------------------------------------------
     "bc_x%beg": -3,  # Reflective
     "bc_x%end": -3,  # Reflective
-    
+    "bc_y%beg": -1,  # Periodic (thin slice, quasi-1D)
+    "bc_y%end": -1,  # Periodic
+
     # -------------------------------------------------------------------------
     # Phase Change
     # -------------------------------------------------------------------------
@@ -188,11 +199,14 @@ case = {
     # -------------------------------------------------------------------------
     # Patch 1: Background - Oxidizer gas (entire domain)
     # -------------------------------------------------------------------------
-    "patch_icpp(1)%geometry": 1,  # Line
+    "patch_icpp(1)%geometry": 3,  # Rectangle (2D; line segment geometry 1 requires n=0)
     "patch_icpp(1)%x_centroid": Lx / 2,
     "patch_icpp(1)%length_x": Lx,
-    
+    "patch_icpp(1)%y_centroid": Ly / 2,
+    "patch_icpp(1)%length_y": Ly,
+
     "patch_icpp(1)%vel(1)": u0,
+    "patch_icpp(1)%vel(2)": u0,
     "patch_icpp(1)%pres": p0,
     
     # Volume fractions: pure oxidizer gas
@@ -208,12 +222,15 @@ case = {
     # -------------------------------------------------------------------------
     # Patch 2: Liquid droplet (left portion)
     # -------------------------------------------------------------------------
-    "patch_icpp(2)%geometry": 1,  # Line
+    "patch_icpp(2)%geometry": 3,  # Rectangle (2D)
     "patch_icpp(2)%x_centroid": droplet_end / 2,
     "patch_icpp(2)%length_x": droplet_end,
+    "patch_icpp(2)%y_centroid": Ly / 2,
+    "patch_icpp(2)%length_y": Ly,
     "patch_icpp(2)%alter_patch(1)": "T",
-    
+
     "patch_icpp(2)%vel(1)": u0,
+    "patch_icpp(2)%vel(2)": u0,
     "patch_icpp(2)%pres": p0,
     
     # Volume fractions: mostly liquid

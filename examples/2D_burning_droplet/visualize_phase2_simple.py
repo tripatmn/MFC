@@ -2,8 +2,14 @@
 """
 Simple visualization script for Phase 2 validation.
 Uses MFC's built-in visualization tools if available, otherwise reads data directly.
+
+Usage:
+  python3 examples/2D_burning_droplet/visualize_phase2_simple.py
+  python3 examples/2D_burning_droplet/visualize_phase2_simple.py --case-dir /path/to/case
+  # From repo root, or from the case dir (examples/2D_burning_droplet) after running simulation
 """
 
+import argparse
 import os
 import sys
 import numpy as np
@@ -18,16 +24,14 @@ except ImportError:
     USE_MFC_VIZ = False
     print("Note: mfc.viz not available, using direct file reading")
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-CASE_DIR = Path(__file__).parent
-OUTPUT_DIR = CASE_DIR / "figures" / "phase2"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+# Default: directory containing this script
+DEFAULT_CASE_DIR = Path(__file__).resolve().parent
 
-# Domain parameters
+# Domain parameters (2D case: m=199, n=14 → (m+1)*(n+1) = 200*15 cells per variable in restart)
 Nx = 200
+Ny = 15
 Lx = 1.0e-3
+Ly = 0.2e-3
 
 # =============================================================================
 # DATA READING
@@ -56,65 +60,59 @@ def read_1d_dat_file(filepath, num_cells):
 
 
 def read_restart_data(restart_dir, timestep, num_cells):
-    """Read restart data for a given timestep (binary format)"""
-    filename = restart_dir / f"lustre_{timestep}.dat"
-    
-    if not filename.exists():
+    """Read restart data for a given timestep (parallel_io: lustre_<step>/<step>_0.dat)."""
+    step_dir = restart_dir / f"lustre_{timestep}"
+    if not step_dir.exists():
         return None
-    
-    # Read binary data
+    rank_files = sorted(step_dir.glob(f"{timestep}_*.dat"))
+    if not rank_files:
+        return None
+    # Single-rank: read first file; multi-rank would require concatenating by rank
+    filename = rank_files[0]
     data = np.fromfile(str(filename), dtype=np.float64)
-    
-    # Reshape based on number of variables
     num_vars = len(data) // num_cells
     if len(data) % num_cells != 0:
         print(f"Warning: Data size {len(data)} not divisible by {num_cells}")
         return None
-    
-    # Reshape to (num_vars, num_cells)
     data = data.reshape((num_vars, num_cells))
-    
     return data
 
 
 def read_grid(restart_dir, num_cells):
-    """Read grid coordinates"""
-    grid_file = restart_dir / "lustre_x_cb.dat"
-    
+    """Read grid coordinates (x_cb.dat in restart_data)."""
+    grid_file = restart_dir / "x_cb.dat"
     if grid_file.exists():
         x = np.fromfile(str(grid_file), dtype=np.float64)
-        # Cell-center coordinates
         if len(x) == num_cells + 1:
             x_cc = 0.5 * (x[:-1] + x[1:])
-        else:
+        elif len(x) >= num_cells:
             x_cc = x[:num_cells]
+        else:
+            x_cc = np.linspace(0, Lx, num_cells)
         return x_cc
-    else:
-        # Generate uniform grid
-        return np.linspace(0, Lx, num_cells)
+    return np.linspace(0, Lx, num_cells)
 
 
-def find_data_files():
-    """Find MFC output files - check both D/ and restart_data/"""
-    # First try restart_data (parallel_io format)
-    restart_dir = CASE_DIR / "restart_data"
+def find_data_files(case_dir):
+    """Find MFC output files - check restart_data (parallel_io: lustre_<step>/<step>_<rank>.dat) and D/."""
+    # restart_data: parallel_io format uses directory lustre_<step> with files <step>_<rank>.dat
+    restart_dir = case_dir / "restart_data"
     if restart_dir.exists():
-        # Find timestep files
-        timesteps = set()
-        for f in restart_dir.glob("lustre_*.dat"):
-            if "x_cb" not in f.name:
-                try:
-                    # Extract timestep from filename like "lustre_0.dat"
-                    ts_str = f.stem.replace("lustre_", "")
-                    ts = int(ts_str)
-                    timesteps.add(ts)
-                except ValueError:
-                    continue
+        timesteps = []
+        for d in sorted(restart_dir.iterdir()):
+            if not d.is_dir() or not d.name.startswith("lustre_"):
+                continue
+            try:
+                ts = int(d.name.replace("lustre_", ""))
+            except ValueError:
+                continue
+            if list(d.glob(f"{ts}_*.dat")):
+                timesteps.append(ts)
         if timesteps:
-            return sorted(timesteps), "restart_data"
-    
+            return sorted(timesteps), "restart_data", case_dir
+
     # Fallback to D/ directory (serial format)
-    D_dir = CASE_DIR / "D"
+    D_dir = case_dir / "D"
     if D_dir.exists():
         cons_files = list(D_dir.glob("cons.1.*.*.dat"))
         if cons_files:
@@ -128,66 +126,98 @@ def find_data_files():
                     except ValueError:
                         continue
             if timesteps:
-                return sorted(timesteps), "D"
-    
-    return None, None
+                return sorted(timesteps), "D", case_dir
+
+    return None, None, None
 
 
 # =============================================================================
 # VISUALIZATION
 # =============================================================================
 
-def plot_phase2_validation():
+def get_case_dir_candidates(args_case_dir):
+    """Build list of case directories to try (script dir, cwd, cwd/examples/2D_burning_droplet)."""
+    candidates = []
+    if args_case_dir is not None:
+        candidates.append(Path(args_case_dir).resolve())
+    candidates.append(DEFAULT_CASE_DIR)
+    cwd = Path.cwd()
+    if cwd not in candidates:
+        candidates.append(cwd)
+    # If running from repo root, case dir might be examples/2D_burning_droplet
+    repo_case = cwd / "examples" / "2D_burning_droplet"
+    if repo_case.exists() and repo_case not in candidates:
+        candidates.append(repo_case)
+    return candidates
+
+
+def plot_phase2_validation(case_dir=None):
     """Create comprehensive Phase 2 validation plots"""
-    
-    timesteps, format_type = find_data_files()
+    candidates = get_case_dir_candidates(case_dir)
+    timesteps, format_type, used_case_dir = None, None, None
+    for cdir in candidates:
+        timesteps, format_type, used_case_dir = find_data_files(cdir)
+        if timesteps:
+            break
     if not timesteps:
-        print("No data files found. Run the simulation first:")
+        print("No data files found in any of these locations:")
+        for c in candidates:
+            print(f"  {c}")
+        print("Run the simulation first, then run this script from repo root or from the case directory:")
         print("  ./mfc.sh run examples/2D_burning_droplet/test_phase2_validation.py -t pre_process simulation -j 4")
-        return
-    
+        print("  python3 examples/2D_burning_droplet/visualize_phase2_simple.py")
+        return None
+
+    OUTPUT_DIR = used_case_dir / "figures" / "phase2"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Using case dir: {used_case_dir}")
     print(f"Found timesteps: {timesteps} (format: {format_type})")
-    
+
     # Use first and last timestep
     plot_ts = [timesteps[0]]
     if len(timesteps) > 1:
         plot_ts.append(timesteps[-1])
-    
+
     if format_type == "restart_data":
-        # Use restart_data format (binary)
-        restart_dir = CASE_DIR / "restart_data"
-        x = read_grid(restart_dir, Nx)
-        
+        # Use restart_data format (binary); 2D grid has (m+1)*(n+1) = Nx*Ny cells
+        restart_dir = used_case_dir / "restart_data"
+        total_cells = Nx * Ny
+        x_grid = read_grid(restart_dir, total_cells)
+        if x_grid is not None and len(x_grid) >= Nx:
+            # 2D flattened: first row along x is indices 0:Nx (x fastest in MFC)
+            x = x_grid[:Nx] if len(x_grid) == total_cells else np.linspace(0, Lx, Nx)
+        else:
+            x = np.linspace(0, Lx, Nx)
+
         for ts in plot_ts:
             print(f"\nGenerating plots for timestep {ts}...")
-            
-            data = read_restart_data(restart_dir, ts, Nx)
+
+            data = read_restart_data(restart_dir, ts, total_cells)
             if data is None:
                 print(f"  Warning: Could not read data for timestep {ts}")
                 continue
-            
+
             num_vars = data.shape[0]
-            print(f"  Read {num_vars} variables, {data.shape[1]} cells")
-            
-            # For 3-fluid 6-eqn model (model_eqns=3):
-            # Variables: alpha_rho_1, alpha_rho_2, alpha_rho_3, rho*u, E, alpha_1, alpha_2, alpha_3, int_e_1, int_e_2, int_e_3
-            # So alpha starts at index 5 (0-indexed)
+            nc = data.shape[1]
+            print(f"  Read {num_vars} variables, {nc} cells")
+            # 1D slice: first row (indices 0:Nx) when 2D
+            n_slice = min(Nx, nc)
             if num_vars >= 8:
-                rho_1 = data[0, :]  # alpha_rho_1
-                rho_2 = data[1, :]  # alpha_rho_2
-                rho_3 = data[2, :]  # alpha_rho_3
-                alpha_1 = data[5, :]  # alpha_1
-                alpha_2 = data[6, :]  # alpha_2
-                alpha_3 = data[7, :]  # alpha_3
+                rho_1 = data[0, :n_slice]
+                rho_2 = data[1, :n_slice]
+                rho_3 = data[2, :n_slice]
+                alpha_1 = data[5, :n_slice]
+                alpha_2 = data[6, :n_slice]
+                alpha_3 = data[7, :n_slice]
             else:
                 print(f"  Warning: Unexpected number of variables ({num_vars})")
                 continue
-            
-            # Create plots for this timestep
-            _create_plots(x, alpha_1, alpha_2, alpha_3, rho_1, rho_2, rho_3, ts)
+            x_slice = x[:n_slice] if len(x) >= n_slice else np.linspace(0, Lx, n_slice)
+
+            _create_plots(x_slice, alpha_1, alpha_2, alpha_3, rho_1, rho_2, rho_3, ts, OUTPUT_DIR)
     else:
         # Use D/ format (text files)
-        D_dir = CASE_DIR / "D"
+        D_dir = used_case_dir / "D"
         x = np.linspace(0, Lx, Nx)
         
         for ts in plot_ts:
@@ -220,13 +250,15 @@ def plot_phase2_validation():
             if alpha_1 is None or alpha_2 is None or alpha_3 is None or rho_1 is None or rho_2 is None or rho_3 is None:
                 print(f"  Warning: Missing data for timestep {ts}")
                 continue
-        
-        # Create plots for this timestep
-        _create_plots(x, alpha_1, alpha_2, alpha_3, rho_1, rho_2, rho_3, ts)
+
+            _create_plots(x, alpha_1, alpha_2, alpha_3, rho_1, rho_2, rho_3, ts, OUTPUT_DIR)
 
 
-def _create_plots(x, alpha_1, alpha_2, alpha_3, rho_1, rho_2, rho_3, ts):
+def _create_plots(x, alpha_1, alpha_2, alpha_3, rho_1, rho_2, rho_3, ts, output_dir):
     """Create comprehensive Phase 2 validation plots"""
+    if output_dir is None:
+        output_dir = DEFAULT_CASE_DIR / "figures" / "phase2"
+    output_dir.mkdir(parents=True, exist_ok=True)
     # Create comprehensive plot
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         
@@ -292,7 +324,7 @@ def _create_plots(x, alpha_1, alpha_2, alpha_3, rho_1, rho_2, rho_3, ts):
     plt.suptitle(f'Phase 2 Validation: t = {ts} steps', fontsize=14, y=0.995)
     plt.tight_layout()
     
-    output_file = OUTPUT_DIR / f'phase2_validation_t{ts:04d}.png'
+    output_file = output_dir / f'phase2_validation_t{ts:04d}.png'
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"  ✅ Saved: {output_file}")
@@ -318,21 +350,29 @@ def _create_plots(x, alpha_1, alpha_2, alpha_3, rho_1, rho_2, rho_3, ts):
         ax.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        output_file = OUTPUT_DIR / f'gas_phase_density_t{ts:04d}.png'
+        output_file = output_dir / f'gas_phase_density_t{ts:04d}.png'
         plt.savefig(output_file, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"  ✅ Saved: {output_file}")
 
+    return OUTPUT_DIR
+
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Phase 2 validation visualization")
+    parser.add_argument("--case-dir", type=str, default=None,
+                        help="Case directory containing restart_data/ or D/ (default: script dir, then cwd)")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("Phase 2 Validation Visualization")
     print("=" * 60)
     print()
-    
-    plot_phase2_validation()
-    
+
+    out_dir = plot_phase2_validation(case_dir=args.case_dir)
+
     print()
     print("=" * 60)
-    print(f"Images saved to: {OUTPUT_DIR}")
+    if out_dir is not None:
+        print(f"Images saved to: {out_dir}")
     print("=" * 60)
