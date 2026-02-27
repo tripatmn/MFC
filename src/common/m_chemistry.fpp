@@ -185,14 +185,14 @@ contains
         type(int_bounds_info), dimension(1:3), intent(in) :: bounds
 
         integer :: x, y, z
-        integer :: eqn
+        integer :: eqn, i
         real(wp) :: T
         real(wp) :: rho, omega_m
         real(wp), dimension(num_species) :: Ys
         real(wp), dimension(num_species) :: omega
-        real(wp) :: alpha_liquid, alpha_gas
+        real(wp) :: alpha_liquid, alpha_gas, rho_gas
 
-        $:GPU_PARALLEL_LOOP(collapse=3, private='[Ys, omega, eqn, T, rho, omega, omega_m, alpha_liquid, alpha_gas]', copyin='[bounds]')
+        $:GPU_PARALLEL_LOOP(collapse=3, private='[Ys, omega, eqn, T, rho, omega, omega_m, alpha_liquid, alpha_gas, rho_gas, i]', copyin='[bounds]')
         do z = bounds(3)%beg, bounds(3)%end
             do y = bounds(2)%beg, bounds(2)%end
                 do x = bounds(1)%beg, bounds(1)%end
@@ -206,6 +206,22 @@ contains
 
                         ! Skip if gas volume fraction is below threshold
                         if (alpha_gas < chem_params%gas_phase_threshold) cycle
+
+                        ! Phase 2: Compute gas-phase density from partial densities
+                        ! Sum all partial densities except liquid phase
+                        rho_gas = 0.0_wp
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do i = 1, num_fluids
+                            if (i /= chem_params%liquid_phase_idx) then
+                                rho_gas = rho_gas + q_cons_qp(i + contxb - 1)%sf(x, y, z)
+                            end if
+                        end do
+
+                        ! Use gas-phase density for reactions
+                        rho = max(rho_gas, 1.0e-10_wp)
+                    else
+                        ! Single fluid case - use total density
+                        rho = q_cons_qp(contxe)%sf(x, y, z)
                     end if
 
                     $:GPU_LOOP(parallelism='[seq]')
@@ -213,7 +229,6 @@ contains
                         Ys(eqn - chemxb + 1) = q_prim_qp(eqn)%sf(x, y, z)
                     end do
 
-                    rho = q_cons_qp(contxe)%sf(x, y, z)
                     T = q_T_sf%sf(x, y, z)
 
                     call get_net_production_rates(rho, T, Ys, omega)
@@ -226,6 +241,12 @@ contains
                         #:block DEF_AMD
                             omega_m = molecular_weights_nonparameter(eqn - chemxb + 1)*omega(eqn - chemxb + 1)
                         #:endblock DEF_AMD
+                        
+                        ! Phase 2: Scale reaction rates by gas volume fraction for multiphase
+                        if (chem_params%multiphase) then
+                            omega_m = omega_m * alpha_gas
+                        end if
+                        
                         rhs_vf(eqn)%sf(x, y, z) = rhs_vf(eqn)%sf(x, y, z) + omega_m
 
                     end do
@@ -252,6 +273,7 @@ contains
         real(wp) :: Mass_Diffu_Energy
         real(wp) :: MW_L, MW_R, MW_cell, Rgas_L, Rgas_R, T_L, T_R, P_L, P_R, rho_L, rho_R, rho_cell, rho_Vic
         real(wp) :: lambda_L, lambda_R, lambda_Cell, dT_dxi, grid_spacing
+        real(wp) :: alpha_gas
         real(wp) :: Cp_L, Cp_R
         real(wp) :: diffusivity_L, diffusivity_R, diffusivity_cell
         real(wp) :: hmix_L, hmix_R, dh_dxi
@@ -272,7 +294,7 @@ contains
             if (chem_params%transport_model == 1) then
                 #:block UNDEF_AMD
                     ! Note: Added 'i' and 'eqn' to private list.
-                    $:GPU_PARALLEL_LOOP(collapse=3,  private='[x,y,z,i,eqn,Ys_L, Ys_R, Ys_cell, Xs_L, Xs_R, mass_diffusivities_mixavg1, mass_diffusivities_mixavg2, mass_diffusivities_mixavg_Cell, h_l, h_r, Xs_cell, h_k, dXk_dxi,Mass_Diffu_Flux, Mass_Diffu_Energy, MW_L, MW_R, MW_cell, Rgas_L, Rgas_R, T_L, T_R, P_L, P_R, rho_L, rho_R, rho_cell, rho_Vic, lambda_L, lambda_R, lambda_Cell, dT_dxi, grid_spacing]', copyin='[offsets]')
+                    $:GPU_PARALLEL_LOOP(collapse=3,  private='[x,y,z,i,eqn,Ys_L, Ys_R, Ys_cell, Xs_L, Xs_R, mass_diffusivities_mixavg1, mass_diffusivities_mixavg2, mass_diffusivities_mixavg_Cell, h_l, h_r, Xs_cell, h_k, dXk_dxi,Mass_Diffu_Flux, Mass_Diffu_Energy, MW_L, MW_R, MW_cell, Rgas_L, Rgas_R, T_L, T_R, P_L, P_R, rho_L, rho_R, rho_cell, rho_Vic, lambda_L, lambda_R, lambda_Cell, dT_dxi, grid_spacing, alpha_gas]', copyin='[offsets]')
                     do z = isc3%beg, isc3%end
                         do y = isc2%beg, isc2%end
                             do x = isc1%beg, isc1%end
@@ -358,6 +380,16 @@ contains
 
                                 lambda_Cell = 0.5_wp*(lambda_R + lambda_L)
 
+                                ! Phase 2: For multiphase, compute average gas volume fraction
+                                alpha_gas = 1.0_wp
+                                if (chem_params%multiphase) then
+                                    alpha_gas = 0.5_wp * ( &
+                                        (1.0_wp - q_prim_qp(advxb + chem_params%liquid_phase_idx - 1)%sf(x, y, z)) + &
+                                        (1.0_wp - q_prim_qp(advxb + chem_params%liquid_phase_idx - 1)%sf( &
+                                            x + offsets(1), y + offsets(2), z + offsets(3))) &
+                                    )
+                                end if
+
                                 ! Calculate mass diffusion fluxes
                                 rho_Vic = 0.0_wp
                                 Mass_Diffu_Energy = 0.0_wp
@@ -366,6 +398,10 @@ contains
                                 do eqn = chemxb, chemxe
                                     Mass_Diffu_Flux(eqn - chemxb + 1) = rho_cell*mass_diffusivities_mixavg_Cell(eqn - chemxb + 1)* &
                                                                         molecular_weights(eqn - chemxb + 1)/MW_cell*dXk_dxi(eqn - chemxb + 1)
+                                    ! Phase 2: Scale by gas volume fraction for multiphase
+                                    if (chem_params%multiphase) then
+                                        Mass_Diffu_Flux(eqn - chemxb + 1) = Mass_Diffu_Flux(eqn - chemxb + 1) * alpha_gas
+                                    end if
                                     rho_Vic = rho_Vic + Mass_Diffu_Flux(eqn - chemxb + 1)
                                     Mass_Diffu_Energy = Mass_Diffu_Energy + h_k(eqn - chemxb + 1)*Mass_Diffu_Flux(eqn - chemxb + 1)
                                 end do
@@ -378,7 +414,12 @@ contains
                                 end do
 
                                 ! Add thermal conduction contribution
-                                Mass_Diffu_Energy = lambda_Cell*dT_dxi + Mass_Diffu_Energy
+                                ! Phase 2: Scale thermal conduction by gas volume fraction for multiphase
+                                if (chem_params%multiphase) then
+                                    Mass_Diffu_Energy = alpha_gas * lambda_Cell*dT_dxi + Mass_Diffu_Energy
+                                else
+                                    Mass_Diffu_Energy = lambda_Cell*dT_dxi + Mass_Diffu_Energy
+                                end if
 
                                 ! Update flux arrays
                                 flux_src_vf(E_idx)%sf(x, y, z) = flux_src_vf(E_idx)%sf(x, y, z) - Mass_Diffu_Energy
@@ -397,7 +438,7 @@ contains
             else if (chem_params%transport_model == 2) then
                 #:block UNDEF_AMD
                     ! Note: Added ALL scalars and 'i'/'eqn' to private list to prevent race conditions.
-                    $:GPU_PARALLEL_LOOP(collapse=3, private='[x,y,z,i,eqn,Ys_L, Ys_R, Ys_cell, dYk_dxi, Mass_Diffu_Flux, grid_spacing, MW_L, MW_R, MW_cell, Rgas_L, Rgas_R, P_L, P_R, rho_L, rho_R, rho_cell, T_L, T_R, Cp_L, Cp_R, hmix_L, hmix_R, dh_dxi, lambda_L, lambda_R, lambda_Cell, diffusivity_L, diffusivity_R, diffusivity_cell, Mass_Diffu_Energy]', copyin='[offsets]')
+                    $:GPU_PARALLEL_LOOP(collapse=3, private='[x,y,z,i,eqn,Ys_L, Ys_R, Ys_cell, dYk_dxi, Mass_Diffu_Flux, grid_spacing, MW_L, MW_R, MW_cell, Rgas_L, Rgas_R, P_L, P_R, rho_L, rho_R, rho_cell, T_L, T_R, Cp_L, Cp_R, hmix_L, hmix_R, dh_dxi, lambda_L, lambda_R, lambda_Cell, diffusivity_L, diffusivity_R, diffusivity_cell, Mass_Diffu_Energy, alpha_gas]', copyin='[offsets]')
                     do z = isc3%beg, isc3%end
                         do y = isc2%beg, isc2%end
                             do x = isc1%beg, isc1%end
@@ -467,6 +508,16 @@ contains
                                                                Ys_L(i - chemxb + 1))/grid_spacing
                                 end do
 
+                                ! Phase 2: For multiphase, compute average gas volume fraction
+                                alpha_gas = 1.0_wp
+                                if (chem_params%multiphase) then
+                                    alpha_gas = 0.5_wp * ( &
+                                        (1.0_wp - q_prim_qp(advxb + chem_params%liquid_phase_idx - 1)%sf(x, y, z)) + &
+                                        (1.0_wp - q_prim_qp(advxb + chem_params%liquid_phase_idx - 1)%sf( &
+                                            x + offsets(1), y + offsets(2), z + offsets(3))) &
+                                    )
+                                end if
+
                                 ! Calculate mixture-averaged diffusivities
                                 diffusivity_L = lambda_L/rho_L/Cp_L
                                 diffusivity_R = lambda_R/rho_R/Cp_R
@@ -482,8 +533,18 @@ contains
                                     Mass_Diffu_Flux(eqn - chemxb + 1) = rho_cell* &
                                                                         diffusivity_cell* &
                                                                         dYk_dxi(eqn - chemxb + 1)
+                                    ! Phase 2: Scale by gas volume fraction for multiphase
+                                    if (chem_params%multiphase) then
+                                        Mass_Diffu_Flux(eqn - chemxb + 1) = Mass_Diffu_Flux(eqn - chemxb + 1) * alpha_gas
+                                    end if
                                 end do
-                                Mass_Diffu_Energy = rho_cell*diffusivity_cell*dh_dxi
+                                
+                                ! Phase 2: Scale thermal diffusion by gas volume fraction for multiphase
+                                if (chem_params%multiphase) then
+                                    Mass_Diffu_Energy = alpha_gas * rho_cell*diffusivity_cell*dh_dxi
+                                else
+                                    Mass_Diffu_Energy = rho_cell*diffusivity_cell*dh_dxi
+                                end if
 
                                 ! Update flux arrays
                                 flux_src_vf(E_idx)%sf(x, y, z) = flux_src_vf(E_idx)%sf(x, y, z) - Mass_Diffu_Energy

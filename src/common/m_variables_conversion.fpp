@@ -40,6 +40,7 @@ module m_variables_conversion
               s_convert_primitive_to_flux_variables, &
               s_compute_pressure, &
               s_compute_species_fraction, &
+              s_convert_gas_species_to_mass_fractions, &
 #ifndef MFC_PRE_PROCESS
               s_compute_speed_of_sound, &
               s_compute_fast_magnetosonic_speed, &
@@ -1386,6 +1387,55 @@ contains
         if (num_fluids == 1 .and. bubbles_euler) alpha_K(1) = q_vf(advxb)%sf(k, l, r)
 
     end subroutine s_compute_species_fraction
+
+    !> Phase 2: Convert gas-phase species conservative variables to mass fractions
+    !! This helper is used for multiphase chemistry coupling where species
+    !! exist only in the gas phase (vapor + air, excluding liquid)
+    !! @param q_vf Conservative variables array
+    !! @param i, j, k Cell indices
+    !! @param Ys_gas Output: Gas-phase species mass fractions
+    subroutine s_convert_gas_species_to_mass_fractions(q_vf, i, j, k, Ys_gas)
+        $:GPU_ROUTINE(function_name='s_convert_gas_species_to_mass_fractions', &
+            & parallelism='[seq]', cray_inline=True)
+        
+        type(scalar_field), dimension(sys_size), intent(in) :: q_vf
+        integer, intent(in) :: i, j, k
+        real(wp), dimension(num_species), intent(out) :: Ys_gas
+        
+        integer :: fl, sp
+        real(wp) :: alpha_gas, rho_gas
+        real(wp), parameter :: eps = 1.0e-12_wp
+        
+        ! Compute gas phase volume fraction and density
+        ! Skip liquid phase (index liquid_phase_idx)
+        alpha_gas = 0.0_wp
+        rho_gas = 0.0_wp
+        
+        if (chem_params%multiphase) then
+            $:GPU_LOOP(parallelism='[seq]')
+            do fl = 1, num_fluids
+                if (fl /= chem_params%liquid_phase_idx) then
+                    alpha_gas = alpha_gas + q_vf(fl + advxb - 1)%sf(i, j, k)
+                    rho_gas = rho_gas + q_vf(fl + contxb - 1)%sf(i, j, k)
+                end if
+            end do
+        else
+            ! Single fluid case - use first continuity variable
+            rho_gas = q_vf(contxb)%sf(i, j, k)
+            alpha_gas = 1.0_wp
+        end if
+        
+        ! Convert species conservative to mass fractions
+        ! Species conservative variables are: alpha_g * rho_g * Y_k
+        ! Mass fractions: Y_k = (alpha_g * rho_g * Y_k) / rho_g
+        $:GPU_LOOP(parallelism='[seq]')
+        do sp = chemxb, chemxe
+            Ys_gas(sp - chemxb + 1) = q_vf(sp)%sf(i, j, k) / max(rho_gas, eps)
+            ! Clamp to valid range
+            Ys_gas(sp - chemxb + 1) = max(0.0_wp, min(1.0_wp, Ys_gas(sp - chemxb + 1)))
+        end do
+        
+    end subroutine s_convert_gas_species_to_mass_fractions
 
     impure subroutine s_finalize_variables_conversion_module()
 
