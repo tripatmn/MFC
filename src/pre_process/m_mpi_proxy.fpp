@@ -42,10 +42,12 @@ contains
             & 'weno_order', 'precision', 'perturb_flow_fluid',                 &
             & 'perturb_sph_fluid', 'num_patches', 'thermal', 'nb', 'dist_type',&
             & 'relax_model', 'num_ibs', 'n_start', 'elliptic_smoothing_iters', &
+            & 'chem_gas_fluid_id', 'chem_gas_num_fluids', &
             & 'num_bc_patches', 'mixlayer_perturb_nk', 'recon_type',           &
             & 'muscl_order', 'igr_order' ]
             call MPI_BCAST(${VAR}$, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
         #:endfor
+        call MPI_BCAST(chem_gas_fluid_ids(1), num_fluids_max, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
 
         #:for VAR in [ 'old_grid','old_ic','stretch_x','stretch_y','stretch_z',&
             & 'cyl_coord','mpp_lim','hypoelasticity', 'relax', 'parallel_io',  &
@@ -58,6 +60,10 @@ contains
             & 'igr', 'down_sample', 'simplex_perturb','fft_wrt', 'hyper_cleaning' ]
             call MPI_BCAST(${VAR}$, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
         #:endfor
+        call MPI_BCAST(chem_fixed_T_enable, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
+        call MPI_BCAST(chem_fixed_T, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
+        call MPI_BCAST(chem_T_min, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
+        call MPI_BCAST(chem_T_max, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
         call MPI_BCAST(fluid_rho(1), num_fluids_max, mpi_p, 0, MPI_COMM_WORLD, ierr)
 
         #:for VAR in [ 'x_domain%beg', 'x_domain%end', 'y_domain%beg',         &

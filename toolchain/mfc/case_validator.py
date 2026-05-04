@@ -1600,6 +1600,81 @@ class CaseValidator:  # pylint: disable=too-many-public-methods
         is provided. No static validation is performed here - chemistry will fail at
         runtime if misconfigured.
         """
+        if self.get("chemistry", 'F') != 'T':
+            return
+
+        gas_id = self.get("chem_gas_fluid_id", 1)
+        num_fluids = self.get("num_fluids")
+
+        if gas_id is None:
+            gas_id = 1
+
+        if num_fluids is not None:
+            self.prohibit(gas_id < 1 or gas_id > num_fluids,
+                          "chem_gas_fluid_id must be between 1 and num_fluids")
+
+        gas_num = self.get("chem_gas_num_fluids", 0)
+        if gas_num is None:
+            gas_num = 0
+        self.prohibit(gas_num < 0, "chem_gas_num_fluids must be >= 0")
+        if gas_num > 0:
+            if num_fluids is not None:
+                self.prohibit(gas_num > num_fluids,
+                              "chem_gas_num_fluids must be <= num_fluids")
+            for i in range(1, gas_num + 1):
+                fluid_id = self.get(f"chem_gas_fluid_ids({i})")
+                self.prohibit(fluid_id is None,
+                              f"chem_gas_fluid_ids({i}) must be set")
+                if fluid_id is not None and num_fluids is not None:
+                    self.prohibit(fluid_id < 1 or fluid_id > num_fluids,
+                                  f"chem_gas_fluid_ids({i}) must be between 1 and num_fluids")
+
+        tmin = self.get("chem_T_min", 250.0)
+        tmax = self.get("chem_T_max", 3000.0)
+        tfixed = self.get("chem_fixed_T", 300.0)
+        if tmin is None:
+            tmin = 250.0
+        if tmax is None:
+            tmax = 3000.0
+        if tfixed is None:
+            tfixed = 300.0
+        self.prohibit(tmin <= 0, "chem_T_min must be > 0")
+        self.prohibit(tmax < tmin, "chem_T_max must be >= chem_T_min")
+        self.prohibit(tfixed <= 0, "chem_fixed_T must be > 0")
+
+        if self.get("user_species_source", 'F') == 'T':
+            sid = self.get("user_species_id", 1)
+            if sid is None:
+                sid = 1
+            self.prohibit(sid < 1, "user_species_id must be >= 1")
+
+        if self.get("evap_species_source", 'F') == 'T':
+            fsid = self.get("fuel_species_id", 1)
+            lid = self.get("evap_liquid_fluid_id", 1)
+            ath = self.get("evap_alpha_thresh", 0.01)
+            alo = self.get("evap_alpha_lo", 1e-3)
+            ahi = self.get("evap_alpha_hi", 1 - 1e-3)
+
+            if fsid is None:
+                fsid = 1
+            if lid is None:
+                lid = 1
+            if ath is None:
+                ath = 0.01
+            if alo is None:
+                alo = 1e-3
+            if ahi is None:
+                ahi = 1 - 1e-3
+
+            self.prohibit(fsid < 1, "fuel_species_id must be >= 1")
+            self.prohibit(lid < 1, "evap_liquid_fluid_id must be >= 1")
+            if num_fluids is not None:
+                self.prohibit(lid > num_fluids,
+                              "evap_liquid_fluid_id must be between 1 and num_fluids")
+            self.prohibit(ath < 0, "evap_alpha_thresh must be >= 0")
+            self.prohibit(alo < 0, "evap_alpha_lo must be >= 0")
+            self.prohibit(ahi > 1, "evap_alpha_hi must be <= 1")
+            self.prohibit(alo >= ahi, "evap_alpha_lo must be < evap_alpha_hi")
 
     def check_misc_pre_process(self):
         """Checks miscellaneous pre-process constraints"""

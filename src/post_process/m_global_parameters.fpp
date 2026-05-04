@@ -305,6 +305,23 @@ module m_global_parameters
     !> @}
 
     type(chemistry_parameters) :: chem_params
+    integer :: chem_gas_fluid_id !< Fluid index used as gas phase for chemistry
+    integer :: chem_gas_num_fluids !< Number of gas fluids used for chemistry density
+    integer, dimension(num_fluids_max) :: chem_gas_fluid_ids !< Fluid ids used for chemistry gas density
+    logical :: chem_fixed_T_enable !< Enable validation-only fixed chemistry temperature for multi-fluid cases
+    real(wp) :: chem_fixed_T !< Validation-only fixed chemistry temperature
+    real(wp) :: chem_T_min !< Minimum chemistry temperature passed to thermochemistry
+    real(wp) :: chem_T_max !< Maximum chemistry temperature passed to thermochemistry
+    logical :: user_species_source !< User-defined species source hook toggle
+    integer :: user_species_id !< Species index for user-defined source term
+    real(wp) :: user_species_src !< User-defined source term value
+    integer :: fuel_species_id !< Fuel species index for evaporation species source
+    logical :: evap_species_source !< Enable evaporation-gated species source hook
+    real(wp) :: evap_species_src !< Species source term value for evaporation coupling hook
+    integer :: evap_liquid_fluid_id !< Fluid index used to determine liquid volume fraction
+    real(wp) :: evap_alpha_thresh !< Liquid volume-fraction threshold for species source activation
+    real(wp) :: evap_alpha_lo !< Lower liquid volume-fraction bound for interface-band species source
+    real(wp) :: evap_alpha_hi !< Upper liquid volume-fraction bound for interface-band species source
     !> @name Bubble modeling variables and parameters
     !> @{
     integer :: nb
@@ -517,6 +534,23 @@ contains
 
         fd_order = dflt_int
         avg_state = dflt_int
+        chem_gas_fluid_id = 1
+        chem_gas_num_fluids = 0
+        chem_gas_fluid_ids(:) = 0
+        chem_fixed_T_enable = .false.
+        chem_fixed_T = 300._wp
+        chem_T_min = 250._wp
+        chem_T_max = 3000._wp
+        user_species_source = .false.
+        user_species_id = 1
+        user_species_src = 0._wp
+        fuel_species_id = 1
+        evap_species_source = .false.
+        evap_species_src = 0._wp
+        evap_liquid_fluid_id = 1
+        evap_alpha_thresh = 0.01_wp
+        evap_alpha_lo = 1e-3_wp
+        evap_alpha_hi = 1._wp - 1e-3_wp
 
         ! Tait EOS
         rhoref = dflt_real

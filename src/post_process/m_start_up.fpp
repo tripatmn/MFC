@@ -116,7 +116,11 @@ contains
             lag_rad_wrt, lag_rvel_wrt, lag_r0_wrt, lag_rmax_wrt, &
             lag_rmin_wrt, lag_dphidt_wrt, lag_pres_wrt, lag_mv_wrt, &
             lag_mg_wrt, lag_betaT_wrt, lag_betaC_wrt, &
-            alpha_rho_e_wrt
+            alpha_rho_e_wrt, chem_gas_fluid_id, chem_gas_num_fluids, chem_gas_fluid_ids, &
+            chem_fixed_T_enable, chem_fixed_T, chem_T_min, chem_T_max, &
+            user_species_source, user_species_id, user_species_src, &
+            fuel_species_id, evap_species_source, evap_species_src, &
+            evap_liquid_fluid_id, evap_alpha_thresh, evap_alpha_lo, evap_alpha_hi
 
         ! Inquiring the status of the post_process.inp file
         file_loc = 'post_process.inp'

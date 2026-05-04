@@ -66,6 +66,9 @@ module m_time_steppers
     type(scalar_field) :: q_T_sf !<
     !! Cell-average temperature variables at the current time-stage
 
+    type(scalar_field) :: m_dot_evap !<
+    !! Cell-average liquid-to-vapor mass-transfer rate from relaxation
+
     real(wp), allocatable, dimension(:, :, :, :, :) :: rhs_mv
 
     real(wp), allocatable, dimension(:, :, :) :: max_dt
@@ -77,7 +80,7 @@ module m_time_steppers
     real(wp), allocatable, dimension(:, :) :: rk_coef
     integer, private :: num_probe_ts
 
-    $:GPU_DECLARE(create='[q_cons_ts,q_prim_vf,q_T_sf,rhs_vf,q_prim_ts1,q_prim_ts2,rhs_mv,rhs_pb,max_dt,rk_coef,stor,bc_type]')
+    $:GPU_DECLARE(create='[q_cons_ts,q_prim_vf,q_T_sf,m_dot_evap,rhs_vf,q_prim_ts1,q_prim_ts2,rhs_mv,rhs_pb,max_dt,rk_coef,stor,bc_type]')
 
 !> @cond
 #if defined(__NVCOMPILER_GPU_UNIFIED_MEM)
@@ -467,6 +470,12 @@ contains
             @:ALLOCATE(max_dt(0:m, 0:n, 0:p))
         end if
 
+        if (relax) then
+            @:ALLOCATE(m_dot_evap%sf(0:m, 0:n, 0:p))
+            @:ACC_SETUP_SFs(m_dot_evap)
+            call s_reset_m_dot_evap()
+        end if
+
         ! Allocating arrays to store the bc types
         @:ALLOCATE(bc_type(1:num_dims,1:2))
 
@@ -586,6 +595,7 @@ contains
                 end do
             end do
             $:END_GPU_PARALLEL_LOOP()
+
             !Evolve pb and mv for non-polytropic qbmm
             if (qbmm .and. (.not. polytropic)) then
                 $:GPU_PARALLEL_LOOP(collapse=5)
@@ -657,6 +667,130 @@ contains
         end if
 
     end subroutine s_tvd_rk
+
+    subroutine s_reset_m_dot_evap()
+        integer :: j, k, l
+
+        if (.not. relax) return
+
+        $:GPU_PARALLEL_LOOP(collapse=3, private='[j,k,l]')
+        do l = 0, p
+            do k = 0, n
+                do j = 0, m
+                    m_dot_evap%sf(j, k, l) = 0._wp
+                end do
+            end do
+        end do
+        $:END_GPU_PARALLEL_LOOP()
+    end subroutine s_reset_m_dot_evap
+
+    subroutine s_apply_evap_to_fuel_species(q_cons_vf, ldt, t_step)
+        type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
+        real(wp), intent(in) :: ldt
+        integer, intent(in) :: t_step
+        integer :: fuel_species_eqn
+        integer :: j, k, l
+        real(wp) :: contrib
+        real(wp) :: min_loc, max_loc, sum_loc, count_loc
+        real(wp) :: min_glb, max_glb, sum_glb, count_glb, mean_glb
+
+        if (.not. relax) return
+        if (.not. chemistry) return
+        if (.not. evap_species_source) return
+        if (fuel_species_id < 1 .or. fuel_species_id > (chemxe - chemxb + 1)) return
+
+        fuel_species_eqn = chemxb + fuel_species_id - 1
+
+        $:GPU_PARALLEL_LOOP(collapse=3, private='[j,k,l]')
+        do l = 0, p
+            do k = 0, n
+                do j = 0, m
+                    q_cons_vf(fuel_species_eqn)%sf(j, k, l) = q_cons_vf(fuel_species_eqn)%sf(j, k, l) &
+                                                               + ldt*max(0._wp, m_dot_evap%sf(j, k, l))
+                end do
+            end do
+        end do
+        $:END_GPU_PARALLEL_LOOP()
+
+        $:GPU_UPDATE(host='[m_dot_evap%sf]')
+
+        min_loc = huge(1._wp)
+        max_loc = 0._wp
+        sum_loc = 0._wp
+        count_loc = 0._wp
+
+        do l = 0, p
+            do k = 0, n
+                do j = 0, m
+                    contrib = ldt*max(0._wp, m_dot_evap%sf(j, k, l))
+                    sum_loc = sum_loc + contrib
+                    if (contrib > 0._wp) then
+                        min_loc = min(min_loc, contrib)
+                        max_loc = max(max_loc, contrib)
+                        count_loc = count_loc + 1._wp
+                    end if
+                end do
+            end do
+        end do
+
+        if (num_procs > 1) then
+            call s_mpi_allreduce_min(min_loc, min_glb)
+            call s_mpi_allreduce_max(max_loc, max_glb)
+            call s_mpi_allreduce_sum(sum_loc, sum_glb)
+            call s_mpi_allreduce_sum(count_loc, count_glb)
+        else
+            min_glb = min_loc
+            max_glb = max_loc
+            sum_glb = sum_loc
+            count_glb = count_loc
+        end if
+
+        if (count_glb > 0._wp) then
+            mean_glb = sum_glb/count_glb
+        else
+            min_glb = 0._wp
+            mean_glb = 0._wp
+        end if
+
+        if (proc_rank == 0) then
+            print '(" evap fuel add @ t_step = ", I8, " min_pos = ", ES16.6, " max_pos = ", ES16.6, " mean_pos = ", ES16.6, " total = ", ES16.6)', &
+                t_step, min_glb, max_glb, mean_glb, sum_glb
+        end if
+    end subroutine s_apply_evap_to_fuel_species
+
+    subroutine s_diagnose_m_dot_evap(t_step)
+        integer, intent(in) :: t_step
+        real(wp) :: min_loc, max_loc, sum_loc, count_loc
+        real(wp) :: min_glb, max_glb, sum_glb, count_glb, mean_glb
+
+        if (.not. relax) return
+
+        $:GPU_UPDATE(host='[m_dot_evap%sf]')
+
+        min_loc = minval(m_dot_evap%sf)
+        max_loc = maxval(m_dot_evap%sf)
+        sum_loc = sum(m_dot_evap%sf)
+        count_loc = real(size(m_dot_evap%sf), wp)
+
+        if (num_procs > 1) then
+            call s_mpi_allreduce_min(min_loc, min_glb)
+            call s_mpi_allreduce_max(max_loc, max_glb)
+            call s_mpi_allreduce_sum(sum_loc, sum_glb)
+            call s_mpi_allreduce_sum(count_loc, count_glb)
+        else
+            min_glb = min_loc
+            max_glb = max_loc
+            sum_glb = sum_loc
+            count_glb = count_loc
+        end if
+
+        mean_glb = sum_glb/count_glb
+
+        if (proc_rank == 0) then
+            print '(" m_dot_evap @ t_step = ", I8, " min = ", ES16.6, " max = ", ES16.6, " mean = ", ES16.6)', &
+                t_step, min_glb, max_glb, mean_glb
+        end if
+    end subroutine s_diagnose_m_dot_evap
 
     !> Bubble source part in Strang operator splitting scheme
         !! @param stage Current time-stage
@@ -1044,6 +1178,10 @@ contains
         end do
 
         @:DEALLOCATE(rhs_vf)
+
+        if (relax) then
+            @:DEALLOCATE(m_dot_evap%sf)
+        end if
 
         ! Writing the footer of and closing the run-time information file
         if (proc_rank == 0 .and. run_time_info) then

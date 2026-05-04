@@ -95,11 +95,13 @@ contains
             & 'wave_speeds', 'avg_state', 'precision', 'bc_x%beg', 'bc_x%end', &
             & 'bc_y%beg', 'bc_y%end', 'bc_z%beg', 'bc_z%end',  'fd_order',     &
             & 'num_probes', 'num_integrals', 'bubble_model', 'thermal',        &
-            & 'num_source', 'relax_model', 'num_ibs', 'n_start',    &
+            & 'num_source', 'relax_model', 'num_ibs', 'n_start', 'chem_gas_fluid_id', &
+            & 'chem_gas_num_fluids', &
             & 'num_bc_patches', 'num_igr_iters', 'num_igr_warm_start_iters', &
             & 'adap_dt_max_iters' ]
             call MPI_BCAST(${VAR}$, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
         #:endfor
+        call MPI_BCAST(chem_gas_fluid_ids(1), num_fluids_max, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
 
         #:for VAR in [ 'run_time_info','cyl_coord', 'mpp_lim',     &
             &  'mp_weno', 'rdma_mpi', 'cont_damage', 'bc_io', &
@@ -117,6 +119,10 @@ contains
             & 'hyper_cleaning' ]
             call MPI_BCAST(${VAR}$, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
         #:endfor
+        call MPI_BCAST(chem_fixed_T_enable, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
+        call MPI_BCAST(chem_fixed_T, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
+        call MPI_BCAST(chem_T_min, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
+        call MPI_BCAST(chem_T_max, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
 
         if (chemistry) then
             #:for VAR in [ 'diffusion', 'reactions' ]

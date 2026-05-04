@@ -175,7 +175,12 @@ contains
             hyper_cleaning, hyper_cleaning_speed, hyper_cleaning_tau, &
             alf_factor, num_igr_iters, num_igr_warm_start_iters, &
             int_comp, ic_eps, ic_beta, nv_uvm_out_of_core, &
-            nv_uvm_igr_temps_on_gpu, nv_uvm_pref_gpu, down_sample, fft_wrt
+            nv_uvm_igr_temps_on_gpu, nv_uvm_pref_gpu, down_sample, fft_wrt, &
+            chem_gas_fluid_id, chem_gas_num_fluids, chem_gas_fluid_ids, &
+            chem_fixed_T_enable, chem_fixed_T, chem_T_min, chem_T_max, &
+            user_species_source, user_species_id, user_species_src, &
+            fuel_species_id, evap_species_source, evap_species_src, &
+            evap_liquid_fluid_id, evap_alpha_thresh, evap_alpha_lo, evap_alpha_hi
 
         ! Checking that an input file has been provided by the user. If it
         ! has, then the input file is read in, otherwise, simulation exits.
@@ -839,6 +844,8 @@ contains
             end if
         end if
 
+        if (relax) call s_reset_m_dot_evap()
+
         if (probe_wrt) then
             do i = 1, sys_size
                 $:GPU_UPDATE(host='[q_cons_ts(1)%vf(i)%sf]')
@@ -852,7 +859,11 @@ contains
             call s_tvd_rk(t_step, time_avg, time_stepper)
         end if
 
-        if (relax) call s_infinite_relaxation_k(q_cons_ts(1)%vf)
+        if (relax) then
+            call s_infinite_relaxation_k(q_cons_ts(1)%vf, m_dot_evap, dt)
+            call s_apply_evap_to_fuel_species(q_cons_ts(1)%vf, dt, t_step)
+            call s_diagnose_m_dot_evap(t_step)
+        end if
 
         ! Time-stepping loop controls
         t_step = t_step + 1

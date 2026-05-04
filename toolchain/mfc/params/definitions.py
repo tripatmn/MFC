@@ -202,6 +202,20 @@ _SIMPLE_DESCS = {
     "polydisperse": "Enable polydisperse bubbles",
     "qbmm": "Enable QBMM",
     "chemistry": "Enable chemistry",
+    "chem_fixed_T_enable": "Enable validation-only fixed chemistry temperature",
+    "chem_fixed_T": "Validation-only fixed chemistry temperature",
+    "chem_T_min": "Minimum chemistry temperature",
+    "chem_T_max": "Maximum chemistry temperature",
+    "user_species_source": "Enable user source term in a species equation",
+    "user_species_id": "Species index to apply user source term",
+    "user_species_src": "User source term value for selected species equation",
+    "fuel_species_id": "Fuel species index for evaporation source coupling",
+    "evap_species_source": "Enable evaporation-gated source in a species equation",
+    "evap_species_src": "Evaporation source term value for selected fuel species",
+    "evap_liquid_fluid_id": "Liquid fluid index used for evaporation source gating",
+    "evap_alpha_thresh": "Liquid volume-fraction threshold for evaporation species source",
+    "evap_alpha_lo": "Lower liquid volume-fraction bound for interface-band evaporation species source",
+    "evap_alpha_hi": "Upper liquid volume-fraction bound for interface-band evaporation species source",
     "surface_tension": "Enable surface tension",
     "hypoelasticity": "Enable hypoelastic model",
     "hyperelasticity": "Enable hyperelastic model",
@@ -217,6 +231,9 @@ _SIMPLE_DESCS = {
     # Misc
     "case_dir": "Case directory path",
     "cantera_file": "Cantera mechanism file",
+    "chem_gas_fluid_id": "Gas fluid index used by chemistry source terms",
+    "chem_gas_num_fluids": "Number of gas fluids used by chemistry source terms",
+    "chem_gas_fluid_ids": "Gas fluid indices used by chemistry source terms",
     "num_ibs": "Number of immersed boundaries",
     "num_source": "Number of acoustic sources",
     "num_probes": "Number of probes",
@@ -912,6 +929,22 @@ def _load():  # pylint: disable=too-many-locals,too-many-statements
     # --- Chemistry ---
     _r("cantera_file", STR, {"chemistry"})
     _r("chemistry", LOG, {"chemistry"})
+    _r("chem_gas_fluid_id", INT, {"chemistry"})
+    _r("chem_gas_num_fluids", INT, {"chemistry"})
+    _r("chem_fixed_T_enable", LOG, {"chemistry"})
+    _r("chem_fixed_T", REAL, {"chemistry"})
+    _r("chem_T_min", REAL, {"chemistry"})
+    _r("chem_T_max", REAL, {"chemistry"})
+    _r("user_species_source", LOG, {"chemistry"})
+    _r("user_species_id", INT, {"chemistry"})
+    _r("user_species_src", REAL, {"chemistry"})
+    _r("fuel_species_id", INT, {"chemistry"})
+    _r("evap_species_source", LOG, {"chemistry"})
+    _r("evap_species_src", REAL, {"chemistry"})
+    _r("evap_liquid_fluid_id", INT, {"chemistry"})
+    _r("evap_alpha_thresh", REAL, {"chemistry"})
+    _r("evap_alpha_lo", REAL, {"chemistry"})
+    _r("evap_alpha_hi", REAL, {"chemistry"})
 
     # --- Acoustic ---
     _r("num_source", INT, {"acoustic"})
@@ -1186,6 +1219,9 @@ def _load():  # pylint: disable=too-many-locals,too-many-statements
     for j in range(1, 101):
         _r(f"chem_wrt_Y({j})", LOG, {"chemistry", "output"})
     _r("chem_wrt_T", LOG, {"chemistry", "output"})
+
+    for j in range(1, NF + 1):
+        _r(f"chem_gas_fluid_ids({j})", INT, {"chemistry"})
 
     # --- fluid_rho ---
     for f in range(1, NF + 1):

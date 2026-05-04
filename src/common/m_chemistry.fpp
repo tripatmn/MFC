@@ -9,6 +9,8 @@
 !> @brief Multi-species chemistry interface for thermodynamic properties, reaction rates, and transport coefficients
 module m_chemistry
 
+    use m_derived_types, only: scalar_field
+
     use m_thermochem, only: &
         num_species, molecular_weights, get_temperature, get_net_production_rates, &
         get_mole_fractions, get_species_binary_mass_diffusivities, &
@@ -17,6 +19,7 @@ module m_chemistry
         get_mixture_viscosity_mixavg, get_mixture_specific_heat_cp_mass, get_mixture_enthalpy_mass
 
     use m_global_parameters
+    use ieee_arithmetic
 
     implicit none
 
@@ -31,8 +34,33 @@ module m_chemistry
     $:GPU_DECLARE(create='[isc1, isc2, isc3]')
     integer, dimension(3) :: offsets
     $:GPU_DECLARE(create='[offsets]')
+    real(wp), parameter :: chem_rho_g_min = 1.0e-14_wp
 
 contains
+
+    !> @brief Computes the gas density used to convert rhoY_k into gas species mass fractions.
+    subroutine s_compute_chemistry_gas_density(q_cons_vf, x, y, z, rho_g)
+        $:GPU_ROUTINE(function_name='s_compute_chemistry_gas_density',parallelism='[seq]', &
+            & cray_inline=True)
+
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
+        integer, intent(in) :: x, y, z
+        real(wp), intent(out) :: rho_g
+
+        integer :: i, fluid_id
+
+        rho_g = 0._wp
+
+        if (chem_gas_num_fluids <= 0) then
+            rho_g = q_cons_vf(contxb + chem_gas_fluid_id - 1)%sf(x, y, z)
+        else
+            do i = 1, chem_gas_num_fluids
+                fluid_id = chem_gas_fluid_ids(i)
+                rho_g = rho_g + q_cons_vf(contxb + fluid_id - 1)%sf(x, y, z)
+            end do
+        end if
+
+    end subroutine s_compute_chemistry_gas_density
 
     !> @brief Computes mixture viscosities for left and right states and inverts them for use as reciprocal Reynolds numbers.
     subroutine compute_viscosity_and_inversion(T_L, Ys_L, T_R, Ys_R, Re_L, Re_R)
@@ -62,15 +90,23 @@ contains
         type(int_bounds_info), dimension(1:3), intent(in) :: bounds
 
         integer :: x, y, z, eqn
-        real(wp) :: energy, T_in
+        real(wp) :: energy, T_in, rho_g
         real(wp), dimension(num_species) :: Ys
 
         do z = bounds(3)%beg, bounds(3)%end
             do y = bounds(2)%beg, bounds(2)%end
                 do x = bounds(1)%beg, bounds(1)%end
+                    call s_compute_chemistry_gas_density(q_cons_vf, x, y, z, rho_g)
+                    rho_g = max(rho_g, chem_rho_g_min)
+
+                    if (chemistry .and. num_fluids > 1 .and. chem_fixed_T_enable) then
+                        q_T_sf%sf(x, y, z) = min(max(chem_fixed_T, chem_T_min), chem_T_max)
+                        cycle
+                    end if
+
                     do eqn = chemxb, chemxe
                         Ys(eqn - chemxb + 1) = &
-                            q_cons_vf(eqn)%sf(x, y, z)/q_cons_vf(contxb)%sf(x, y, z)
+                            max(0._wp, q_cons_vf(eqn)%sf(x, y, z)/rho_g)
                     end do
 
                     ! e = E - 1/2*|u|^2
@@ -130,7 +166,7 @@ contains
         integer :: x, y, z
         integer :: eqn
         real(wp) :: T
-        real(wp) :: rho, omega_m
+        real(wp) :: rho, rho_g, rhoYk, raw_Y, Y_sum, omega_m
         #:if not MFC_CASE_OPTIMIZATION and USING_AMD
             real(wp), dimension(10) :: Ys
             real(wp), dimension(10) :: omega
@@ -139,20 +175,60 @@ contains
             real(wp), dimension(num_species) :: omega
         #:endif
 
-        $:GPU_PARALLEL_LOOP(collapse=3, private='[Ys, omega, eqn, T, rho, omega_m]', copyin='[bounds]')
+        $:GPU_PARALLEL_LOOP(collapse=3, private='[Ys, omega, eqn, T, rho, rho_g, rhoYk, raw_Y, Y_sum, omega_m]', copyin='[bounds]')
         do z = bounds(3)%beg, bounds(3)%end
             do y = bounds(2)%beg, bounds(2)%end
                 do x = bounds(1)%beg, bounds(1)%end
 
-                    $:GPU_LOOP(parallelism='[seq]')
-                    do eqn = chemxb, chemxe
-                        Ys(eqn - chemxb + 1) = q_prim_qp(eqn)%sf(x, y, z)
-                    end do
+                    if (num_fluids > 1) then
+                        call s_compute_chemistry_gas_density(q_cons_qp, x, y, z, rho_g)
+                        if ((.not. ieee_is_finite(rho_g)) .or. rho_g <= chem_rho_g_min) then
+                            ! No gas-phase chemistry if designated gas density vanishes.
+                            cycle
+                        end if
 
-                    rho = q_cons_qp(contxe)%sf(x, y, z)
+                        Y_sum = 0._wp
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = chemxb, chemxe
+                            rhoYk = q_cons_qp(eqn)%sf(x, y, z)
+                            if (.not. ieee_is_finite(rhoYk)) then
+                                Ys(eqn - chemxb + 1) = 0._wp
+                            else
+                                raw_Y = rhoYk/rho_g
+                                if (.not. ieee_is_finite(raw_Y)) then
+                                    Ys(eqn - chemxb + 1) = 0._wp
+                                else
+                                    Ys(eqn - chemxb + 1) = min(max(raw_Y, 0._wp), 1._wp)
+                                end if
+                            end if
+                            Y_sum = Y_sum + Ys(eqn - chemxb + 1)
+                        end do
+
+                        if (.not. ieee_is_finite(Y_sum)) cycle
+
+                        if (Y_sum > 1._wp) then
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do eqn = 1, num_species
+                                Ys(eqn) = Ys(eqn)/Y_sum
+                            end do
+                        end if
+
+                        rho = rho_g
+                    else
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = chemxb, chemxe
+                            Ys(eqn - chemxb + 1) = q_prim_qp(eqn)%sf(x, y, z)
+                        end do
+
+                        rho = q_cons_qp(contxe)%sf(x, y, z)
+                    end if
+
                     T = q_T_sf%sf(x, y, z)
+                    if (.not. ieee_is_finite(T)) cycle
+                    T = min(max(T, chem_T_min), chem_T_max)
 
                     call get_net_production_rates(rho, T, Ys, omega)
+                    if (any(.not. ieee_is_finite(omega))) cycle
 
                     $:GPU_LOOP(parallelism='[seq]')
                     do eqn = chemxb, chemxe
@@ -161,7 +237,9 @@ contains
                         #:else
                             omega_m = molecular_weights(eqn - chemxb + 1)*omega(eqn - chemxb + 1)
                         #:endif
-                        rhs_vf(eqn)%sf(x, y, z) = rhs_vf(eqn)%sf(x, y, z) + omega_m
+                        if (ieee_is_finite(omega_m)) then
+                            rhs_vf(eqn)%sf(x, y, z) = rhs_vf(eqn)%sf(x, y, z) + omega_m
+                        end if
 
                     end do
 

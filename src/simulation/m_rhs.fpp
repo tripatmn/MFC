@@ -649,6 +649,9 @@ contains
 
         real(wp) :: t_start, t_finish
         integer :: id
+        integer :: user_species_eqn
+        integer :: fuel_species_eqn
+        integer :: liquid_alpha_eqn
         integer(kind=8) :: i, j, k, l, q !< Generic loop iterators
 
         call nvtxStartRange("COMPUTE-RHS")
@@ -1054,6 +1057,40 @@ contains
             call nvtxStartRange("RHS-CHEM-REACTIONS")
             call s_compute_chemistry_reaction_flux(rhs_vf, q_cons_qp%vf, q_T_sf, q_prim_qp%vf, idwint)
             call nvtxEndRange
+        end if
+
+        if (chemistry .and. user_species_source) then
+            if (user_species_id >= 1 .and. user_species_id <= (chemxe - chemxb + 1)) then
+                user_species_eqn = chemxb + user_species_id - 1
+                $:GPU_PARALLEL_LOOP(private='[j,k,l]', collapse=3)
+                do l = 0, p
+                    do k = 0, n
+                        do j = 0, m
+                            rhs_vf(user_species_eqn)%sf(j, k, l) = rhs_vf(user_species_eqn)%sf(j, k, l) + user_species_src
+                        end do
+                    end do
+                end do
+                $:END_GPU_PARALLEL_LOOP()
+            end if
+        end if
+
+        if (chemistry .and. evap_species_source) then
+            if (fuel_species_id >= 1 .and. fuel_species_id <= (chemxe - chemxb + 1) .and. &
+                evap_liquid_fluid_id >= 1 .and. evap_liquid_fluid_id <= num_fluids) then
+                fuel_species_eqn = chemxb + fuel_species_id - 1
+                liquid_alpha_eqn = advxb + evap_liquid_fluid_id - 1
+                $:GPU_PARALLEL_LOOP(private='[j,k,l]', collapse=3)
+                do l = 0, p
+                    do k = 0, n
+                        do j = 0, m
+                            if (q_prim_qp%vf(liquid_alpha_eqn)%sf(j, k, l) > evap_alpha_thresh) then
+                                rhs_vf(fuel_species_eqn)%sf(j, k, l) = rhs_vf(fuel_species_eqn)%sf(j, k, l) + evap_species_src
+                            end if
+                        end do
+                    end do
+                end do
+                $:END_GPU_PARALLEL_LOOP()
+            end if
         end if
 
         if (cont_damage) call s_compute_damage_state(q_cons_qp%vf, rhs_vf)
@@ -2175,4 +2212,3 @@ contains
     end subroutine s_finalize_rhs_module
 
 end module m_rhs
-

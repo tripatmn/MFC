@@ -464,7 +464,28 @@ module m_global_parameters
     !> @}
 
     type(chemistry_parameters) :: chem_params
-    $:GPU_DECLARE(create='[chem_params]')
+    integer :: chem_gas_fluid_id !< Fluid index used as gas phase for chemistry
+    integer :: chem_gas_num_fluids !< Number of gas fluids used for chemistry density
+    integer, dimension(num_fluids_max) :: chem_gas_fluid_ids !< Fluid ids used for chemistry gas density
+    logical :: chem_fixed_T_enable !< Enable validation-only fixed chemistry temperature for multi-fluid cases
+    real(wp) :: chem_fixed_T !< Validation-only fixed chemistry temperature
+    real(wp) :: chem_T_min !< Minimum chemistry temperature passed to thermochemistry
+    real(wp) :: chem_T_max !< Maximum chemistry temperature passed to thermochemistry
+    logical :: user_species_source !< User-defined species source hook toggle
+    integer :: user_species_id !< Species index for user-defined source term
+    real(wp) :: user_species_src !< User-defined source term value
+    integer :: fuel_species_id !< Fuel species index for evaporation species source
+    logical :: evap_species_source !< Enable evaporation-gated species source hook
+    real(wp) :: evap_species_src !< Species source term value for evaporation coupling hook
+    integer :: evap_liquid_fluid_id !< Fluid index used to determine liquid volume fraction
+    real(wp) :: evap_alpha_thresh !< Liquid volume-fraction threshold for species source activation
+    real(wp) :: evap_alpha_lo !< Lower liquid volume-fraction bound for interface-band species source
+    real(wp) :: evap_alpha_hi !< Upper liquid volume-fraction bound for interface-band species source
+    $:GPU_DECLARE(create='[chem_params,chem_gas_fluid_id,chem_gas_num_fluids,chem_gas_fluid_ids, &
+        & chem_fixed_T_enable,chem_fixed_T,chem_T_min,chem_T_max, &
+        & user_species_source,user_species_id,user_species_src, &
+        & fuel_species_id,evap_species_source,evap_species_src,evap_liquid_fluid_id,evap_alpha_thresh, &
+        & evap_alpha_lo,evap_alpha_hi]')
 
     !> @name Physical bubble parameters (see Ando 2010, Preston 2007)
     !> @{
@@ -655,6 +676,23 @@ contains
         chem_params%reactions = .false.
         chem_params%gamma_method = 1
         chem_params%transport_model = 1
+        chem_gas_fluid_id = 1
+        chem_gas_num_fluids = 0
+        chem_gas_fluid_ids(:) = 0
+        chem_fixed_T_enable = .false.
+        chem_fixed_T = 300._wp
+        chem_T_min = 250._wp
+        chem_T_max = 3000._wp
+        user_species_source = .false.
+        user_species_id = 1
+        user_species_src = 0._wp
+        fuel_species_id = 1
+        evap_species_source = .false.
+        evap_species_src = 0._wp
+        evap_liquid_fluid_id = 1
+        evap_alpha_thresh = 0.01_wp
+        evap_alpha_lo = 1e-3_wp
+        evap_alpha_hi = 1._wp - 1e-3_wp
 
         num_bc_patches = 0
         bc_io = .false.
@@ -1214,6 +1252,50 @@ contains
             sys_size = species_idx%end
         end if
 
+        if (chemistry) then
+            if (chem_gas_fluid_id < 1 .or. chem_gas_fluid_id > num_fluids) then
+                chem_gas_fluid_id = 1
+            end if
+            if (chem_gas_num_fluids < 0) then
+                chem_gas_num_fluids = 0
+            elseif (chem_gas_num_fluids > num_fluids_max) then
+                chem_gas_num_fluids = num_fluids_max
+            end if
+            do i = 1, chem_gas_num_fluids
+                if (chem_gas_fluid_ids(i) < 1 .or. chem_gas_fluid_ids(i) > num_fluids) then
+                    chem_gas_num_fluids = 0
+                    exit
+                end if
+            end do
+            if (user_species_id < 1 .or. user_species_id > num_species) then
+                user_species_id = 1
+            end if
+            if (fuel_species_id < 1 .or. fuel_species_id > num_species) then
+                fuel_species_id = 1
+            end if
+            if (evap_liquid_fluid_id < 1 .or. evap_liquid_fluid_id > num_fluids) then
+                evap_liquid_fluid_id = 1
+            end if
+            if (evap_alpha_thresh < 0._wp) then
+                evap_alpha_thresh = 0._wp
+            end if
+            if (evap_alpha_lo < 0._wp) then
+                evap_alpha_lo = 0._wp
+            end if
+            if (evap_alpha_hi > 1._wp) then
+                evap_alpha_hi = 1._wp
+            end if
+            if (chem_T_min <= 0._wp) then
+                chem_T_min = 250._wp
+            end if
+            if (chem_T_max < chem_T_min) then
+                chem_T_max = chem_T_min
+            end if
+        else
+            user_species_source = .false.
+            evap_species_source = .false.
+        end if
+
         if (bubbles_euler .and. qbmm .and. .not. polytropic) then
             allocate (MPI_IO_DATA%view(1:sys_size + 2*nb*4))
             allocate (MPI_IO_DATA%var(1:sys_size + 2*nb*4))
@@ -1333,7 +1415,11 @@ contains
 
         $:GPU_UPDATE(device='[Bx0]')
 
-        $:GPU_UPDATE(device='[chem_params]')
+        $:GPU_UPDATE(device='[chem_params,chem_gas_fluid_id,chem_gas_num_fluids,chem_gas_fluid_ids, &
+            & chem_fixed_T_enable,chem_fixed_T,chem_T_min,chem_T_max, &
+            & user_species_source,user_species_id,user_species_src, &
+            & fuel_species_id,evap_species_source,evap_species_src,evap_liquid_fluid_id,evap_alpha_thresh, &
+            & evap_alpha_lo,evap_alpha_hi]')
 
         $:GPU_UPDATE(device='[cont_damage,tau_star,cont_damage_s,alpha_bar]')
 

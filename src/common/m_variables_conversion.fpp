@@ -22,6 +22,8 @@ module m_variables_conversion
         num_species, get_temperature, get_pressure, gas_constant, &
         get_mixture_molecular_weight, get_mixture_energy_mass
 
+    use m_chemistry, only: s_compute_chemistry_gas_density
+
     implicit none
 
     private; 
@@ -132,15 +134,19 @@ contains
         real(wp) :: E_e
         real(wp) :: e_Per_Kg, Pdyn_Per_Kg
         real(wp) :: T_guess
+        real(wp) :: pres_mag_local
 
         integer :: s !< Generic loop iterator
+
+        pres_mag_local = 0._wp
+        if (present(pres_mag)) pres_mag_local = pres_mag
 
         #:if not chemistry
             ! Depending on model_eqns and bubbles_euler, the appropriate procedure
             ! for computing pressure is targeted by the procedure pointer
 
             if (mhd) then
-                pres = (energy - dyn_p - pi_inf - qv - pres_mag)/gamma
+                pres = (energy - dyn_p - pi_inf - qv - pres_mag_local)/gamma
             elseif ((model_eqns /= 4) .and. (bubbles_euler .neqv. .true.)) then
                 pres = (energy - dyn_p - pi_inf - qv)/gamma
             else if ((model_eqns /= 4) .and. bubbles_euler) then
@@ -174,6 +180,43 @@ contains
             end if
 
         #:else
+
+            if (num_fluids > 1) then
+                if (mhd) then
+                    pres = (energy - dyn_p - pi_inf - qv - pres_mag_local)/gamma
+                elseif ((model_eqns /= 4) .and. (bubbles_euler .neqv. .true.)) then
+                    pres = (energy - dyn_p - pi_inf - qv)/gamma
+                else if ((model_eqns /= 4) .and. bubbles_euler) then
+                    pres = ((energy - dyn_p)/(1._wp - alf) - pi_inf - qv)/gamma
+                else
+                    pres = (pref + pi_inf)* &
+                           (energy/(rhoref*(1 - alf)))**(1/gamma + 1) - pi_inf
+                end if
+
+                if (hypoelasticity .and. present(G)) then
+                    ! calculate elastic contribution to Energy
+                    E_e = 0._wp
+                    do s = stress_idx%beg, stress_idx%end
+                        if (G > 0) then
+                            E_e = E_e + ((stress/rho)**2._wp)/(4._wp*G)
+                            ! Double for shear stresses
+                            if (any(s == shear_indices)) then
+                                E_e = E_e + ((stress/rho)**2._wp)/(4._wp*G)
+                            end if
+                        end if
+                    end do
+
+                    pres = ( &
+                           energy - &
+                           0.5_wp*(mom**2._wp)/rho - &
+                           pi_inf - qv - E_e &
+                           )/gamma
+                end if
+
+                pres = max(pres, 1.0e2_wp)
+
+                return
+            end if
 
             Y_rs(:) = rhoYks(:)/rho
             e_Per_Kg = energy/rho
@@ -603,7 +646,8 @@ contains
             real(wp) :: rhoYks(1:num_species)
         #:endif
         real(wp), dimension(2) :: Re_K
-        real(wp) :: rho_K, gamma_K, pi_inf_K, qv_K, dyn_pres_K
+        real(wp) :: rho_K, gamma_K, pi_inf_K, qv_K, dyn_pres_K, rho_g
+        real(wp) :: Y_sum
 
         real(wp) :: vftmp, nbub_sc
 
@@ -612,6 +656,7 @@ contains
         real(wp) :: pres
 
         integer :: i, j, k, l !< Generic loop iterators
+        integer :: gas_idx, fluid_id
 
         real(wp) :: T
         real(wp) :: pres_mag
@@ -626,7 +671,7 @@ contains
         real(wp) :: f, dGa_dW, dp_dW, df_dW ! Functions within Newton-Raphson iteration
         integer :: iter ! Newton-Raphson iteration counter
 
-        $:GPU_PARALLEL_LOOP(collapse=3, private='[alpha_K, alpha_rho_K, Re_K, nRtmp, rho_K, gamma_K, pi_inf_K,qv_K, dyn_pres_K, rhoYks, B, pres, vftmp, nbub_sc, G_K, T, pres_mag, Ga, B2, m2, S, W, dW, E, D, f, dGa_dW, dp_dW, df_dW, iter ]')
+        $:GPU_PARALLEL_LOOP(collapse=3, private='[alpha_K, alpha_rho_K, Re_K, nRtmp, rho_K, gamma_K, pi_inf_K,qv_K, dyn_pres_K, rho_g, Y_sum, rhoYks, gas_idx, fluid_id, B, pres, vftmp, nbub_sc, G_K, T, pres_mag, Ga, B2, m2, S, W, dW, E, D, f, dGa_dW, dp_dW, df_dW, iter ]')
         do l = ibounds(3)%beg, ibounds(3)%end
             do k = ibounds(2)%beg, ibounds(2)%end
                 do j = ibounds(1)%beg, ibounds(1)%end
@@ -730,7 +775,7 @@ contains
                         cycle ! skip all the non-relativistic conversions below
                     end if
 
-                    if (chemistry) then
+                    if (chemistry .and. num_fluids == 1) then
                         rho_K = 0._wp
                         $:GPU_LOOP(parallelism='[seq]')
                         do i = chemxb, chemxe
@@ -746,6 +791,28 @@ contains
                         do i = chemxb, chemxe
                             qK_prim_vf(i)%sf(j, k, l) = max(0._wp, qK_cons_vf(i)%sf(j, k, l)/rho_K)
                         end do
+                    elseif (chemistry) then
+                        call s_compute_chemistry_gas_density(qK_cons_vf, j, k, l, rho_g)
+                        rho_g = max(rho_g, sgm_eps)
+
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do i = 1, contxe
+                            qK_prim_vf(i)%sf(j, k, l) = qK_cons_vf(i)%sf(j, k, l)
+                        end do
+
+                        Y_sum = 0._wp
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do i = chemxb, chemxe
+                            qK_prim_vf(i)%sf(j, k, l) = min(max(qK_cons_vf(i)%sf(j, k, l)/rho_g, 0._wp), 1._wp)
+                            Y_sum = Y_sum + qK_prim_vf(i)%sf(j, k, l)
+                        end do
+
+                        if (Y_sum > 1._wp) then
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do i = chemxb, chemxe
+                                qK_prim_vf(i)%sf(j, k, l) = qK_prim_vf(i)%sf(j, k, l)/Y_sum
+                            end do
+                        end if
                     else
                         $:GPU_LOOP(parallelism='[seq]')
                         do i = 1, contxe
@@ -777,6 +844,13 @@ contains
                         end do
 
                         T = q_T_sf%sf(j, k, l)
+                    end if
+
+                    if (chemistry .and. num_fluids > 1 .and. model_eqns == 3) then
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do i = advxb, advxe
+                            qK_prim_vf(i)%sf(j, k, l) = qK_cons_vf(i)%sf(j, k, l)
+                        end do
                     end if
 
                     if (mhd) then
@@ -924,9 +998,11 @@ contains
         real(wp), dimension(2) :: Re_K
 
         integer :: i, j, k, l !< Generic loop iterators
+        integer :: gas_idx, fluid_id
 
         real(wp), dimension(num_species) :: Ys
         real(wp) :: e_mix, mix_mol_weight, T
+        real(wp) :: rho_species_ref
         real(wp) :: pres_mag
 
         real(wp) :: Ga ! Lorentz factor (gamma in relativity)
@@ -1034,15 +1110,43 @@ contains
                     if (chemistry) then
                         do i = chemxb, chemxe
                             Ys(i - chemxb + 1) = q_prim_vf(i)%sf(j, k, l)
-                            q_cons_vf(i)%sf(j, k, l) = rho*q_prim_vf(i)%sf(j, k, l)
+                        end do
+
+                        if (num_fluids == 1) then
+                            rho_species_ref = rho
+                        else
+                            rho_species_ref = 0._wp
+                            if (chem_gas_num_fluids <= 0) then
+                                fluid_id = chem_gas_fluid_id
+                                rho_species_ref = q_prim_vf(contxb + fluid_id - 1)%sf(j, k, l)
+                            else
+                                do gas_idx = 1, chem_gas_num_fluids
+                                    fluid_id = chem_gas_fluid_ids(gas_idx)
+                                    rho_species_ref = rho_species_ref + &
+                                                      q_prim_vf(contxb + fluid_id - 1)%sf(j, k, l)
+                                end do
+                            end if
+                        end if
+
+                        do i = chemxb, chemxe
+                            q_cons_vf(i)%sf(j, k, l) = rho_species_ref*q_prim_vf(i)%sf(j, k, l)
                         end do
 
                         call get_mixture_molecular_weight(Ys, mix_mol_weight)
-                        T = q_prim_vf(E_idx)%sf(j, k, l)*mix_mol_weight/(gas_constant*rho)
+                        if (num_fluids == 1) then
+                            T = q_prim_vf(E_idx)%sf(j, k, l)*mix_mol_weight/(gas_constant*rho)
+                        else
+                            T = 300._wp
+                        end if
                         call get_mixture_energy_mass(T, Ys, e_mix)
 
-                        q_cons_vf(E_idx)%sf(j, k, l) = &
-                            dyn_pres + rho*e_mix
+                        if (num_fluids == 1) then
+                            q_cons_vf(E_idx)%sf(j, k, l) = &
+                                dyn_pres + rho*e_mix
+                        else
+                            q_cons_vf(E_idx)%sf(j, k, l) = &
+                                dyn_pres + rho_species_ref*e_mix
+                        end if
                     else
                         ! Computing the energy from the pressure
                         if (mhd) then
@@ -1423,11 +1527,11 @@ contains
         real(wp), intent(in) :: c_c
         real(wp), intent(out) :: c
 
-        real(wp) :: blkmod1, blkmod2
+        real(wp) :: blkmod1, blkmod2, c2
 
         integer :: q
 
-        if (chemistry) then
+        if (chemistry .and. num_fluids == 1) then
             if (avg_state == 1 .and. abs(c_c) > verysmall) then
                 c = sqrt(c_c - (gamma - 1.0_wp)*(vel_sum - H))
             else
@@ -1463,6 +1567,16 @@ contains
                         (pres + pi_inf/(gamma + 1._wp))/ &
                         (rho*(1._wp - adv(num_fluids)))
                 end if
+            elseif (chemistry .and. num_fluids > 1) then
+                c2 = 0._wp
+                $:GPU_LOOP(parallelism='[seq]')
+                do q = 1, num_fluids
+                    c2 = c2 + adv(q)*gs_min(q)* &
+                         (pres + pi_infs(q)/(gammas(q) + 1._wp))
+                end do
+                c2 = c2/rho
+                c = sqrt(max(c2, 100._wp*sgm_eps))
+                return
             else
                 c = (H - 5.e-1*vel_sum - qv/rho)/gamma
             end if

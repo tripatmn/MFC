@@ -83,14 +83,23 @@ contains
         !!      model, also considering mass depletion, depending on the incoming
         !!      state conditions.
         !!  @param q_cons_vf Cell-average conservative variables
+#ifdef MFC_SIMULATION
+    subroutine s_infinite_relaxation_k(q_cons_vf, m_dot_evap, relax_dt)
+#else
     subroutine s_infinite_relaxation_k(q_cons_vf)
+#endif
 
         type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
+#ifdef MFC_SIMULATION
+        type(scalar_field), intent(inout) :: m_dot_evap
+        real(wp), intent(in) :: relax_dt
+#endif
         real(wp) :: pS, pSOV, pSSL !< equilibrium pressure for mixture, overheated vapor, and subcooled liquid
         real(wp) :: TS, TSOV, TSSL, TSatOV, TSatSL !< equilibrium temperature for mixture, overheated vapor, and subcooled liquid. Saturation Temperatures at overheated vapor and subcooled liquid
         real(wp) :: rhoe, dynE, rhos !< total internal energy, kinetic energy, and total entropy
-        real(wp) :: rho, rM, m1, m2, MCT !< total density, total reacting mass, individual reacting masses
+        real(wp) :: rho, rM, m1, m2, m2_after, MCT !< total density, total reacting mass, individual reacting masses
         real(wp) :: TvF !< total volume fraction
+        logical :: pt_state_ok, ptg_state_ok
 
         ! $:GPU_DECLARE(create='[pS,pSOV,pSSL,TS,TSOV,TSSL,TSatOV,TSatSL]')
         ! $:GPU_DECLARE(create='[rhoe,dynE,rhos,rho,rM,m1,m2,MCT,TvF]')
@@ -105,7 +114,7 @@ contains
         integer :: i, j, k, l
 
         ! starting equilibrium solver
-        $:GPU_PARALLEL_LOOP(collapse=3, private='[i,j,k,l,p_infOV, p_infpT, p_infSL, sk, hk, gk, ek, rhok,pS, pSOV, pSSL, TS, TSOV, TSatOV, TSatSL, TSSL, rhoe, dynE, rhos, rho, rM, m1, m2, MCT, TvF]')
+        $:GPU_PARALLEL_LOOP(collapse=3, private='[i,j,k,l,p_infOV, p_infpT, p_infSL, sk, hk, gk, ek, rhok,pS, pSOV, pSSL, TS, TSOV, TSatOV, TSatSL, TSSL, rhoe, dynE, rhos, rho, rM, m1, m2, m2_after, MCT, TvF, pt_state_ok, ptg_state_ok]')
         do j = 0, m
             do k = 0, n
                 do l = 0, p
@@ -152,6 +161,18 @@ contains
                     ! Calling pT-equilibrium for either finishing phase-change module, or as an IC for the pTg-equilibrium
                     ! for this case, MFL cannot be either 0 or 1, so I chose it to be 2
                     call s_infinite_pt_relaxation_k(j, k, l, 2, pS, p_infpT, q_cons_vf, rhoe, TS)
+
+                    pt_state_ok = ieee_is_finite(pS) .and. ieee_is_finite(TS) .and. &
+                                  pS > 0._wp .and. TS > 0._wp
+
+                    if (.not. pt_state_ok) then
+                        q_cons_vf(lp + contxb - 1)%sf(j, k, l) = m1
+                        q_cons_vf(vp + contxb - 1)%sf(j, k, l) = m2
+#ifdef MFC_SIMULATION
+                        m_dot_evap%sf(j, k, l) = 0._wp
+#endif
+                        cycle
+                    end if
 
                     ! check if pTg-equilibrium is required
                     ! NOTE that NOTHING else needs to be updated OTHER than the individual partial densities
@@ -229,7 +250,24 @@ contains
                             q_cons_vf(vp + contxb - 1)%sf(j, k, l) = m2
 
                             ! calling the pTg-equilibrium solver
-                            call s_infinite_ptg_relaxation_k(j, k, l, pS, p_infpT, rhoe, q_cons_vf, TS)
+                            if (ieee_is_finite(pS) .and. ieee_is_finite(TS) .and. &
+                                pS > 0._wp .and. TS > 0._wp) then
+                                call s_infinite_ptg_relaxation_k(j, k, l, pS, p_infpT, rhoe, q_cons_vf, TS)
+                            end if
+
+                            ptg_state_ok = ieee_is_finite(pS) .and. ieee_is_finite(TS) .and. &
+                                           ieee_is_finite(q_cons_vf(lp + contxb - 1)%sf(j, k, l)) .and. &
+                                           ieee_is_finite(q_cons_vf(vp + contxb - 1)%sf(j, k, l)) .and. &
+                                           pS > 0._wp .and. TS > 0._wp
+
+                            if (.not. ptg_state_ok) then
+                                q_cons_vf(lp + contxb - 1)%sf(j, k, l) = m1
+                                q_cons_vf(vp + contxb - 1)%sf(j, k, l) = m2
+#ifdef MFC_SIMULATION
+                                m_dot_evap%sf(j, k, l) = 0._wp
+#endif
+                                cycle
+                            end if
 
                         end if
 
@@ -277,6 +315,11 @@ contains
                         rhos = rhos + q_cons_vf(i + contxb - 1)%sf(j, k, l)*sk(i)
 
                     end do
+
+#ifdef MFC_SIMULATION
+                    m2_after = q_cons_vf(vp + contxb - 1)%sf(j, k, l)
+                    m_dot_evap%sf(j, k, l) = (m2_after - m2)/relax_dt
+#endif
                 end do
             end do
         end do

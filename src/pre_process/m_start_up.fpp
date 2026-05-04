@@ -146,6 +146,11 @@ contains
             viscous, bubbles_lagrange, num_bc_patches, &
             patch_bc, Bx0, relativity, cont_damage, igr, igr_order, &
             down_sample, recon_type, muscl_order, hyper_cleaning, &
+            chem_gas_fluid_id, chem_gas_num_fluids, chem_gas_fluid_ids, &
+            chem_fixed_T_enable, chem_fixed_T, chem_T_min, chem_T_max, &
+            user_species_source, user_species_id, user_species_src, &
+            fuel_species_id, evap_species_source, evap_species_src, &
+            evap_liquid_fluid_id, evap_alpha_thresh, evap_alpha_lo, evap_alpha_hi, &
             simplex_perturb, simplex_params, fft_wrt
 
         ! Inquiring the status of the pre_process.inp file
