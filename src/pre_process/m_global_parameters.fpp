@@ -78,6 +78,7 @@ module m_global_parameters
     ! Simulation Algorithm Parameters
     integer :: model_eqns            !< Multicomponent flow model
     logical :: relax                 !< activate phase change
+    logical :: relax_ic              !< apply phase-change relaxation to initial condition
     integer :: relax_model           !< Relax Model
     real(wp) :: palpha_eps           !< trigger parameter for the p relaxation procedure, phase change model
     real(wp) :: ptgalpha_eps         !< trigger parameter for the pTg relaxation procedure, phase change model
@@ -370,6 +371,7 @@ contains
         ! Simulation algorithm parameters
         model_eqns = dflt_int
         relax = .false.
+        relax_ic = .true.
         relax_model = dflt_int
         palpha_eps = dflt_real
         ptgalpha_eps = dflt_real

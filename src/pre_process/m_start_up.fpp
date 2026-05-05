@@ -138,7 +138,7 @@ contains
             polytropic, thermal, Ca, Web, Re_inv, &
             polydisperse, poly_sigma, qbmm, &
             sigR, sigV, dist_type, rhoRV, &
-            file_per_process, relax, relax_model, &
+            file_per_process, relax, relax_ic, relax_model, &
             palpha_eps, ptgalpha_eps, ib, num_ibs, patch_ib, &
             sigma, adv_n, cfl_adap_dt, cfl_const_dt, n_start, &
             n_start_old, surface_tension, hyperelasticity, pre_stress, &
@@ -800,7 +800,7 @@ contains
             end do
         end if
 
-        if (relax) then
+        if (relax .and. relax_ic) then
             if (proc_rank == 0) then
                 print *, 'initial condition might have been altered due to enforcement of &
 &                pTg-equilirium (relax = "T" activated)'

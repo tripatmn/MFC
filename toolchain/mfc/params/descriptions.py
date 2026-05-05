@@ -189,6 +189,7 @@ DESCRIPTIONS = {
     "sigma": "Surface tension coefficient",
     "Bx0": "Background magnetic field in x-direction",
     "relax": "Enable relaxation terms",
+    "relax_ic": "Apply phase-change relaxation to initial conditions",
     "adv_n": "Enable advection of number density",
     "cont_damage": "Enable continuum damage model",
     "igr": "Enable implicit gradient reconstruction",

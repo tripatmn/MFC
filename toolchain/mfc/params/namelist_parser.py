@@ -34,7 +34,7 @@ _FALLBACK_PARAMS = {
         'patch_bc', 'patch_ib', 'patch_icpp', 'perturb_flow', 'perturb_flow_fluid',
         'perturb_flow_mag', 'perturb_sph', 'perturb_sph_fluid', 'pi_fac', 'poly_sigma',
         'polydisperse', 'polytropic', 'pre_stress', 'precision', 'pref',
-        'ptgalpha_eps', 'qbmm', 'recon_type', 'relativity', 'relax',
+        'ptgalpha_eps', 'qbmm', 'recon_type', 'relativity', 'relax', 'relax_ic',
         'relax_model', 'rhoRV', 'rhoref', 'sigR', 'sigV',
         'sigma', 'simplex_params', 'simplex_perturb', 'stretch_x', 'stretch_y',
         'stretch_z', 'surface_tension', 't_step_old', 't_step_start', 'thermal',

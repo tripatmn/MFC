@@ -178,6 +178,7 @@ _SIMPLE_DESCS = {
     "num_fluids": "Number of fluids",
     "num_patches": "Number of IC patches",
     "mpp_lim": "Mixture pressure positivity limiter",
+    "relax_ic": "Apply phase-change relaxation to initial conditions",
     # WENO
     "weno_order": "WENO reconstruction order",
     "weno_eps": "WENO epsilon parameter",
@@ -1009,7 +1010,7 @@ def _load():  # pylint: disable=too-many-locals,too-many-statements
               "tau_star", "cont_damage_s", "alpha_bar", "alf_factor",
               "ic_eps", "ic_beta"]:
         _r(n, REAL)
-    for n in ["mpp_lim", "relax", "adv_n", "cont_damage", "igr", "down_sample",
+    for n in ["mpp_lim", "relax", "relax_ic", "adv_n", "cont_damage", "igr", "down_sample",
               "old_grid", "old_ic", "mixlayer_vel_profile", "mixlayer_perturb",
               "perturb_flow", "perturb_sph", "pre_stress", "elliptic_smoothing",
               "simplex_perturb", "alt_soundspeed", "mixture_err", "rdma_mpi",

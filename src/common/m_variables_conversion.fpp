@@ -1132,20 +1132,33 @@ contains
                             q_cons_vf(i)%sf(j, k, l) = rho_species_ref*q_prim_vf(i)%sf(j, k, l)
                         end do
 
-                        call get_mixture_molecular_weight(Ys, mix_mol_weight)
                         if (num_fluids == 1) then
+                            call get_mixture_molecular_weight(Ys, mix_mol_weight)
                             T = q_prim_vf(E_idx)%sf(j, k, l)*mix_mol_weight/(gas_constant*rho)
-                        else
-                            T = 300._wp
-                        end if
-                        call get_mixture_energy_mass(T, Ys, e_mix)
-
-                        if (num_fluids == 1) then
+                            call get_mixture_energy_mass(T, Ys, e_mix)
                             q_cons_vf(E_idx)%sf(j, k, l) = &
                                 dyn_pres + rho*e_mix
-                        else
+                        elseif (mhd) then
+                            if (n == 0) then
+                                pres_mag = 0.5_wp*(Bx0**2 + q_prim_vf(B_idx%beg)%sf(j, k, l)**2 + q_prim_vf(B_idx%beg + 1)%sf(j, k, l)**2)
+                            else
+                                pres_mag = 0.5_wp*(q_prim_vf(B_idx%beg)%sf(j, k, l)**2 + q_prim_vf(B_idx%beg + 1)%sf(j, k, l)**2 + q_prim_vf(B_idx%beg + 2)%sf(j, k, l)**2)
+                            end if
                             q_cons_vf(E_idx)%sf(j, k, l) = &
-                                dyn_pres + rho_species_ref*e_mix
+                                gamma*q_prim_vf(E_idx)%sf(j, k, l) + dyn_pres + pres_mag &
+                                + pi_inf + qv
+                        elseif ((model_eqns /= 4) .and. (bubbles_euler .neqv. .true.)) then
+                            ! E = Gamma*P + \rho u u /2 + \pi_inf + (\alpha\rho qv)
+                            q_cons_vf(E_idx)%sf(j, k, l) = &
+                                gamma*q_prim_vf(E_idx)%sf(j, k, l) + dyn_pres + pi_inf + qv
+                        else if ((model_eqns /= 4) .and. (bubbles_euler)) then
+                            ! \tilde{E} = dyn_pres + (1-\alf)(\Gamma p_l + \Pi_inf)
+                            q_cons_vf(E_idx)%sf(j, k, l) = dyn_pres + &
+                                                           (1._wp - q_prim_vf(alf_idx)%sf(j, k, l))* &
+                                                           (gamma*q_prim_vf(E_idx)%sf(j, k, l) + pi_inf)
+                        else
+                            !Tait EOS, no conserved energy variable
+                            q_cons_vf(E_idx)%sf(j, k, l) = 0._wp
                         end if
                     else
                         ! Computing the energy from the pressure
