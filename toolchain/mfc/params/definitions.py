@@ -232,6 +232,7 @@ _SIMPLE_DESCS = {
     # Misc
     "case_dir": "Case directory path",
     "cantera_file": "Cantera mechanism file",
+    "cantera_phase": "Cantera phase name",
     "chem_gas_fluid_id": "Gas fluid index used by chemistry source terms",
     "chem_gas_num_fluids": "Number of gas fluids used by chemistry source terms",
     "chem_gas_fluid_ids": "Gas fluid indices used by chemistry source terms",
@@ -929,6 +930,7 @@ def _load():  # pylint: disable=too-many-locals,too-many-statements
 
     # --- Chemistry ---
     _r("cantera_file", STR, {"chemistry"})
+    _r("cantera_phase", STR, {"chemistry"})
     _r("chemistry", LOG, {"chemistry"})
     _r("chem_gas_fluid_id", INT, {"chemistry"})
     _r("chem_gas_num_fluids", INT, {"chemistry"})

@@ -48,7 +48,7 @@ def _get_target_params():
 
 
 # Parameters to ignore during certain operations
-IGNORE = ["cantera_file", "chemistry"]
+IGNORE = ["cantera_file", "cantera_phase", "chemistry"]
 
 # Combined dict of all parameters
 ALL = _load_all_params()

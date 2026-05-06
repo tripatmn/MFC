@@ -42,6 +42,7 @@ class MFCInputFile(Case):
 
         if self.params.get("chemistry", 'F') == 'T':
             cantera_file = self.params["cantera_file"]
+            cantera_phase = self.params.get("cantera_phase", "")
 
             candidates = [
                 cantera_file,
@@ -56,6 +57,8 @@ class MFCInputFile(Case):
 
         for candidate in candidates:
             try:
+                if self.params.get("chemistry", 'F') == 'T' and cantera_phase:
+                    return ct.Solution(candidate, cantera_phase)
                 return ct.Solution(candidate)
             except Exception:
                 continue

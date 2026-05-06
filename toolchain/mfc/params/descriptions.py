@@ -157,6 +157,7 @@ DESCRIPTIONS = {
     # Misc
     "case_dir": "Case directory path",
     "cantera_file": "Cantera mechanism file for chemistry",
+    "cantera_phase": "Optional Cantera phase name for chemistry",
     "chem_gas_fluid_id": "Gas fluid index used by chemistry source terms",
     "chem_gas_num_fluids": "Number of gas fluids used by chemistry source terms",
     "chem_gas_fluid_ids": "Gas fluid index included in chemistry gas density",
