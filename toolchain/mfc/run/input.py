@@ -8,6 +8,7 @@ from ..printer import cons
 from ..        import common
 from ..state   import ARGS, ARG, gpuConfigOptions
 from ..case    import Case
+from ..chemistry_codegen import generate_fortran_without_transport
 from ..        import case_validator
 
 @dataclasses.dataclass(init=False)
@@ -65,6 +66,21 @@ class MFCInputFile(Case):
 
         raise common.MFCException(f"Cantera file '{cantera_file}' not found. Searched: {', '.join(candidates)}.")
 
+    def __generate_thermochemistry(self, module_name, solution, options):
+        import pyrometheus as pyro  # pylint: disable=import-outside-toplevel
+
+        if self.params.get("chemistry", 'F') == 'T' and solution.transport_model == "none":
+            if self.uses_chemistry_transport():
+                raise common.MFCException(
+                    "The selected Cantera phase has transport_model='none', but this case "
+                    "requires chemistry transport via chem_params%diffusion='T' or viscous='T'. "
+                    "Use chem_params%diffusion='F' and viscous='F', or select a mechanism phase "
+                    "with transport data."
+                )
+            return generate_fortran_without_transport(module_name, solution, options)
+
+        return pyro.FortranCodeGenerator().generate(module_name, solution, options)
+
     def generate_fpp(self, target) -> None:
         # Lazy import to avoid slow startup for commands that don't need chemistry
         import pyrometheus as pyro  # pylint: disable=import-outside-toplevel
@@ -92,14 +108,13 @@ class MFCInputFile(Case):
         else:
             directive_str = None
 
+        solution = self.get_cantera_solution()
+        options = pyro.CodeGenerationOptions(scalar_type=real_type, directive_offload=directive_str)
+
         # Write the generated Fortran code to the m_thermochem.f90 file with the chosen precision
         common.file_write(
             os.path.join(modules_dir, "m_thermochem.f90"),
-            pyro.FortranCodeGenerator().generate(
-                "m_thermochem",
-                self.get_cantera_solution(),
-                pyro.CodeGenerationOptions(scalar_type = real_type, directive_offload = directive_str)
-            ),
+            self.__generate_thermochemistry("m_thermochem", solution, options),
             True
         )
 

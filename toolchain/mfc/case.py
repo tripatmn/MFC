@@ -39,6 +39,15 @@ class Case:
     def has_parameter(self, key: str)-> bool:
         return key in self.params.keys()
 
+    def __is_true(self, key: str) -> bool:
+        val = self.params.get(key, 'F')
+        return val is True or val == 'T'
+
+    def uses_chemistry_transport(self) -> bool:
+        return self.__is_true("chemistry") and (
+            self.__is_true("chem_params%diffusion") or self.__is_true("viscous")
+        )
+
     def gen_json_dict_str(self) -> str:
         return json.dumps(self.params, indent=4)
 
@@ -391,6 +400,7 @@ class Case:
         def _prepend() -> str:
             return f"""\
 #:set chemistry             = {self.params.get("chemistry", 'F') == 'T'}
+#:set chemistry_transport   = {self.uses_chemistry_transport()}
 """
 
         def _default(_) -> str:

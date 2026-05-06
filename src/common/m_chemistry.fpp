@@ -13,10 +13,15 @@ module m_chemistry
 
     use m_thermochem, only: &
         num_species, molecular_weights, get_temperature, get_net_production_rates, &
-        get_mole_fractions, get_species_binary_mass_diffusivities, &
-        get_species_mass_diffusivities_mixavg, gas_constant, get_mixture_molecular_weight, &
-        get_mixture_energy_mass, get_mixture_thermal_conductivity_mixavg, get_species_enthalpies_rt, &
-        get_mixture_viscosity_mixavg, get_mixture_specific_heat_cp_mass, get_mixture_enthalpy_mass
+        gas_constant, get_mixture_molecular_weight, get_mixture_energy_mass, &
+        get_mixture_specific_heat_cp_mass, get_mixture_enthalpy_mass
+
+    #:if chemistry_transport
+        use m_thermochem, only: &
+            get_mole_fractions, get_species_binary_mass_diffusivities, &
+            get_species_mass_diffusivities_mixavg, get_mixture_thermal_conductivity_mixavg, &
+            get_species_enthalpies_rt, get_mixture_viscosity_mixavg
+    #:endif
 
     use m_global_parameters
     use ieee_arithmetic
@@ -71,10 +76,15 @@ contains
         real(wp), intent(inout) :: T_L, T_R, Re_L, Re_R
         real(wp), dimension(num_species), intent(inout) :: Ys_R, Ys_L
 
-        call get_mixture_viscosity_mixavg(T_L, Ys_L, Re_L)
-        call get_mixture_viscosity_mixavg(T_R, Ys_R, Re_R)
-        Re_L = 1.0_wp/Re_L
-        Re_R = 1.0_wp/Re_R
+        #:if chemistry_transport
+            call get_mixture_viscosity_mixavg(T_L, Ys_L, Re_L)
+            call get_mixture_viscosity_mixavg(T_R, Ys_R, Re_R)
+            Re_L = 1.0_wp/Re_L
+            Re_R = 1.0_wp/Re_R
+        #:else
+            Re_L = 0._wp
+            Re_R = 0._wp
+        #:endif
 
     end subroutine compute_viscosity_and_inversion
 
@@ -258,6 +268,7 @@ contains
         type(int_bounds_info), intent(in) :: irx, iry, irz
 
         integer, intent(in) :: idir
+        #:if chemistry_transport
         #:if not MFC_CASE_OPTIMIZATION and USING_AMD
             real(wp), dimension(10) :: Xs_L, Xs_R, Xs_cell, Ys_L, Ys_R, Ys_cell
             real(wp), dimension(10) :: mass_diffusivities_mixavg1, mass_diffusivities_mixavg2
@@ -504,6 +515,8 @@ contains
                 $:END_GPU_PARALLEL_LOOP()
             end if
         end if
+
+        #:endif
 
     end subroutine s_compute_chemistry_diffusion_flux
 
