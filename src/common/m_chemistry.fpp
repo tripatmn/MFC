@@ -43,6 +43,17 @@ module m_chemistry
 
 contains
 
+    !> @brief Typed finite check to avoid compiler ambiguity in ieee_is_finite.
+    logical function s_is_finite_wp(x)
+        $:GPU_ROUTINE(function_name='s_is_finite_wp',parallelism='[seq]', &
+            & cray_inline=True)
+
+        real(wp), intent(in) :: x
+
+        s_is_finite_wp = ieee_is_finite(x)
+
+    end function s_is_finite_wp
+
     !> @brief Computes the gas density used to convert rhoY_k into gas species mass fractions.
     subroutine s_compute_chemistry_gas_density(q_cons_vf, x, y, z, rho_g)
         $:GPU_ROUTINE(function_name='s_compute_chemistry_gas_density',parallelism='[seq]', &
@@ -177,6 +188,7 @@ contains
         integer :: eqn
         real(wp) :: T
         real(wp) :: rho, rho_g, rhoYk, raw_Y, Y_sum, omega_m
+        logical :: omega_finite
         #:if not MFC_CASE_OPTIMIZATION and USING_AMD
             real(wp), dimension(10) :: Ys
             real(wp), dimension(10) :: omega
@@ -185,14 +197,14 @@ contains
             real(wp), dimension(num_species) :: omega
         #:endif
 
-        $:GPU_PARALLEL_LOOP(collapse=3, private='[Ys, omega, eqn, T, rho, rho_g, rhoYk, raw_Y, Y_sum, omega_m]', copyin='[bounds]')
+        $:GPU_PARALLEL_LOOP(collapse=3, private='[Ys, omega, eqn, T, rho, rho_g, rhoYk, raw_Y, Y_sum, omega_m, omega_finite]', copyin='[bounds]')
         do z = bounds(3)%beg, bounds(3)%end
             do y = bounds(2)%beg, bounds(2)%end
                 do x = bounds(1)%beg, bounds(1)%end
 
                     if (num_fluids > 1) then
                         call s_compute_chemistry_gas_density(q_cons_qp, x, y, z, rho_g)
-                        if ((.not. ieee_is_finite(rho_g)) .or. rho_g <= chem_rho_g_min) then
+                        if ((.not. s_is_finite_wp(rho_g)) .or. rho_g <= chem_rho_g_min) then
                             ! No gas-phase chemistry if designated gas density vanishes.
                             cycle
                         end if
@@ -201,11 +213,11 @@ contains
                         $:GPU_LOOP(parallelism='[seq]')
                         do eqn = chemxb, chemxe
                             rhoYk = q_cons_qp(eqn)%sf(x, y, z)
-                            if (.not. ieee_is_finite(rhoYk)) then
+                            if (.not. s_is_finite_wp(rhoYk)) then
                                 Ys(eqn - chemxb + 1) = 0._wp
                             else
                                 raw_Y = rhoYk/rho_g
-                                if (.not. ieee_is_finite(raw_Y)) then
+                                if (.not. s_is_finite_wp(raw_Y)) then
                                     Ys(eqn - chemxb + 1) = 0._wp
                                 else
                                     Ys(eqn - chemxb + 1) = min(max(raw_Y, 0._wp), 1._wp)
@@ -214,7 +226,7 @@ contains
                             Y_sum = Y_sum + Ys(eqn - chemxb + 1)
                         end do
 
-                        if (.not. ieee_is_finite(Y_sum)) cycle
+                        if (.not. s_is_finite_wp(Y_sum)) cycle
 
                         if (Y_sum > 1._wp) then
                             $:GPU_LOOP(parallelism='[seq]')
@@ -234,11 +246,16 @@ contains
                     end if
 
                     T = q_T_sf%sf(x, y, z)
-                    if (.not. ieee_is_finite(T)) cycle
+                    if (.not. s_is_finite_wp(T)) cycle
                     T = min(max(T, chem_T_min), chem_T_max)
 
                     call get_net_production_rates(rho, T, Ys, omega)
-                    if (any(.not. ieee_is_finite(omega))) cycle
+                    omega_finite = .true.
+                    $:GPU_LOOP(parallelism='[seq]')
+                    do eqn = 1, num_species
+                        if (.not. s_is_finite_wp(omega(eqn))) omega_finite = .false.
+                    end do
+                    if (.not. omega_finite) cycle
 
                     $:GPU_LOOP(parallelism='[seq]')
                     do eqn = chemxb, chemxe
@@ -247,7 +264,7 @@ contains
                         #:else
                             omega_m = molecular_weights(eqn - chemxb + 1)*omega(eqn - chemxb + 1)
                         #:endif
-                        if (ieee_is_finite(omega_m)) then
+                        if (s_is_finite_wp(omega_m)) then
                             rhs_vf(eqn)%sf(x, y, z) = rhs_vf(eqn)%sf(x, y, z) + omega_m
                         end if
 
