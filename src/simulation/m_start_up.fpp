@@ -848,12 +848,8 @@ contains
             end if
         end if
 
-        call s_gpu_diag_marker(t_step, "start timestep")
-
         if (relax) then
-            call s_gpu_diag_marker(t_step, "before reset_m_dot_evap")
             call s_reset_m_dot_evap()
-            call s_gpu_diag_marker(t_step, "after reset_m_dot_evap")
         end if
 
         if (probe_wrt) then
@@ -866,27 +862,17 @@ contains
 
         ! Total-variation-diminishing (TVD) Runge-Kutta (RK) time-steppers
         if (any(time_stepper == (/1, 2, 3/))) then
-            call s_gpu_diag_marker(t_step, "before TVD-RK")
             call s_tvd_rk(t_step, time_avg, time_stepper)
-            call s_gpu_diag_marker(t_step, "after TVD-RK")
         end if
 
         if (relax) then
-            call s_gpu_diag_marker(t_step, "before infinite_relax")
             call s_infinite_relaxation_k(q_cons_ts(1)%vf, m_dot_evap, dt)
-            call s_gpu_diag_marker(t_step, "after infinite_relax")
-            call s_gpu_diag_marker(t_step, "before evap fuel species")
             call s_apply_evap_to_fuel_species(q_cons_ts(1)%vf, dt, t_step)
-            call s_gpu_diag_marker(t_step, "after evap fuel species")
-            call s_gpu_diag_marker(t_step, "before diagnose_m_dot")
             call s_diagnose_m_dot_evap(t_step)
-            call s_gpu_diag_marker(t_step, "after diagnose_m_dot")
         end if
 
         ! Time-stepping loop controls
-        call s_gpu_diag_marker(t_step, "before timestep increment")
         t_step = t_step + 1
-        call s_gpu_diag_marker(t_step, "after timestep increment")
 
     end subroutine s_perform_time_step
 
@@ -963,8 +949,6 @@ contains
 
         integer :: save_count
 
-        call s_gpu_diag_marker(t_step, "save start")
-
         if (down_sample) then
             call s_populate_variables_buffers(bc_type, q_cons_ts(1)%vf)
         end if
@@ -989,7 +973,6 @@ contains
 
         call cpu_time(start)
         call nvtxStartRange("SAVE-DATA")
-        call s_gpu_diag_marker(t_step, "before save host updates")
         do i = 1, sys_size
 #ifndef FRONTIER_UNIFIED
             $:GPU_UPDATE(host='[q_cons_ts(stor)%vf(i)%sf]')
@@ -1005,7 +988,6 @@ contains
                 end do
             end do
         end do
-        call s_gpu_diag_marker(t_step, "after save host updates")
 
         if (qbmm .and. .not. polytropic) then
             $:GPU_UPDATE(host='[pb_ts(1)%sf]')
@@ -1029,16 +1011,12 @@ contains
             end do
 
             $:GPU_UPDATE(host='[q_beta(1)%sf]')
-            call s_gpu_diag_marker(t_step, "before write data files")
             call s_write_data_files(q_cons_ts(stor)%vf, q_T_sf, q_prim_vf, save_count, bc_type, q_beta(1))
-            call s_gpu_diag_marker(t_step, "after write data files")
             $:GPU_UPDATE(host='[Rmax_stats,Rmin_stats,gas_p,gas_mv,intfc_vel]')
             call s_write_restart_lag_bubbles(save_count) !parallel
             if (lag_params%write_bubbles_stats) call s_write_lag_bubble_stats()
         else
-            call s_gpu_diag_marker(t_step, "before write data files")
             call s_write_data_files(q_cons_ts(stor)%vf, q_T_sf, q_prim_vf, save_count, bc_type)
-            call s_gpu_diag_marker(t_step, "after write data files")
         end if
 
         call nvtxEndRange
@@ -1049,8 +1027,6 @@ contains
             nt = int((t_step - t_step_start)/(t_step_save))
         end if
 
-        call s_gpu_diag_marker(t_step, "save finish")
-
         if (nt == 1) then
             io_time_avg = abs(finish - start)
         else
@@ -1058,19 +1034,6 @@ contains
         end if
 
     end subroutine s_save_data
-
-    subroutine s_gpu_diag_marker(t_step, label)
-        integer, intent(in) :: t_step
-        character(len=*), intent(in) :: label
-
-        if (proc_rank /= 0) return
-        if (t_step < t_step_start .or. t_step > t_step_start + 2) return
-#if defined(MFC_OpenACC)
-        !$acc wait
-#endif
-        print '("[GPU_DIAG] start_up t_step=", I8, " ", A)', t_step, trim(label)
-        call flush(output_unit)
-    end subroutine s_gpu_diag_marker
 
     !> @brief Initializes all simulation sub-modules in the required dependency order.
     impure subroutine s_initialize_modules

@@ -14,8 +14,6 @@
 !!              are only available in the volume fraction model.
 program p_main
 
-    use iso_fortran_env, only: output_unit
-
     use m_global_parameters    !< Definitions of the global parameters
 
     use m_start_up
@@ -90,21 +88,15 @@ program p_main
             end if
         end if
 
-        call s_gpu_diag_marker(t_step, "before perform_time_step")
         call s_perform_time_step(t_step, time_avg)
-        call s_gpu_diag_marker(t_step, "after perform_time_step")
 
         if (cfl_dt) then
             if (abs(mod(mytime, t_save)) < dt .or. mytime >= t_stop) then
-                call s_gpu_diag_marker(t_step, "before save_data")
                 call s_save_data(t_step, start, finish, io_time_avg, nt)
-                call s_gpu_diag_marker(t_step, "after save_data")
             end if
         else
             if (mod(t_step - t_step_start, t_step_save) == 0 .or. t_step == t_step_stop) then
-                call s_gpu_diag_marker(t_step, "before save_data")
                 call s_save_data(t_step, start, finish, io_time_avg, nt)
-                call s_gpu_diag_marker(t_step, "after save_data")
             end if
         end if
 
@@ -118,20 +110,5 @@ program p_main
     call nvtxStartRange("FINALIZE-MODULES")
     call s_finalize_modules()
     call nvtxEndRange
-
-contains
-
-    subroutine s_gpu_diag_marker(t_step, label)
-        integer, intent(in) :: t_step
-        character(len=*), intent(in) :: label
-
-        if (proc_rank /= 0) return
-        if (t_step < t_step_start .or. t_step > t_step_start + 2) return
-#if defined(MFC_OpenACC)
-        !$acc wait
-#endif
-        print '("[GPU_DIAG] p_main t_step=", I8, " ", A)', t_step, trim(label)
-        call flush(output_unit)
-    end subroutine s_gpu_diag_marker
 
 end program p_main

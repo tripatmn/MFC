@@ -547,21 +547,15 @@ contains
         if (adap_dt) call s_adaptive_dt_bubble(1)
 
         do s = 1, nstage
-            call s_gpu_diag_marker_ts(t_step, "before RHS", s)
             call s_compute_rhs(q_cons_ts(1)%vf, q_T_sf, q_prim_vf, bc_type, rhs_vf, pb_ts(1)%sf, rhs_pb, mv_ts(1)%sf, rhs_mv, t_step, time_avg, s)
-            call s_gpu_diag_marker_ts(t_step, "after RHS", s)
 
             if (s == 1) then
                 if (run_time_info) then
                     if (igr .or. dummy) then
-                        call s_gpu_diag_marker_ts(t_step, "before runtime info cons", s)
                         call s_write_run_time_information(q_cons_ts(1)%vf, t_step)
-                        call s_gpu_diag_marker_ts(t_step, "after runtime info cons", s)
                     end if
                     if (.not. igr .or. dummy) then
-                        call s_gpu_diag_marker_ts(t_step, "before runtime info prim", s)
                         call s_write_run_time_information(q_prim_vf, t_step)
-                        call s_gpu_diag_marker_ts(t_step, "after runtime info prim", s)
                     end if
                 end if
 
@@ -578,7 +572,6 @@ contains
             end if
 
             if (bubbles_lagrange .and. .not. adap_dt) call s_update_lagrange_tdv_rk(stage=s)
-            call s_gpu_diag_marker_ts(t_step, "before RK update", s)
             $:GPU_PARALLEL_LOOP(collapse=4)
             do i = 1, sys_size
                 do l = 0, p
@@ -604,11 +597,9 @@ contains
                 end do
             end do
             $:END_GPU_PARALLEL_LOOP()
-            call s_gpu_diag_marker_ts(t_step, "after RK update", s)
 
             !Evolve pb and mv for non-polytropic qbmm
             if (qbmm .and. (.not. polytropic)) then
-                call s_gpu_diag_marker_ts(t_step, "before QBMM RK update", s)
                 $:GPU_PARALLEL_LOOP(collapse=5)
                 do i = 1, nb
                     do l = 0, p
@@ -635,7 +626,6 @@ contains
                     end do
                 end do
                 $:END_GPU_PARALLEL_LOOP()
-                call s_gpu_diag_marker_ts(t_step, "after QBMM RK update", s)
             end if
 
             if (bodyForces) call s_apply_bodyforces(q_cons_ts(1)%vf, q_prim_vf, rhs_vf, rk_coef(s, 3)*dt/rk_coef(s, 4))
@@ -679,25 +669,6 @@ contains
         end if
 
     end subroutine s_tvd_rk
-
-    subroutine s_gpu_diag_marker_ts(t_step, label, stage)
-        integer, intent(in) :: t_step
-        character(len=*), intent(in) :: label
-        integer, intent(in), optional :: stage
-
-        if (proc_rank /= 0) return
-        if (t_step < t_step_start .or. t_step > t_step_start + 1) return
-#if defined(MFC_OpenACC)
-        !$acc wait
-#endif
-        if (present(stage)) then
-            print '("[GPU_DIAG] time_steppers t_step=", I8, " stage=", I2, " ", A)', &
-                t_step, stage, trim(label)
-        else
-            print '("[GPU_DIAG] time_steppers t_step=", I8, " ", A)', t_step, trim(label)
-        end if
-        call flush(output_unit)
-    end subroutine s_gpu_diag_marker_ts
 
     subroutine s_reset_m_dot_evap()
         integer :: j, k, l
@@ -792,17 +763,34 @@ contains
 
     subroutine s_diagnose_m_dot_evap(t_step)
         integer, intent(in) :: t_step
+        integer :: j, k, l
         real(wp) :: min_loc, max_loc, sum_loc, count_loc
         real(wp) :: min_glb, max_glb, sum_glb, count_glb, mean_glb
 
         if (.not. relax) return
 
+#if defined(MFC_OpenACC)
+        if (.not. (chemistry .and. evap_species_source .and. &
+                   fuel_species_id >= 1 .and. fuel_species_id <= (chemxe - chemxb + 1))) return
+#else
         $:GPU_UPDATE(host='[m_dot_evap%sf]')
+#endif
 
-        min_loc = minval(m_dot_evap%sf)
-        max_loc = maxval(m_dot_evap%sf)
-        sum_loc = sum(m_dot_evap%sf)
-        count_loc = real(size(m_dot_evap%sf), wp)
+        min_loc = huge(1._wp)
+        max_loc = -huge(1._wp)
+        sum_loc = 0._wp
+        count_loc = 0._wp
+
+        do l = 0, p
+            do k = 0, n
+                do j = 0, m
+                    min_loc = min(min_loc, m_dot_evap%sf(j, k, l))
+                    max_loc = max(max_loc, m_dot_evap%sf(j, k, l))
+                    sum_loc = sum_loc + m_dot_evap%sf(j, k, l)
+                    count_loc = count_loc + 1._wp
+                end do
+            end do
+        end do
 
         if (num_procs > 1) then
             call s_mpi_allreduce_min(min_loc, min_glb)
