@@ -8,6 +8,8 @@
 !> @brief Total-variation-diminishing (TVD) Runge--Kutta time integrators (1st-, 2nd-, and 3rd-order SSP)
 module m_time_steppers
 
+    use iso_fortran_env, only: output_unit
+
     use m_derived_types        !< Definitions of the derived types
 
     use m_global_parameters    !< Definitions of the global parameters
@@ -545,15 +547,21 @@ contains
         if (adap_dt) call s_adaptive_dt_bubble(1)
 
         do s = 1, nstage
+            call s_gpu_diag_marker_ts(t_step, "before RHS", s)
             call s_compute_rhs(q_cons_ts(1)%vf, q_T_sf, q_prim_vf, bc_type, rhs_vf, pb_ts(1)%sf, rhs_pb, mv_ts(1)%sf, rhs_mv, t_step, time_avg, s)
+            call s_gpu_diag_marker_ts(t_step, "after RHS", s)
 
             if (s == 1) then
                 if (run_time_info) then
                     if (igr .or. dummy) then
+                        call s_gpu_diag_marker_ts(t_step, "before runtime info cons", s)
                         call s_write_run_time_information(q_cons_ts(1)%vf, t_step)
+                        call s_gpu_diag_marker_ts(t_step, "after runtime info cons", s)
                     end if
                     if (.not. igr .or. dummy) then
+                        call s_gpu_diag_marker_ts(t_step, "before runtime info prim", s)
                         call s_write_run_time_information(q_prim_vf, t_step)
+                        call s_gpu_diag_marker_ts(t_step, "after runtime info prim", s)
                     end if
                 end if
 
@@ -570,6 +578,7 @@ contains
             end if
 
             if (bubbles_lagrange .and. .not. adap_dt) call s_update_lagrange_tdv_rk(stage=s)
+            call s_gpu_diag_marker_ts(t_step, "before RK update", s)
             $:GPU_PARALLEL_LOOP(collapse=4)
             do i = 1, sys_size
                 do l = 0, p
@@ -595,9 +604,11 @@ contains
                 end do
             end do
             $:END_GPU_PARALLEL_LOOP()
+            call s_gpu_diag_marker_ts(t_step, "after RK update", s)
 
             !Evolve pb and mv for non-polytropic qbmm
             if (qbmm .and. (.not. polytropic)) then
+                call s_gpu_diag_marker_ts(t_step, "before QBMM RK update", s)
                 $:GPU_PARALLEL_LOOP(collapse=5)
                 do i = 1, nb
                     do l = 0, p
@@ -624,6 +635,7 @@ contains
                     end do
                 end do
                 $:END_GPU_PARALLEL_LOOP()
+                call s_gpu_diag_marker_ts(t_step, "after QBMM RK update", s)
             end if
 
             if (bodyForces) call s_apply_bodyforces(q_cons_ts(1)%vf, q_prim_vf, rhs_vf, rk_coef(s, 3)*dt/rk_coef(s, 4))
@@ -667,6 +679,25 @@ contains
         end if
 
     end subroutine s_tvd_rk
+
+    subroutine s_gpu_diag_marker_ts(t_step, label, stage)
+        integer, intent(in) :: t_step
+        character(len=*), intent(in) :: label
+        integer, intent(in), optional :: stage
+
+        if (proc_rank /= 0) return
+        if (t_step < t_step_start .or. t_step > t_step_start + 1) return
+#if defined(MFC_OpenACC)
+        !$acc wait
+#endif
+        if (present(stage)) then
+            print '("[GPU_DIAG] time_steppers t_step=", I8, " stage=", I2, " ", A)', &
+                t_step, stage, trim(label)
+        else
+            print '("[GPU_DIAG] time_steppers t_step=", I8, " ", A)', t_step, trim(label)
+        end if
+        call flush(output_unit)
+    end subroutine s_gpu_diag_marker_ts
 
     subroutine s_reset_m_dot_evap()
         integer :: j, k, l
@@ -755,6 +786,7 @@ contains
         if (proc_rank == 0) then
             print '(" evap fuel add @ t_step = ", I8, " min_pos = ", ES16.6, " max_pos = ", ES16.6, " mean_pos = ", ES16.6, " total = ", ES16.6)', &
                 t_step, min_glb, max_glb, mean_glb, sum_glb
+            call flush(output_unit)
         end if
     end subroutine s_apply_evap_to_fuel_species
 
@@ -789,6 +821,7 @@ contains
         if (proc_rank == 0) then
             print '(" m_dot_evap @ t_step = ", I8, " min = ", ES16.6, " max = ", ES16.6, " mean = ", ES16.6)', &
                 t_step, min_glb, max_glb, mean_glb
+            call flush(output_unit)
         end if
     end subroutine s_diagnose_m_dot_evap
 

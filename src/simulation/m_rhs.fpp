@@ -8,6 +8,8 @@
 !> @brief Assembles the right-hand side of the governing equations using finite-volume flux differencing, Riemann solvers, and physical source terms
 module m_rhs
 
+    use iso_fortran_env, only: output_unit
+
     use m_derived_types        !< Definitions of the derived types
 
     use m_global_parameters    !< Definitions of the global parameters
@@ -655,11 +657,13 @@ contains
         integer(kind=8) :: i, j, k, l, q !< Generic loop iterators
 
         call nvtxStartRange("COMPUTE-RHS")
+        call s_gpu_diag_marker(t_step, stage, 0, "start RHS")
 
         call cpu_time(t_start)
 
         if (.not. igr .or. dummy) then
             ! Association/Population of Working Variables
+            call s_gpu_diag_marker(t_step, stage, 0, "before qp copy")
             $:GPU_PARALLEL_LOOP(private='[i,j,k,l]', collapse=4)
             do i = 1, sys_size
                 do l = idwbuff(3)%beg, idwbuff(3)%end
@@ -671,6 +675,7 @@ contains
                 end do
             end do
             $:END_GPU_PARALLEL_LOOP()
+            call s_gpu_diag_marker(t_step, stage, 0, "after qp copy")
 
             ! Converting Conservative to Primitive Variables
 
@@ -703,15 +708,19 @@ contains
         end if
         if (.not. igr .or. dummy) then
             call nvtxStartRange("RHS-CONVERT")
+            call s_gpu_diag_marker(t_step, stage, 0, "before cons_to_prim")
             call s_convert_conservative_to_primitive_variables( &
                 q_cons_qp%vf, &
                 q_T_sf, &
                 q_prim_qp%vf, &
                 idwint)
+            call s_gpu_diag_marker(t_step, stage, 0, "after cons_to_prim")
             call nvtxEndRange
 
             call nvtxStartRange("RHS-COMMUNICATION")
+            call s_gpu_diag_marker(t_step, stage, 0, "before buffers")
             call s_populate_variables_buffers(bc_type, q_prim_qp%vf, pb_in, mv_in)
+            call s_gpu_diag_marker(t_step, stage, 0, "after buffers")
             call nvtxEndRange
         end if
 
@@ -749,6 +758,7 @@ contains
 
         ! Dimensional Splitting Loop
         do id = 1, num_dims
+            call s_gpu_diag_marker(t_step, stage, id, "start direction")
 
             if (igr .or. dummy) then
 
@@ -784,6 +794,7 @@ contains
 
                 ! Reconstructing Primitive/Conservative Variables
                 call nvtxStartRange("RHS-WENO")
+                call s_gpu_diag_marker(t_step, stage, id, "before reconstruct")
 
                 if (.not. surface_tension) then
                     if (all(Re_size == 0)) then
@@ -885,6 +896,7 @@ contains
                 end if
 
                 call nvtxEndRange ! WENO
+                call s_gpu_diag_marker(t_step, stage, id, "after reconstruct")
 
                 ! Configuring Coordinate Direction Indexes
                 if (id == 1) then
@@ -901,6 +913,7 @@ contains
 
                 !Computing Riemann Solver Flux and Source Flux
                 call nvtxStartRange("RHS-RIEMANN-SOLVER")
+                call s_gpu_diag_marker(t_step, stage, id, "before riemann")
                 call s_riemann_solver(qR_rsx_vf, qR_rsy_vf, qR_rsz_vf, &
                                       dqR_prim_dx_n(id)%vf, &
                                       dqR_prim_dy_n(id)%vf, &
@@ -916,6 +929,7 @@ contains
                                       flux_src_n(id)%vf, &
                                       flux_gsrc_n(id)%vf, &
                                       id, irx, iry, irz)
+                call s_gpu_diag_marker(t_step, stage, id, "after riemann")
                 call nvtxEndRange
 
                 !$:GPU_UPDATE(host='[flux_n(1)%vf(1)%sf]')
@@ -924,11 +938,13 @@ contains
                 ! Additional physics and source terms
                 ! RHS addition for advection source
                 call nvtxStartRange("RHS-ADVECTION-SRC")
+                call s_gpu_diag_marker(t_step, stage, id, "before adv source")
                 call s_compute_advection_source_term(id, &
                                                      rhs_vf, &
                                                      q_cons_qp, &
                                                      q_prim_qp, &
                                                      flux_src_n(id))
+                call s_gpu_diag_marker(t_step, stage, id, "after adv source")
                 call nvtxEndRange
 
                 ! RHS additions for hypoelasticity
@@ -994,6 +1010,7 @@ contains
 
                 ! END: Additional physics and source terms
             end if
+            call s_gpu_diag_marker(t_step, stage, id, "end direction")
         end do
         ! END: Dimensional Splitting Loop
 
@@ -1055,13 +1072,16 @@ contains
 
         if (chemistry .and. chem_params%reactions) then
             call nvtxStartRange("RHS-CHEM-REACTIONS")
+            call s_gpu_diag_marker(t_step, stage, 0, "before chem reactions")
             call s_compute_chemistry_reaction_flux(rhs_vf, q_cons_qp%vf, q_T_sf, q_prim_qp%vf, idwint)
+            call s_gpu_diag_marker(t_step, stage, 0, "after chem reactions")
             call nvtxEndRange
         end if
 
         if (chemistry .and. user_species_source) then
             if (user_species_id >= 1 .and. user_species_id <= (chemxe - chemxb + 1)) then
                 user_species_eqn = chemxb + user_species_id - 1
+                call s_gpu_diag_marker(t_step, stage, 0, "before user species src")
                 $:GPU_PARALLEL_LOOP(private='[j,k,l]', collapse=3)
                 do l = 0, p
                     do k = 0, n
@@ -1071,6 +1091,7 @@ contains
                     end do
                 end do
                 $:END_GPU_PARALLEL_LOOP()
+                call s_gpu_diag_marker(t_step, stage, 0, "after user species src")
             end if
         end if
 
@@ -1079,6 +1100,7 @@ contains
                 evap_liquid_fluid_id >= 1 .and. evap_liquid_fluid_id <= num_fluids) then
                 fuel_species_eqn = chemxb + fuel_species_id - 1
                 liquid_alpha_eqn = advxb + evap_liquid_fluid_id - 1
+                call s_gpu_diag_marker(t_step, stage, 0, "before evap species src")
                 $:GPU_PARALLEL_LOOP(private='[j,k,l]', collapse=3)
                 do l = 0, p
                     do k = 0, n
@@ -1090,6 +1112,7 @@ contains
                     end do
                 end do
                 $:END_GPU_PARALLEL_LOOP()
+                call s_gpu_diag_marker(t_step, stage, 0, "after evap species src")
             end if
         end if
 
@@ -1122,8 +1145,25 @@ contains
         end if
 
         call nvtxEndRange
+        call s_gpu_diag_marker(t_step, stage, 0, "end RHS")
 
     end subroutine s_compute_rhs
+
+    subroutine s_gpu_diag_marker(t_step, stage, idir, label)
+        integer, intent(in) :: t_step
+        integer, intent(in) :: stage
+        integer, intent(in) :: idir
+        character(len=*), intent(in) :: label
+
+        if (proc_rank /= 0) return
+        if (t_step < t_step_start .or. t_step > t_step_start + 1) return
+#if defined(MFC_OpenACC)
+        !$acc wait
+#endif
+        print '("[GPU_DIAG] rhs t_step=", I8, " stage=", I2, " dir=", I2, " ", A)', &
+            t_step, stage, idir, trim(label)
+        call flush(output_unit)
+    end subroutine s_gpu_diag_marker
 
     !> @brief Accumulates advection source contributions from a given coordinate direction into the RHS.
     subroutine s_compute_advection_source_term(idir, rhs_vf, q_cons_vf, q_prim_vf, flux_src_n_vf)
