@@ -47,17 +47,19 @@ Species order:
 ## Case Files
 
 ```text
+case_hpc_sanity_64x40_off.py
+case_hpc_sanity_120x80_off.py
 case_hpc_reactions_off.py
 case_hpc_reactions_on.py
 analyze_hpc.py
 ```
 
-The refined grid is `m = 240`, `n = 160`, `p = 0`. The short run uses:
+The sanity and refined OFF grids are:
 
 ```text
-t_step_stop  = 50
-t_step_save  = 5
-t_step_print = 5
+case_hpc_sanity_64x40_off.py   m = 64,  n = 40,  t_step_stop = 5
+case_hpc_sanity_120x80_off.py  m = 120, n = 80,  t_step_stop = 10
+case_hpc_reactions_off.py      m = 240, n = 160, t_step_stop = 50
 ```
 
 The timestep is the stable fixed timestep from the local 64x40 passing case.
@@ -105,6 +107,13 @@ python3 toolchain/main.py run runs/dodecane_global_reduced_on/case.py \
 
 For NVIDIA/OpenACC builds, set the compute capability for the target GPU. For a
 GTX 1660-class GPU this is `75`; on HPC, use the value for the allocated device.
+
+Recommended HPC validation order:
+
+1. Run `case_hpc_sanity_64x40_off.py`.
+2. If it passes, run `case_hpc_sanity_120x80_off.py`.
+3. Only then retry `case_hpc_reactions_off.py` at 240x160.
+4. Only after OFF passes, run `case_hpc_reactions_on.py`.
 
 ```bash
 source build/venv/bin/activate
