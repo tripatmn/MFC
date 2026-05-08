@@ -18,8 +18,6 @@ module m_phase_change
 
     use m_variables_conversion !< State variables type conversion procedures
 
-    use ieee_arithmetic
-
     use m_helper_basic         !< Functions to compare floating point numbers
 
     implicit none
@@ -48,6 +46,17 @@ module m_phase_change
     $:GPU_DECLARE(create='[A,B,C,D]')
 
 contains
+
+    !> @brief GPU-safe typed finite check for phase-change device routines.
+    logical function s_is_finite_wp(x)
+        $:GPU_ROUTINE(function_name='s_is_finite_wp',parallelism='[seq]', &
+            & cray_inline=True)
+
+        real(wp), intent(in) :: x
+
+        s_is_finite_wp = (x == x) .and. (abs(x) <= huge(x))
+
+    end function s_is_finite_wp
 
     !> This subroutine should dispatch to the correct relaxation solver based
         !!      some parameter. It replaces the procedure pointer, which CCE
@@ -162,7 +171,7 @@ contains
                     ! for this case, MFL cannot be either 0 or 1, so I chose it to be 2
                     call s_infinite_pt_relaxation_k(j, k, l, 2, pS, p_infpT, q_cons_vf, rhoe, TS)
 
-                    pt_state_ok = ieee_is_finite(pS) .and. ieee_is_finite(TS) .and. &
+                    pt_state_ok = s_is_finite_wp(pS) .and. s_is_finite_wp(TS) .and. &
                                   pS > 0._wp .and. TS > 0._wp
 
                     if (.not. pt_state_ok) then
@@ -250,14 +259,14 @@ contains
                             q_cons_vf(vp + contxb - 1)%sf(j, k, l) = m2
 
                             ! calling the pTg-equilibrium solver
-                            if (ieee_is_finite(pS) .and. ieee_is_finite(TS) .and. &
+                            if (s_is_finite_wp(pS) .and. s_is_finite_wp(TS) .and. &
                                 pS > 0._wp .and. TS > 0._wp) then
                                 call s_infinite_ptg_relaxation_k(j, k, l, pS, p_infpT, rhoe, q_cons_vf, TS)
                             end if
 
-                            ptg_state_ok = ieee_is_finite(pS) .and. ieee_is_finite(TS) .and. &
-                                           ieee_is_finite(q_cons_vf(lp + contxb - 1)%sf(j, k, l)) .and. &
-                                           ieee_is_finite(q_cons_vf(vp + contxb - 1)%sf(j, k, l)) .and. &
+                            ptg_state_ok = s_is_finite_wp(pS) .and. s_is_finite_wp(TS) .and. &
+                                           s_is_finite_wp(q_cons_vf(lp + contxb - 1)%sf(j, k, l)) .and. &
+                                           s_is_finite_wp(q_cons_vf(vp + contxb - 1)%sf(j, k, l)) .and. &
                                            pS > 0._wp .and. TS > 0._wp
 
                             if (.not. ptg_state_ok) then

@@ -24,8 +24,6 @@ module m_chemistry
     #:endif
 
     use m_global_parameters
-    use ieee_arithmetic
-
     implicit none
 
     #:if USING_AMD
@@ -43,14 +41,14 @@ module m_chemistry
 
 contains
 
-    !> @brief Typed finite check to avoid compiler ambiguity in ieee_is_finite.
+    !> @brief GPU-safe typed finite check.
     logical function s_is_finite_wp(x)
         $:GPU_ROUTINE(function_name='s_is_finite_wp',parallelism='[seq]', &
             & cray_inline=True)
 
         real(wp), intent(in) :: x
 
-        s_is_finite_wp = ieee_is_finite(x)
+        s_is_finite_wp = (x == x) .and. (abs(x) <= huge(x))
 
     end function s_is_finite_wp
 
