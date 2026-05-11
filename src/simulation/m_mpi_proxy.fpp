@@ -97,6 +97,7 @@ contains
             & 'num_probes', 'num_integrals', 'bubble_model', 'thermal',        &
             & 'num_source', 'relax_model', 'num_ibs', 'n_start', 'chem_gas_fluid_id', &
             & 'chem_gas_num_fluids', &
+            & 'user_species_id', 'fuel_species_id', 'evap_liquid_fluid_id', &
             & 'num_bc_patches', 'num_igr_iters', 'num_igr_warm_start_iters', &
             & 'adap_dt_max_iters' ]
             call MPI_BCAST(${VAR}$, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
@@ -116,7 +117,7 @@ contains
             & 'cfl_adap_dt', 'cfl_const_dt', 'cfl_dt', 'surface_tension',       &
             & 'shear_stress', 'bulk_stress', 'bubbles_lagrange',                &
             & 'hyperelasticity', 'down_sample', 'int_comp','fft_wrt', &
-            & 'hyper_cleaning' ]
+            & 'hyper_cleaning', 'user_species_source', 'evap_species_source' ]
             call MPI_BCAST(${VAR}$, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
         #:endfor
         call MPI_BCAST(chem_fixed_T_enable, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
@@ -160,7 +161,8 @@ contains
             & 'z_b', 't_stop', 't_save', 'cfl_target', 'Bx0', 'alf_factor',  &
             & 'tau_star', 'cont_damage_s', 'alpha_bar', 'adap_dt_tol', &
             & 'ic_eps', 'ic_beta', 'hyper_cleaning_speed', &
-            & 'hyper_cleaning_tau' ]
+            & 'hyper_cleaning_tau', 'user_species_src', 'evap_species_src', &
+            & 'evap_alpha_thresh', 'evap_alpha_lo', 'evap_alpha_hi' ]
             call MPI_BCAST(${VAR}$, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
         #:endfor
 
