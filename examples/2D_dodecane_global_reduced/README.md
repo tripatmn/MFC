@@ -35,6 +35,12 @@ Species order:
 - With reactions on, the artificial one-step mechanism gives sign-correct coupling:
   `c12h26` and `O2` decrease relative to reactions off, while `CO2` and `H2O`
   increase.
+- The multi-rank GPU path works after broadcasting the evaporation/species
+  coupling controls to all ranks.
+- The accelerated validation pair amplifies the ON/OFF chemistry signal while
+  preserving the same reduced-flow setup.
+- Raw `D/` output can be analyzed directly with `analyze_hpc.py`; `post_process`
+  is not required for this Branch-A validation.
 
 ## What This Does Not Validate
 
@@ -43,6 +49,9 @@ Species order:
 - It is not transport-controlled burning; chemistry diffusion is off.
 - It is not a D2-law validation.
 - It does not validate a detailed dodecane mechanism such as Reitz chemistry.
+- The accelerated global one-step rate is validation-only.
+- It does not establish a physical burning-rate constant.
+- It is not a grid-convergence study.
 
 ## Case Files
 
@@ -51,6 +60,9 @@ case_hpc_sanity_64x40_off.py
 case_hpc_sanity_120x80_off.py
 case_hpc_reactions_off.py
 case_hpc_reactions_on.py
+case_hpc_reactions_off_stronger.py
+case_hpc_reactions_on_stronger.py
+dodecane_global_1step_rate1000.yaml
 analyze_hpc.py
 ```
 
@@ -63,6 +75,44 @@ case_hpc_reactions_off.py      m = 240, n = 160, t_step_stop = 50
 ```
 
 The timestep is the stable fixed timestep from the local 64x40 passing case.
+
+## Branch-A Closeout
+
+Branch A is a software/coupling validation, not a physical burning-droplet
+study. The confirmed path is:
+
+1. Phase-change relaxation produces `m_dot_evap`.
+2. Positive vaporization is added to the global fuel species selected by
+   `fuel_species_id = 1`, namely `c12h26`.
+3. With reactions enabled, the validation mechanism consumes `c12h26` and `O2`.
+4. With reactions enabled, the validation mechanism produces `CO2` and `H2O`.
+5. The same path runs on multi-rank GPU after broadcasting the new
+   evaporation/species coupling parameters.
+
+The baseline pair uses:
+
+```text
+case_hpc_reactions_off.py
+case_hpc_reactions_on.py
+examples/1D_dodecane_global_smoke/dodecane_global_1step.yaml
+```
+
+The stronger Branch-A pair uses:
+
+```text
+case_hpc_reactions_off_stronger.py
+case_hpc_reactions_on_stronger.py
+dodecane_global_1step_rate1000.yaml
+```
+
+The stronger mechanism is identical in species and stoichiometry to the
+baseline global one-step mechanism, but its Arrhenius prefactor is increased
+1000x. This is only to make the ON/OFF signal easier to measure in a cheap
+software validation. It should not be interpreted as physical dodecane
+kinetics.
+
+Known limitation: `post_process` has failed with exit 139 in this workflow, but
+the raw `D/` analyzer is sufficient for the current Branch-A checks.
 
 ## Recommended Run Layout
 
@@ -187,3 +237,136 @@ PASS criteria:
   and `c12h26` mass increases.
 - ON: all saved fields finite, vaporization remains active, `c12h26_ON <
   c12h26_OFF`, `O2_ON < O2_OFF`, `CO2_ON > CO2_OFF`, and `H2O_ON > H2O_OFF`.
+
+## Branch-B B1a Closeout
+
+The reduced B1 scaffold is accepted only as a nonreacting phase-change
+mass-transfer budget validation. It should not be called a D2-law validation.
+
+Observed B1-family results:
+
+- B1 and B1_v2 ran with reactions off, phase relaxation active, and finite raw
+  fields. The thresholded droplet area and threshold `D^2` did not change.
+- B1_v2 produced nearly one-for-one liquid-to-vapor mass transfer:
+  `cons.1` liquid alpha_rho changed by `-7.2678e-09`, while `cons.2` vapor
+  alpha_rho changed by `+7.3026e-09`.
+- B1_v4 reduced the initial droplet radius on the same grid, but all
+  `alpha_liq` threshold areas at 0.1, 0.5, and 0.9 remained exactly constant,
+  and threshold `D^2` remained exactly constant.
+- B1_v4 also produced nearly one-for-one liquid-to-vapor mass transfer:
+  `cons.1` liquid alpha_rho changed by `-2.4310e-09`, while `cons.2` vapor
+  alpha_rho changed by `+2.4567e-09`.
+- In B1_v4, liquid alpha_rho decreased while liquid alpha slightly increased,
+  so this reduced shock/dodecane scaffold does not behave like a clean
+  geometrically receding droplet.
+
+Conclusion: B1a passes as a mass-transfer budget check because liquid alpha_rho
+decreases and vapor alpha_rho increases nearly one-for-one. Geometric D2-law
+validation was not achieved. Do not continue tuning this reduced scaffold for a
+D2-law signal.
+
+## Branch-B Plan
+
+Branch B should move from sign-correct software coupling toward a physical
+burning-droplet validation. The target observable is the droplet-area law:
+
+```text
+D(t)^2 = D(0)^2 - K t
+```
+
+where `K` is the burning-rate constant estimated from a linear regression over
+the quasi-steady burning interval.
+
+Required case features:
+
+- A single isolated liquid dodecane droplet in an oxidizing gas environment.
+- A controlled ambient pressure, temperature, and oxidizer composition.
+- Vaporization active, fuel species coupling active, and reactions active.
+- Output of liquid volume fraction or liquid mass fields at enough time samples
+  to reconstruct droplet size.
+- Output of fuel, oxidizer, product species and temperature or pressure fields.
+- Diffusion/transport likely enabled before claiming physical burning behavior;
+  Branch-A chemistry diffusion is off and does not validate transport-limited
+  burning.
+
+Recommended staged path:
+
+### Stage B0: Observable and Raw Analyzer
+
+Define the raw-output analyzer before adding new cases. It should read `D/`
+fields directly, compute finite-field status, integrate liquid mass/area, infer
+an effective droplet diameter, and fit `D^2(t)` over a selectable time window.
+For a 2D cross-section, a practical diameter estimate is:
+
+```text
+A_liq(t) = integral H(alpha_liq - alpha_cutoff) dA
+D_eff(t) = 2 sqrt(A_liq(t) / pi)
+```
+
+An alternate smoother estimate can use `integral alpha_liq dA` instead of a
+thresholded area, but the cutoff and method must be reported.
+
+The analyzer should write:
+
+- finite-field status and bad file list
+- `A_liq(t)`, `D_eff(t)`, and `D_eff(t)^2`
+- selected regression window
+- fitted slope and `K = -d(D^2)/dt`
+- residuals or `R^2`
+- species and temperature sanity summaries
+
+### Stage B1: Nonreacting/Evaporating Droplet Sanity
+
+Run a minimal nonreacting case with vaporization and fuel-species coupling on.
+Check that liquid decreases, vapor/fuel species increase, fields remain finite,
+and the diameter estimator is smooth enough to regress later.
+
+### Stage B2: Reacting Single-Droplet Case
+
+Turn reactions on with a global one-step mechanism first. This keeps the
+chemistry cheap and controllable while validating the full vaporization to fuel
+species to heat-release path. Do not start with a detailed mechanism until the
+diameter metric and raw analyzer are stable.
+
+### Stage B3: Burning-Rate Comparison
+
+Compute `D^2(t)` and fit a burning-rate constant over the quasi-steady interval.
+Compare against an expected order of magnitude or a reference setup only after
+the case shows stable finite fields, monotonic liquid loss, and sensible
+temperature/species trends.
+
+### Stage B4: Grid Refinement
+
+Refine the grid only after the raw analyzer, droplet-size metric, and regression
+window are stable on the minimal physical case. The refinement study should
+track `K`, finite-field status, and regression quality, not just final mass.
+
+### Stage B5: Mechanism and Transport Upgrade
+
+After the global one-step case produces a stable physical metric, upgrade toward
+more realistic chemistry and transport. Candidate steps are:
+
+- enable species/thermal diffusion needed for transport-controlled burning
+- replace the validation one-step mechanism with a reduced or full Cantera
+  dodecane mechanism
+- compare sensitivity of `K` to mechanism and transport choices
+
+The first Branch-B case should be the smallest single-droplet configuration that
+can produce a stable `D^2(t)` signal. It should precede shock-droplet burning and
+any grid-convergence campaign.
+
+## Branch-B Next Step
+
+Design a dedicated single-droplet evaporation/D2 validation case separate from
+the reduced shock/dodecane scaffold. The target observable is a thresholded or
+connected-component `D^2(t)` that actually decreases over saved raw outputs.
+
+Pass criteria for the clean case:
+
+- all saved fields are finite
+- liquid mass decreases monotonically or near-monotonically
+- thresholded or connected-component `D^2(t)` decreases measurably
+- at least 4 fit points are available in the selected regression window
+- fitted `K = -d(D^2)/dt` is positive
+
+Do not refine the grid until this clean case has a measurable `D^2(t)` signal.
