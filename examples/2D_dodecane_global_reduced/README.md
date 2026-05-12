@@ -321,6 +321,24 @@ Run a minimal nonreacting case with vaporization and fuel-species coupling on.
 Check that liquid decreases, vapor/fuel species increase, fields remain finite,
 and the diameter estimator is smooth enough to regress later.
 
+Clean evaporation pilot status:
+
+- `case_hpc_d2_clean_evap_pilot_v2.py` is the first clean nonreacting
+  single-droplet D2 evaporation pilot.
+- Setup: no shock, chemistry disabled, `model_eqns = 3`, `relax = T`,
+  `relax_model = 6`, `relax_ic = F`, 128x128 grid, GPU run with `-n 2`.
+- Result: simulation passed with finite fields in `69/69` saved samples.
+  Threshold `D^2` decreased from `6.4324113826307024e-09` to
+  `5.1710006242829025e-09`, and threshold liquid cells decreased from `821` to
+  `660`.
+- Liquid alpha_rho decreased while vapor alpha_rho increased. The raw D2 fit
+  gave `K = 2.8369259394735546e-03` and `R^2 = 0.7980995461141833`.
+- Interpretation: this is the first stable Branch-B baseline with actual
+  alpha-boundary recession.
+- Limitation: this is still a pilot only. It is not grid-converged, not a
+  reactive or burning validation, and the fit quality still needs window
+  assessment.
+
 ### Stage B2: Reacting Single-Droplet Case
 
 Turn reactions on with a global one-step mechanism first. This keeps the
