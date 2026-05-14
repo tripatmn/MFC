@@ -346,6 +346,44 @@ chemistry cheap and controllable while validating the full vaporization to fuel
 species to heat-release path. Do not start with a detailed mechanism until the
 diameter metric and raw analyzer are stable.
 
+Clean burning pilot status:
+
+- `case_hpc_d2_clean_burning_pilot.py` is the first clean reacting
+  single-droplet pilot. It keeps the clean evaporation pilot geometry, grid,
+  no-shock setup, phase-change setup, raw outputs, and GPU `-n 2` path, while
+  enabling the baseline global one-step dodecane mechanism.
+- The baseline burning pilot passed with finite fields and sign-correct weak
+  chemistry. `CO2` and `H2O` increased, `O2` decreased, and the `D^2`
+  regression remained nearly unchanged relative to the nonreacting
+  `case_hpc_d2_clean_evap_pilot_v2.py` baseline.
+- `case_hpc_d2_clean_burning_pilot_rate1000.py` uses the same case setup but
+  switches to `dodecane_global_1step_rate1000.yaml`. After forcing a real
+  thermochemistry rebuild, the rate1000 pilot produced about `2.5x` stronger
+  `CO2`, `H2O`, and `O2`-consumption signals than the baseline burning pilot.
+- The clean nonreacting pilot gave `K = 2.8369259394735546e-03` and
+  `R^2 = 0.7980995461141833` over the `D2_norm = 0.90..0.80` fit window. The
+  baseline and rebuilt rate1000 burning pilots both gave
+  `K = 2.8053606995350347e-03` and `R^2 = 0.7920795337031122` in the same
+  window, so stronger chemistry did not materially change the measured `D^2`
+  regression.
+- Spatial diagnostics showed that products form near the droplet, not simply
+  far away from the interface. Pressure and temperature-proxy maxima increased
+  locally in the rebuilt rate1000 output, but global and near-droplet mean
+  temperature-proxy values barely changed.
+- Interpretation: these pilots are chemistry-active, but not
+  heat-feedback-dominated. The current `D^2` signal appears dominated by phase
+  relaxation/evaporation rather than reaction heat feedback, consistent with
+  reacting-droplet studies where products and flames can form while Stefan or
+  convective cooling and near-interface transport keep droplet heating weakly
+  dependent on reactivity.
+- Caution: direct temperature was not output in these runs. The thermal
+  comparison used pressure and a gas-temperature proxy, so it should be treated
+  as diagnostic rather than definitive.
+- Next step: add direct temperature, internal-energy, and reaction-source
+  diagnostics. After that, consider either a 1D liquid-gas interface test or a
+  shock/flow case closer to the reacting-droplet literature before claiming a
+  physical burning-rate validation.
+
 ### Stage B3: Burning-Rate Comparison
 
 Compute `D^2(t)` and fit a burning-rate constant over the quasi-steady interval.
