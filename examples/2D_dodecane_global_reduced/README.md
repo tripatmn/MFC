@@ -428,6 +428,43 @@ shock-induced burning-droplet validation. The next direction is to use this
 formalized heat-coupled path as the baseline for cleaner quiescent validation,
 then extend toward shock and post-shock burning-droplet cases.
 
+#### Archived Baseline Quiescent Burning Validation
+
+Archived run directory:
+
+```text
+runs/dodecane_clean_burning_baseline_validation/
+```
+
+This run used the baseline one-step dodecane mechanism, GPU/OpenACC with
+`-n 2`, and the formal heat-coupling settings:
+
+```text
+chem_reaction_heat_enable     = T
+chem_reaction_heat_limit_frac = 0.05
+chem_reaction_heat_diag       = F
+```
+
+The simulation passed and all checked raw fields were finite. The heat-coupled
+baseline result gave threshold `D2_norm = 1.0000 -> 0.7978`,
+mass-equivalent `D2_norm = 1.0000 -> 0.9556`, and alpha-weighted
+`D2_norm = 1.0000 -> 0.9312`. Liquid alpha_rho changed by `-1.503e-07`,
+vapor alpha_rho changed by `+1.503e-07`, and the chemistry signs were correct:
+`O2 ~= -1.224e2`, `CO2 ~= +1.092e2`, and `H2O ~= +4.842e1`.
+
+Compared with `runs/dodecane_d2_clean_evap_pilot_v2/`, burning increased liquid
+mass regression by about `5.1%`. Threshold equivalent-area `D2` fits gave
+`R^2 ~= 0.86..0.87` and an increased fitted `K` by about `19..25%`, depending
+on the selected window. The mass-equivalent `D2_norm` fit was cleaner, with
+`R^2 ~= 0.994`, and its fitted recession rate increased by about `4.6%`.
+
+Use mass-equivalent `D2_norm` from liquid alpha_rho as the primary metric for
+heat-coupled quiescent validation. Use threshold equivalent-area `D2` from
+`alpha_liq >= 0.5` as the secondary geometric metric. This remains a 2D
+Cartesian equivalent-diameter validation, not yet a direct 3D spherical burning
+constant. Use this archived run as the baseline quiescent burning reference
+before building more physically detailed quiescent or shock/post-shock cases.
+
 ### Stage B3: Burning-Rate Comparison
 
 Compute `D^2(t)` and fit a burning-rate constant over the quasi-steady interval.
