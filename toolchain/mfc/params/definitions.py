@@ -207,6 +207,9 @@ _SIMPLE_DESCS = {
     "chem_fixed_T": "Validation-only fixed chemistry temperature",
     "chem_T_min": "Minimum chemistry temperature",
     "chem_T_max": "Maximum chemistry temperature",
+    "chem_reaction_heat_enable": "Enable multi-fluid reaction enthalpy feedback",
+    "chem_reaction_heat_limit_frac": "Fraction of local gas internal energy allowed as reaction heat per step",
+    "chem_reaction_heat_diag": "Enable debug diagnostics for multi-fluid reaction heat coupling",
     "user_species_source": "Enable user source term in a species equation",
     "user_species_id": "Species index to apply user source term",
     "user_species_src": "User source term value for selected species equation",
@@ -938,6 +941,9 @@ def _load():  # pylint: disable=too-many-locals,too-many-statements
     _r("chem_fixed_T", REAL, {"chemistry"})
     _r("chem_T_min", REAL, {"chemistry"})
     _r("chem_T_max", REAL, {"chemistry"})
+    _r("chem_reaction_heat_enable", LOG, {"chemistry"})
+    _r("chem_reaction_heat_limit_frac", REAL, {"chemistry"})
+    _r("chem_reaction_heat_diag", LOG, {"chemistry"})
     _r("user_species_source", LOG, {"chemistry"})
     _r("user_species_id", INT, {"chemistry"})
     _r("user_species_src", REAL, {"chemistry"})

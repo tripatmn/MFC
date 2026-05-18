@@ -117,13 +117,15 @@ contains
             & 'cfl_adap_dt', 'cfl_const_dt', 'cfl_dt', 'surface_tension',       &
             & 'shear_stress', 'bulk_stress', 'bubbles_lagrange',                &
             & 'hyperelasticity', 'down_sample', 'int_comp','fft_wrt', &
-            & 'hyper_cleaning', 'user_species_source', 'evap_species_source' ]
+            & 'hyper_cleaning', 'chem_reaction_heat_enable', 'chem_reaction_heat_diag', &
+            & 'user_species_source', 'evap_species_source' ]
             call MPI_BCAST(${VAR}$, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
         #:endfor
         call MPI_BCAST(chem_fixed_T_enable, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
         call MPI_BCAST(chem_fixed_T, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
         call MPI_BCAST(chem_T_min, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
         call MPI_BCAST(chem_T_max, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
+        call MPI_BCAST(chem_reaction_heat_limit_frac, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
 
         if (chemistry) then
             #:for VAR in [ 'diffusion', 'reactions' ]

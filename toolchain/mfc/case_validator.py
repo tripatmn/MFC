@@ -1601,6 +1601,8 @@ class CaseValidator:  # pylint: disable=too-many-public-methods
         runtime if misconfigured.
         """
         if self.get("chemistry", 'F') != 'T':
+            self.prohibit(self.get("chem_reaction_heat_enable", 'F') == 'T',
+                          "chem_reaction_heat_enable requires chemistry = T")
             return
 
         gas_id = self.get("chem_gas_fluid_id", 1)
@@ -1641,6 +1643,22 @@ class CaseValidator:  # pylint: disable=too-many-public-methods
         self.prohibit(tmin <= 0, "chem_T_min must be > 0")
         self.prohibit(tmax < tmin, "chem_T_max must be >= chem_T_min")
         self.prohibit(tfixed <= 0, "chem_fixed_T must be > 0")
+
+        heat_enabled = self.get("chem_reaction_heat_enable", 'F') == 'T'
+        heat_limit_frac = self.get("chem_reaction_heat_limit_frac", 0.0)
+        model_eqns = self.get("model_eqns")
+        reactions_enabled = self.get("chem_params%reactions", 'F') == 'T'
+        if heat_limit_frac is None:
+            heat_limit_frac = 0.0
+        self.prohibit(heat_limit_frac < 0,
+                      "chem_reaction_heat_limit_frac must be >= 0")
+        if heat_enabled:
+            self.prohibit(not reactions_enabled,
+                          "chem_reaction_heat_enable requires chem_params%reactions = T")
+            self.prohibit(num_fluids is None or num_fluids <= 1,
+                          "chem_reaction_heat_enable requires num_fluids > 1")
+            self.prohibit(model_eqns != 3,
+                          "chem_reaction_heat_enable currently requires model_eqns = 3")
 
         if self.get("user_species_source", 'F') == 'T':
             sid = self.get("user_species_id", 1)

@@ -640,14 +640,16 @@ contains
             real(wp), dimension(3) :: alpha_K, alpha_rho_K
             real(wp), dimension(3) :: nRtmp
             real(wp) :: rhoYks(1:10)
+            real(wp) :: Ys_T(1:10)
         #:else
             real(wp), dimension(num_fluids) :: alpha_K, alpha_rho_K
             real(wp), dimension(nb) :: nRtmp
             real(wp) :: rhoYks(1:num_species)
+            real(wp) :: Ys_T(1:num_species)
         #:endif
         real(wp), dimension(2) :: Re_K
         real(wp) :: rho_K, gamma_K, pi_inf_K, qv_K, dyn_pres_K, rho_g
-        real(wp) :: Y_sum
+        real(wp) :: Y_sum, mix_mol_weight, T_chem
 
         real(wp) :: vftmp, nbub_sc
 
@@ -671,7 +673,7 @@ contains
         real(wp) :: f, dGa_dW, dp_dW, df_dW ! Functions within Newton-Raphson iteration
         integer :: iter ! Newton-Raphson iteration counter
 
-        $:GPU_PARALLEL_LOOP(collapse=3, private='[alpha_K, alpha_rho_K, Re_K, nRtmp, rho_K, gamma_K, pi_inf_K,qv_K, dyn_pres_K, rho_g, Y_sum, rhoYks, gas_idx, fluid_id, B, pres, vftmp, nbub_sc, G_K, T, pres_mag, Ga, B2, m2, S, W, dW, E, D, f, dGa_dW, dp_dW, df_dW, iter ]')
+        $:GPU_PARALLEL_LOOP(collapse=3, private='[alpha_K, alpha_rho_K, Re_K, nRtmp, rho_K, gamma_K, pi_inf_K,qv_K, dyn_pres_K, rho_g, Y_sum, rhoYks, Ys_T, gas_idx, fluid_id, B, pres, vftmp, nbub_sc, G_K, T, mix_mol_weight, T_chem, pres_mag, Ga, B2, m2, S, W, dW, E, D, f, dGa_dW, dp_dW, df_dW, iter ]')
         do l = ibounds(3)%beg, ibounds(3)%end
             do k = ibounds(2)%beg, ibounds(2)%end
                 do j = ibounds(1)%beg, ibounds(1)%end
@@ -871,6 +873,27 @@ contains
                     qK_prim_vf(E_idx)%sf(j, k, l) = pres
 
                     if (chemistry) then
+                        if (num_fluids > 1) then
+                            if (chem_fixed_T_enable) then
+                                T = min(max(chem_fixed_T, chem_T_min), chem_T_max)
+                            elseif (chem_reaction_heat_enable .and. (rho_g > sgm_eps) .and. (pres == pres) .and. &
+                                    (abs(pres) <= huge(pres)) .and. (pres > 0._wp)) then
+                                $:GPU_LOOP(parallelism='[seq]')
+                                do i = 1, num_species
+                                    Ys_T(i) = qK_prim_vf(chemxb + i - 1)%sf(j, k, l)
+                                end do
+
+                                call get_mixture_molecular_weight(Ys_T, mix_mol_weight)
+                                T_chem = pres*mix_mol_weight/(gas_constant*rho_g)
+                                if ((mix_mol_weight == mix_mol_weight) .and. &
+                                    (abs(mix_mol_weight) <= huge(mix_mol_weight)) .and. &
+                                    (mix_mol_weight > 0._wp) .and. &
+                                    (T_chem == T_chem) .and. (abs(T_chem) <= huge(T_chem)) .and. &
+                                    (T_chem > 0._wp)) then
+                                    T = T_chem
+                                end if
+                            end if
+                        end if
                         q_T_sf%sf(j, k, l) = T
                     end if
 

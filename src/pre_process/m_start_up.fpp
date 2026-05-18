@@ -148,6 +148,7 @@ contains
             down_sample, recon_type, muscl_order, hyper_cleaning, &
             chem_gas_fluid_id, chem_gas_num_fluids, chem_gas_fluid_ids, &
             chem_fixed_T_enable, chem_fixed_T, chem_T_min, chem_T_max, &
+            chem_reaction_heat_enable, chem_reaction_heat_limit_frac, chem_reaction_heat_diag, &
             user_species_source, user_species_id, user_species_src, &
             fuel_species_id, evap_species_source, evap_species_src, &
             evap_liquid_fluid_id, evap_alpha_thresh, evap_alpha_lo, evap_alpha_hi, &

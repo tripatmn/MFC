@@ -471,6 +471,9 @@ module m_global_parameters
     real(wp) :: chem_fixed_T !< Validation-only fixed chemistry temperature
     real(wp) :: chem_T_min !< Minimum chemistry temperature passed to thermochemistry
     real(wp) :: chem_T_max !< Maximum chemistry temperature passed to thermochemistry
+    logical :: chem_reaction_heat_enable !< Enable multi-fluid reaction enthalpy feedback
+    real(wp) :: chem_reaction_heat_limit_frac !< Fractional per-step reaction heat limiter
+    logical :: chem_reaction_heat_diag !< Enable reaction heat debug diagnostics
     logical :: user_species_source !< User-defined species source hook toggle
     integer :: user_species_id !< Species index for user-defined source term
     real(wp) :: user_species_src !< User-defined source term value
@@ -483,6 +486,7 @@ module m_global_parameters
     real(wp) :: evap_alpha_hi !< Upper liquid volume-fraction bound for interface-band species source
     $:GPU_DECLARE(create='[chem_params,chem_gas_fluid_id,chem_gas_num_fluids,chem_gas_fluid_ids, &
         & chem_fixed_T_enable,chem_fixed_T,chem_T_min,chem_T_max, &
+        & chem_reaction_heat_enable,chem_reaction_heat_limit_frac,chem_reaction_heat_diag, &
         & user_species_source,user_species_id,user_species_src, &
         & fuel_species_id,evap_species_source,evap_species_src,evap_liquid_fluid_id,evap_alpha_thresh, &
         & evap_alpha_lo,evap_alpha_hi]')
@@ -683,6 +687,9 @@ contains
         chem_fixed_T = 300._wp
         chem_T_min = 250._wp
         chem_T_max = 3000._wp
+        chem_reaction_heat_enable = .false.
+        chem_reaction_heat_limit_frac = 0._wp
+        chem_reaction_heat_diag = .false.
         user_species_source = .false.
         user_species_id = 1
         user_species_src = 0._wp
@@ -1417,6 +1424,7 @@ contains
 
         $:GPU_UPDATE(device='[chem_params,chem_gas_fluid_id,chem_gas_num_fluids,chem_gas_fluid_ids, &
             & chem_fixed_T_enable,chem_fixed_T,chem_T_min,chem_T_max, &
+            & chem_reaction_heat_enable,chem_reaction_heat_limit_frac,chem_reaction_heat_diag, &
             & user_species_source,user_species_id,user_species_src, &
             & fuel_species_id,evap_species_source,evap_species_src,evap_liquid_fluid_id,evap_alpha_thresh, &
             & evap_alpha_lo,evap_alpha_hi]')

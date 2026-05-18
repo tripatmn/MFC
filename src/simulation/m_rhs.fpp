@@ -1055,7 +1055,7 @@ contains
 
         if (chemistry .and. chem_params%reactions) then
             call nvtxStartRange("RHS-CHEM-REACTIONS")
-            call s_compute_chemistry_reaction_flux(rhs_vf, q_cons_qp%vf, q_T_sf, q_prim_qp%vf, idwint)
+            call s_compute_chemistry_reaction_flux(rhs_vf, q_cons_qp%vf, q_T_sf, q_prim_qp%vf, idwint, t_step, stage)
             call nvtxEndRange
         end if
 
