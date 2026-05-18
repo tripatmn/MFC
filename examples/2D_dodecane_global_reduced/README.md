@@ -384,6 +384,50 @@ Clean burning pilot status:
   shock/flow case closer to the reacting-droplet literature before claiming a
   physical burning-rate validation.
 
+#### Finalized Multifluid Reaction Heat Coupling
+
+The multifluid reaction-energy coupling is now controlled by formal case
+parameters:
+
+```text
+chem_reaction_heat_enable     = F
+chem_reaction_heat_limit_frac = 0.0
+chem_reaction_heat_diag       = F
+```
+
+These defaults preserve existing behavior. For the clean validation pilots, use:
+
+```text
+chem_reaction_heat_enable     = T
+chem_reaction_heat_limit_frac = 0.05
+chem_reaction_heat_diag       = F
+```
+
+The baseline one-step dodecane mechanism is the primary clean validation path.
+The `rate1000` mechanism is a stress/sensitivity case only; it is useful for
+amplifying stiffness and source-limiter behavior, but it should not be treated
+as the primary validation case.
+
+Validation summary for the clean quiescent pilots:
+
+- nonreacting final threshold `D2_norm` was about `0.8039`
+- baseline heat plus limiter final threshold `D2_norm` was about `0.7978`
+- rate1000 heat plus limiter final threshold `D2_norm` was about `0.8027`
+- baseline species deltas were `O2 ~= -1.224e2`, `CO2 ~= +1.092e2`, and
+  `H2O ~= +4.842e1`
+- rate1000 species deltas were `O2 ~= -3.538e2`, `CO2 ~= +3.157e2`, and
+  `H2O ~= +1.400e2`
+
+For heat-coupled runs, use the mass-equivalent `D2_norm` from liquid
+`alpha_rho` as the primary droplet-loss metric. The threshold `D2` from
+`alpha_liq >= 0.5` remains useful as a secondary geometric metric, but it does
+not track liquid mass loss as cleanly once reaction heat changes the interface.
+
+Current limitation: this is a clean quiescent single-droplet pilot, not yet a
+shock-induced burning-droplet validation. The next direction is to use this
+formalized heat-coupled path as the baseline for cleaner quiescent validation,
+then extend toward shock and post-shock burning-droplet cases.
+
 ### Stage B3: Burning-Rate Comparison
 
 Compute `D^2(t)` and fit a burning-rate constant over the quasi-steady interval.
