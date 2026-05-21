@@ -34,6 +34,16 @@ $SCRATCH/mid_burning
 $SCRATCH/high_burning
 ```
 
+## High-Grid Lean Output
+
+The full-output high-grid cases can be too I/O heavy because raw `D/` output
+dominates storage. For high-grid validation, prefer the `high_lean` cases below.
+They keep the same 256 x 256 physics and final time, retain pressure diagnostics,
+and save every 200 steps instead of every 100 steps. The current simulation raw
+writer emits all conservative fields and, when pressure is needed, all primitive
+fields, so this lean variant reduces output by cadence rather than by individual
+raw-field selection.
+
 ## Run Commands
 
 Run pre_process + simulation only. Do not run post_process.
@@ -48,7 +58,7 @@ cp examples/2D_dodecane_global_reduced/case_hpc_d2_clean_evap_validation_mid.py 
 ./mfc.sh run "$SCRATCH/mid_nonreacting/case.py" -t pre_process simulation --gpu acc -n 2 -j 8 --clean -b mpirun
 
 mkdir -p "$SCRATCH/high_nonreacting"
-cp examples/2D_dodecane_global_reduced/case_hpc_d2_clean_evap_validation_high.py "$SCRATCH/high_nonreacting/case.py"
+cp examples/2D_dodecane_global_reduced/case_hpc_d2_clean_evap_validation_high_lean.py "$SCRATCH/high_nonreacting/case.py"
 ./mfc.sh run "$SCRATCH/high_nonreacting/case.py" -t pre_process simulation --gpu acc -n 2 -j 8 --clean -b mpirun
 
 mkdir -p "$SCRATCH/low_burning"
@@ -60,7 +70,7 @@ cp examples/2D_dodecane_global_reduced/case_hpc_d2_clean_burning_validation_mid.
 ./mfc.sh run "$SCRATCH/mid_burning/case.py" -t pre_process simulation --gpu acc -n 2 -j 8 --clean -b mpirun
 
 mkdir -p "$SCRATCH/high_burning"
-cp examples/2D_dodecane_global_reduced/case_hpc_d2_clean_burning_validation_high.py "$SCRATCH/high_burning/case.py"
+cp examples/2D_dodecane_global_reduced/case_hpc_d2_clean_burning_validation_high_lean.py "$SCRATCH/high_burning/case.py"
 ./mfc.sh run "$SCRATCH/high_burning/case.py" -t pre_process simulation --gpu acc -n 2 -j 8 --clean -b mpirun
 ```
 
