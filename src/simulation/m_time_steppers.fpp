@@ -686,15 +686,11 @@ contains
         $:END_GPU_PARALLEL_LOOP()
     end subroutine s_reset_m_dot_evap
 
-    subroutine s_apply_evap_to_fuel_species(q_cons_vf, ldt, t_step)
+    subroutine s_apply_evap_to_fuel_species(q_cons_vf, ldt)
         type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
         real(wp), intent(in) :: ldt
-        integer, intent(in) :: t_step
         integer :: fuel_species_eqn
         integer :: j, k, l
-        real(wp) :: contrib
-        real(wp) :: min_loc, max_loc, sum_loc, count_loc
-        real(wp) :: min_glb, max_glb, sum_glb, count_glb, mean_glb
 
         if (.not. relax) return
         if (.not. chemistry) return
@@ -713,105 +709,7 @@ contains
             end do
         end do
         $:END_GPU_PARALLEL_LOOP()
-
-        $:GPU_UPDATE(host='[m_dot_evap%sf]')
-
-        min_loc = huge(1._wp)
-        max_loc = 0._wp
-        sum_loc = 0._wp
-        count_loc = 0._wp
-
-        do l = 0, p
-            do k = 0, n
-                do j = 0, m
-                    contrib = ldt*max(0._wp, m_dot_evap%sf(j, k, l))
-                    sum_loc = sum_loc + contrib
-                    if (contrib > 0._wp) then
-                        min_loc = min(min_loc, contrib)
-                        max_loc = max(max_loc, contrib)
-                        count_loc = count_loc + 1._wp
-                    end if
-                end do
-            end do
-        end do
-
-        if (num_procs > 1) then
-            call s_mpi_allreduce_min(min_loc, min_glb)
-            call s_mpi_allreduce_max(max_loc, max_glb)
-            call s_mpi_allreduce_sum(sum_loc, sum_glb)
-            call s_mpi_allreduce_sum(count_loc, count_glb)
-        else
-            min_glb = min_loc
-            max_glb = max_loc
-            sum_glb = sum_loc
-            count_glb = count_loc
-        end if
-
-        if (count_glb > 0._wp) then
-            mean_glb = sum_glb/count_glb
-        else
-            min_glb = 0._wp
-            mean_glb = 0._wp
-        end if
-
-        if (proc_rank == 0) then
-            print '(" evap fuel add @ t_step = ", I8, " min_pos = ", ES16.6, " max_pos = ", ES16.6, " mean_pos = ", ES16.6, " total = ", ES16.6)', &
-                t_step, min_glb, max_glb, mean_glb, sum_glb
-            call flush(output_unit)
-        end if
     end subroutine s_apply_evap_to_fuel_species
-
-    subroutine s_diagnose_m_dot_evap(t_step)
-        integer, intent(in) :: t_step
-        integer :: j, k, l
-        real(wp) :: min_loc, max_loc, sum_loc, count_loc
-        real(wp) :: min_glb, max_glb, sum_glb, count_glb, mean_glb
-
-        if (.not. relax) return
-
-#if defined(MFC_OpenACC)
-        if (.not. (chemistry .and. evap_species_source .and. &
-                   fuel_species_id >= 1 .and. fuel_species_id <= (chemxe - chemxb + 1))) return
-#else
-        $:GPU_UPDATE(host='[m_dot_evap%sf]')
-#endif
-
-        min_loc = huge(1._wp)
-        max_loc = -huge(1._wp)
-        sum_loc = 0._wp
-        count_loc = 0._wp
-
-        do l = 0, p
-            do k = 0, n
-                do j = 0, m
-                    min_loc = min(min_loc, m_dot_evap%sf(j, k, l))
-                    max_loc = max(max_loc, m_dot_evap%sf(j, k, l))
-                    sum_loc = sum_loc + m_dot_evap%sf(j, k, l)
-                    count_loc = count_loc + 1._wp
-                end do
-            end do
-        end do
-
-        if (num_procs > 1) then
-            call s_mpi_allreduce_min(min_loc, min_glb)
-            call s_mpi_allreduce_max(max_loc, max_glb)
-            call s_mpi_allreduce_sum(sum_loc, sum_glb)
-            call s_mpi_allreduce_sum(count_loc, count_glb)
-        else
-            min_glb = min_loc
-            max_glb = max_loc
-            sum_glb = sum_loc
-            count_glb = count_loc
-        end if
-
-        mean_glb = sum_glb/count_glb
-
-        if (proc_rank == 0) then
-            print '(" m_dot_evap @ t_step = ", I8, " min = ", ES16.6, " max = ", ES16.6, " mean = ", ES16.6)', &
-                t_step, min_glb, max_glb, mean_glb
-            call flush(output_unit)
-        end if
-    end subroutine s_diagnose_m_dot_evap
 
     !> Bubble source part in Strang operator splitting scheme
         !! @param stage Current time-stage

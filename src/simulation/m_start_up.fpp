@@ -868,8 +868,7 @@ contains
 
         if (relax) then
             call s_infinite_relaxation_k(q_cons_ts(1)%vf, m_dot_evap, dt)
-            call s_apply_evap_to_fuel_species(q_cons_ts(1)%vf, dt, t_step)
-            call s_diagnose_m_dot_evap(t_step)
+            call s_apply_evap_to_fuel_species(q_cons_ts(1)%vf, dt)
         end if
 
         ! Time-stepping loop controls
