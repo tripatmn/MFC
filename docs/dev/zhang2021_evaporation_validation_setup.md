@@ -50,6 +50,19 @@ This is a practical case definition for validation setup, not a promise that a
 full run is cheap. A shorter pilot run should be used before committing compute
 time to the full window.
 
+## Stability Pilot Ladder
+
+- A 128 x 128 Zhang-style nonreacting pilot passed to `t_step = 3000`, reaching
+  `1.354e-5 s` with no NaNs. Liquid `alpha_rho` loss matched vapor
+  `alpha_rho` gain, and the maximum reported ICFL was about 0.298.
+- The next stability step is
+  `examples/2D_dodecane_global_reduced/case_hpc_d2_zhang2021_evap_1mm_pilot_256.py`.
+  It keeps the same physical target, uses 256 x 256 cells, `dx = dy =
+  1.5625e-5 m`, `dt = 1.1283507029868327e-9 s`, and runs to
+  `t_step_stop = 12000`.
+- The full 512 x 512 case should wait until the 256 x 256 pilot passes without
+  NaNs and shows consistent liquid-to-vapor mass transfer.
+
 ## Expected Metrics
 
 - Primary: mass-equivalent normalized D2 from liquid `alpha_rho`
