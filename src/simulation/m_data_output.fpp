@@ -8,6 +8,8 @@
 !> @brief Writes solution data, run-time stability diagnostics (ICFL, VCFL, CCFL, Rc), and probe/center-of-mass files
 module m_data_output
 
+    use iso_fortran_env, only: output_unit
+
     use m_derived_types        !< Definitions of the derived types
 
     use m_global_parameters    !< Definitions of the global parameters
@@ -74,6 +76,28 @@ module m_data_output
     type(scalar_field), allocatable, dimension(:) :: q_cons_temp_ds
 
 contains
+
+    logical function s_zhang_evap_hang_diag_active(t_step)
+        integer, intent(in) :: t_step
+
+        character(len=16) :: env_value
+        integer :: env_status
+
+        call get_environment_variable("TEMP_ZHANG_EVAP_HANG_DIAG", env_value, status=env_status)
+        s_zhang_evap_hang_diag_active = env_status == 0 .and. trim(env_value) == "1" &
+                                        .and. t_step >= 8900 .and. t_step <= 9200
+    end function s_zhang_evap_hang_diag_active
+
+    subroutine s_zhang_evap_hang_trace(t_step, label)
+        integer, intent(in) :: t_step
+        character(len=*), intent(in) :: label
+
+        if (.not. s_zhang_evap_hang_diag_active(t_step)) return
+
+        print '(" TEMP_ZHANG_EVAP_HANG_DIAG rank=", I6, " t_step=", I8, " stage=", I4, " ", A)', &
+            proc_rank, t_step, 0, trim(label)
+        call flush(output_unit)
+    end subroutine s_zhang_evap_hang_trace
 
     !> Write data files. Dispatch subroutine that replaces procedure pointer.
         !! @param q_cons_vf Conservative variables
@@ -284,7 +308,10 @@ contains
         real(wp), dimension(2) :: Re         !< Cell-avg. Reynolds numbers
         integer :: j, k, l
 
+        call s_zhang_evap_hang_trace(t_step, "RUN_TIME_INFORMATION_BEGIN")
+
         ! Computing Stability Criteria at Current Time-step
+        call s_zhang_evap_hang_trace(t_step, "RUN_TIME_INFORMATION_STABILITY_KERNEL_BEGIN")
         $:GPU_PARALLEL_LOOP(collapse=3, private='[j,k,l,vel, alpha, Re, rho, vel_sum, pres, gamma, pi_inf, c, H, qv]')
         do l = 0, p
             do k = 0, n
@@ -303,6 +330,7 @@ contains
             end do
         end do
         $:END_GPU_PARALLEL_LOOP()
+        call s_zhang_evap_hang_trace(t_step, "RUN_TIME_INFORMATION_STABILITY_KERNEL_END")
 
         ! end: Computing Stability Criteria at Current Time-step
 
@@ -335,12 +363,14 @@ contains
 
         ! Determining global stability criteria extrema at current time-step
         if (num_procs > 1) then
+            call s_zhang_evap_hang_trace(t_step, "MPI_REDUCE_STABILITY_BEGIN")
             call s_mpi_reduce_stability_criteria_extrema(icfl_max_loc, &
                                                          vcfl_max_loc, &
                                                          Rc_min_loc, &
                                                          icfl_max_glb, &
                                                          vcfl_max_glb, &
                                                          Rc_min_glb)
+            call s_zhang_evap_hang_trace(t_step, "MPI_REDUCE_STABILITY_END")
         else
             icfl_max_glb = icfl_max_loc
             if (viscous) vcfl_max_glb = vcfl_max_loc
@@ -385,7 +415,11 @@ contains
             end if
         end if
 
+        call s_zhang_evap_hang_trace(t_step, "MPI_BARRIER_RUNTIME_INFO_BEGIN")
         call s_mpi_barrier()
+        call s_zhang_evap_hang_trace(t_step, "MPI_BARRIER_RUNTIME_INFO_END")
+
+        call s_zhang_evap_hang_trace(t_step, "RUN_TIME_INFORMATION_END")
 
     end subroutine s_write_run_time_information
 
@@ -549,7 +583,10 @@ contains
         if (.not. file_exist) call s_create_directory(trim(t_step_dir))
 
         if ((prim_vars_wrt .or. (n == 0 .and. p == 0)) .and. (.not. igr)) then
-            call s_convert_conservative_to_primitive_variables(q_cons_vf, q_T_sf, q_prim_vf, idwint)
+            call s_zhang_evap_hang_trace(t_step, "WRITE_DATA_CONS_TO_PRIM_BEGIN")
+            call s_convert_conservative_to_primitive_variables(q_cons_vf, q_T_sf, q_prim_vf, idwint, &
+                                                               t_step, 0, "WRITE_DATA")
+            call s_zhang_evap_hang_trace(t_step, "WRITE_DATA_CONS_TO_PRIM_END")
             do i = 1, sys_size
                 $:GPU_UPDATE(host='[q_prim_vf(i)%sf(:,:,:)]')
             end do

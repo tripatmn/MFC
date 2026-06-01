@@ -8,6 +8,8 @@
 !> @brief Conservative-to-primitive variable conversion, mixture property evaluation, and pressure computation
 module m_variables_conversion
 
+    use iso_fortran_env, only: output_unit
+
     use m_derived_types        !< Definitions of the derived types
 
     use m_global_parameters    !< Definitions of the global parameters
@@ -65,6 +67,28 @@ module m_variables_conversion
     real(wp), allocatable, dimension(:, :, :), public :: qv_sf !< Scalar liquid energy reference function
 
 contains
+
+    logical function s_zhang_evap_hang_diag_active(t_step)
+        integer, intent(in) :: t_step
+
+        character(len=16) :: env_value
+        integer :: env_status
+
+        call get_environment_variable("TEMP_ZHANG_EVAP_HANG_DIAG", env_value, status=env_status)
+        s_zhang_evap_hang_diag_active = env_status == 0 .and. trim(env_value) == "1" &
+                                        .and. t_step >= 8900 .and. t_step <= 9200
+    end function s_zhang_evap_hang_diag_active
+
+    subroutine s_zhang_evap_hang_trace(t_step, stage, label)
+        integer, intent(in) :: t_step, stage
+        character(len=*), intent(in) :: label
+
+        if (.not. s_zhang_evap_hang_diag_active(t_step)) return
+
+        print '(" TEMP_ZHANG_EVAP_HANG_DIAG rank=", I6, " t_step=", I8, " stage=", I4, " ", A)', &
+            proc_rank, t_step, stage, trim(label)
+        call flush(output_unit)
+    end subroutine s_zhang_evap_hang_trace
 
     !> Dispatch to the s_convert_mixture_to_mixture_variables
         !!      and s_convert_species_to_mixture_variables subroutines.
@@ -630,12 +654,17 @@ contains
     subroutine s_convert_conservative_to_primitive_variables(qK_cons_vf, &
                                                              q_T_sf, &
                                                              qK_prim_vf, &
-                                                             ibounds)
+                                                             ibounds, &
+                                                             t_step_diag, &
+                                                             stage_diag, &
+                                                             context_diag)
 
         type(scalar_field), dimension(sys_size), intent(in) :: qK_cons_vf
         type(scalar_field), intent(inout) :: q_T_sf
         type(scalar_field), dimension(sys_size), intent(inout) :: qK_prim_vf
         type(int_bounds_info), dimension(1:3), intent(in) :: ibounds
+        integer, optional, intent(in) :: t_step_diag, stage_diag
+        character(len=*), optional, intent(in) :: context_diag
         #:if USING_AMD and not MFC_CASE_OPTIMIZATION
             real(wp), dimension(3) :: alpha_K, alpha_rho_K
             real(wp), dimension(3) :: nRtmp
@@ -672,6 +701,17 @@ contains
         real(wp) :: E, D ! Prim/Cons variables within Newton-Raphson iteration
         real(wp) :: f, dGa_dW, dp_dW, df_dW ! Functions within Newton-Raphson iteration
         integer :: iter ! Newton-Raphson iteration counter
+
+        if (present(t_step_diag)) then
+            if (present(stage_diag) .and. present(context_diag)) then
+                call s_zhang_evap_hang_trace(t_step_diag, stage_diag, &
+                                             "CONS_TO_PRIM_BEGIN_"//trim(context_diag))
+            elseif (present(stage_diag)) then
+                call s_zhang_evap_hang_trace(t_step_diag, stage_diag, "CONS_TO_PRIM_BEGIN")
+            else
+                call s_zhang_evap_hang_trace(t_step_diag, 0, "CONS_TO_PRIM_BEGIN")
+            end if
+        end if
 
         $:GPU_PARALLEL_LOOP(collapse=3, private='[alpha_K, alpha_rho_K, Re_K, nRtmp, rho_K, gamma_K, pi_inf_K,qv_K, dyn_pres_K, rho_g, Y_sum, rhoYks, Ys_T, gas_idx, fluid_id, B, pres, vftmp, nbub_sc, G_K, T, mix_mol_weight, T_chem, pres_mag, Ga, B2, m2, S, W, dW, E, D, f, dGa_dW, dp_dW, df_dW, iter ]')
         do l = ibounds(3)%beg, ibounds(3)%end
@@ -994,6 +1034,17 @@ contains
             end do
         end do
         $:END_GPU_PARALLEL_LOOP()
+
+        if (present(t_step_diag)) then
+            if (present(stage_diag) .and. present(context_diag)) then
+                call s_zhang_evap_hang_trace(t_step_diag, stage_diag, &
+                                             "CONS_TO_PRIM_END_"//trim(context_diag))
+            elseif (present(stage_diag)) then
+                call s_zhang_evap_hang_trace(t_step_diag, stage_diag, "CONS_TO_PRIM_END")
+            else
+                call s_zhang_evap_hang_trace(t_step_diag, 0, "CONS_TO_PRIM_END")
+            end if
+        end if
 
     end subroutine s_convert_conservative_to_primitive_variables
 

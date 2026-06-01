@@ -8,6 +8,8 @@
 !> @brief Assembles the right-hand side of the governing equations using finite-volume flux differencing, Riemann solvers, and physical source terms
 module m_rhs
 
+    use iso_fortran_env, only: output_unit
+
     use m_derived_types        !< Definitions of the derived types
 
     use m_global_parameters    !< Definitions of the global parameters
@@ -167,6 +169,28 @@ module m_rhs
     $:GPU_DECLARE(create='[nbub]')
 
 contains
+
+    logical function s_zhang_evap_hang_diag_active(t_step)
+        integer, intent(in) :: t_step
+
+        character(len=16) :: env_value
+        integer :: env_status
+
+        call get_environment_variable("TEMP_ZHANG_EVAP_HANG_DIAG", env_value, status=env_status)
+        s_zhang_evap_hang_diag_active = env_status == 0 .and. trim(env_value) == "1" &
+                                        .and. t_step >= 8900 .and. t_step <= 9200
+    end function s_zhang_evap_hang_diag_active
+
+    subroutine s_zhang_evap_hang_trace(t_step, stage, label)
+        integer, intent(in) :: t_step, stage
+        character(len=*), intent(in) :: label
+
+        if (.not. s_zhang_evap_hang_diag_active(t_step)) return
+
+        print '(" TEMP_ZHANG_EVAP_HANG_DIAG rank=", I6, " t_step=", I8, " stage=", I4, " ", A)', &
+            proc_rank, t_step, stage, trim(label)
+        call flush(output_unit)
+    end subroutine s_zhang_evap_hang_trace
 
     !> The computation of parameters, the allocation of memory,
         !!      the association of pointers and/or the execution of any
@@ -655,6 +679,7 @@ contains
         integer(kind=8) :: i, j, k, l, q !< Generic loop iterators
 
         call nvtxStartRange("COMPUTE-RHS")
+        call s_zhang_evap_hang_trace(t_step, stage, "S_COMPUTE_RHS_BEGIN")
 
         call cpu_time(t_start)
 
@@ -697,22 +722,31 @@ contains
         end if
 
         if (igr .or. dummy) then
+            call s_zhang_evap_hang_trace(t_step, stage, "RHS_COMMUNICATION_CONS_BEGIN")
             call nvtxStartRange("RHS-COMMUNICATION")
             call s_populate_variables_buffers(bc_type, q_cons_vf, pb_in, mv_in)
             call nvtxEndRange
+            call s_zhang_evap_hang_trace(t_step, stage, "RHS_COMMUNICATION_CONS_END")
         end if
         if (.not. igr .or. dummy) then
+            call s_zhang_evap_hang_trace(t_step, stage, "RHS_CONS_TO_PRIM_BEGIN")
             call nvtxStartRange("RHS-CONVERT")
             call s_convert_conservative_to_primitive_variables( &
                 q_cons_qp%vf, &
                 q_T_sf, &
                 q_prim_qp%vf, &
-                idwint)
+                idwint, &
+                t_step, &
+                stage, &
+                "RHS")
             call nvtxEndRange
+            call s_zhang_evap_hang_trace(t_step, stage, "RHS_CONS_TO_PRIM_END")
 
+            call s_zhang_evap_hang_trace(t_step, stage, "RHS_COMMUNICATION_PRIM_BEGIN")
             call nvtxStartRange("RHS-COMMUNICATION")
             call s_populate_variables_buffers(bc_type, q_prim_qp%vf, pb_in, mv_in)
             call nvtxEndRange
+            call s_zhang_evap_hang_trace(t_step, stage, "RHS_COMMUNICATION_PRIM_END")
         end if
 
         call nvtxStartRange("RHS-ELASTIC")
@@ -728,6 +762,7 @@ contains
         if (qbmm) call s_mom_inv(q_cons_qp%vf, q_prim_qp%vf, mom_sp, mom_3d, pb_in, rhs_pb, mv_in, rhs_mv, idwbuff(1), idwbuff(2), idwbuff(3))
 
         if ((viscous .and. .not. igr) .or. dummy) then
+            call s_zhang_evap_hang_trace(t_step, stage, "RHS_VISCOUS_BEGIN")
             call nvtxStartRange("RHS-VISCOUS")
             call s_get_viscous(qL_rsx_vf, qL_rsy_vf, qL_rsz_vf, &
                                dqL_prim_dx_n, dqL_prim_dy_n, dqL_prim_dz_n, &
@@ -739,16 +774,20 @@ contains
                                dq_prim_dx_qp, dq_prim_dy_qp, dq_prim_dz_qp, &
                                idwbuff(1), idwbuff(2), idwbuff(3))
             call nvtxEndRange
+            call s_zhang_evap_hang_trace(t_step, stage, "RHS_VISCOUS_END")
         end if
 
         if (surface_tension) then
+            call s_zhang_evap_hang_trace(t_step, stage, "RHS_SURFACE_TENSION_BEGIN")
             call nvtxStartRange("RHS-SURFACE-TENSION")
             call s_get_capillary(q_prim_qp%vf, bc_type)
             call nvtxEndRange
+            call s_zhang_evap_hang_trace(t_step, stage, "RHS_SURFACE_TENSION_END")
         end if
 
         ! Dimensional Splitting Loop
         do id = 1, num_dims
+            call s_zhang_evap_hang_trace(t_step, stage, "RHS_DIMENSION_BEGIN")
 
             if (igr .or. dummy) then
 
@@ -994,6 +1033,7 @@ contains
 
                 ! END: Additional physics and source terms
             end if
+            call s_zhang_evap_hang_trace(t_step, stage, "RHS_DIMENSION_END")
         end do
         ! END: Dimensional Splitting Loop
 
@@ -1054,9 +1094,11 @@ contains
         end if
 
         if (chemistry .and. chem_params%reactions) then
+            call s_zhang_evap_hang_trace(t_step, stage, "RHS_CHEM_REACTIONS_BEGIN")
             call nvtxStartRange("RHS-CHEM-REACTIONS")
             call s_compute_chemistry_reaction_flux(rhs_vf, q_cons_qp%vf, q_T_sf, q_prim_qp%vf, idwint, t_step, stage)
             call nvtxEndRange
+            call s_zhang_evap_hang_trace(t_step, stage, "RHS_CHEM_REACTIONS_END")
         end if
 
         if (chemistry .and. user_species_source) then
@@ -1099,6 +1141,7 @@ contains
 
         if (run_time_info .or. probe_wrt .or. ib .or. bubbles_lagrange) then
             if (.not. igr .or. dummy) then
+                call s_zhang_evap_hang_trace(t_step, stage, "RHS_COPY_PRIM_OUT_BEGIN")
                 $:GPU_PARALLEL_LOOP(private='[i,j,k,l]', collapse=4)
                 do i = 1, sys_size
                     do l = idwbuff(3)%beg, idwbuff(3)%end
@@ -1110,6 +1153,7 @@ contains
                     end do
                 end do
                 $:END_GPU_PARALLEL_LOOP()
+                call s_zhang_evap_hang_trace(t_step, stage, "RHS_COPY_PRIM_OUT_END")
             end if
         end if
 
@@ -1122,6 +1166,7 @@ contains
         end if
 
         call nvtxEndRange
+        call s_zhang_evap_hang_trace(t_step, stage, "S_COMPUTE_RHS_END")
 
     end subroutine s_compute_rhs
 

@@ -10,6 +10,8 @@ module m_phase_change
 
 #ifndef MFC_POST_PROCESS
 
+    use iso_fortran_env, only: output_unit
+
     use m_derived_types        !< Definitions of the derived types
 
     use m_global_parameters    !< Definitions of the global parameters
@@ -46,6 +48,28 @@ module m_phase_change
     $:GPU_DECLARE(create='[A,B,C,D]')
 
 contains
+
+    logical function s_zhang_evap_hang_diag_active(t_step)
+        integer, intent(in) :: t_step
+
+        character(len=16) :: env_value
+        integer :: env_status
+
+        call get_environment_variable("TEMP_ZHANG_EVAP_HANG_DIAG", env_value, status=env_status)
+        s_zhang_evap_hang_diag_active = env_status == 0 .and. trim(env_value) == "1" &
+                                        .and. t_step >= 8900 .and. t_step <= 9200
+    end function s_zhang_evap_hang_diag_active
+
+    subroutine s_zhang_evap_hang_trace(t_step, stage, label)
+        integer, intent(in) :: t_step, stage
+        character(len=*), intent(in) :: label
+
+        if (.not. s_zhang_evap_hang_diag_active(t_step)) return
+
+        print '(" TEMP_ZHANG_EVAP_HANG_DIAG rank=", I6, " t_step=", I8, " stage=", I4, " ", A)', &
+            proc_rank, t_step, stage, trim(label)
+        call flush(output_unit)
+    end subroutine s_zhang_evap_hang_trace
 
     !> @brief GPU-safe typed finite check for phase-change device routines.
     logical function s_is_finite_wp(x)
@@ -93,7 +117,7 @@ contains
         !!      state conditions.
         !!  @param q_cons_vf Cell-average conservative variables
 #ifdef MFC_SIMULATION
-    subroutine s_infinite_relaxation_k(q_cons_vf, m_dot_evap, relax_dt)
+    subroutine s_infinite_relaxation_k(q_cons_vf, m_dot_evap, relax_dt, t_step_diag, stage_diag)
 #else
     subroutine s_infinite_relaxation_k(q_cons_vf)
 #endif
@@ -102,6 +126,7 @@ contains
 #ifdef MFC_SIMULATION
         type(scalar_field), intent(inout) :: m_dot_evap
         real(wp), intent(in) :: relax_dt
+        integer, optional, intent(in) :: t_step_diag, stage_diag
 #endif
         real(wp) :: pS, pSOV, pSSL !< equilibrium pressure for mixture, overheated vapor, and subcooled liquid
         real(wp) :: TS, TSOV, TSSL, TSatOV, TSatSL !< equilibrium temperature for mixture, overheated vapor, and subcooled liquid. Saturation Temperatures at overheated vapor and subcooled liquid
@@ -121,6 +146,16 @@ contains
 
         !< Generic loop iterators
         integer :: i, j, k, l
+
+#ifdef MFC_SIMULATION
+        if (present(t_step_diag)) then
+            if (present(stage_diag)) then
+                call s_zhang_evap_hang_trace(t_step_diag, stage_diag, "S_INFINITE_RELAXATION_K_BEGIN")
+            else
+                call s_zhang_evap_hang_trace(t_step_diag, 0, "S_INFINITE_RELAXATION_K_BEGIN")
+            end if
+        end if
+#endif
 
         ! starting equilibrium solver
         $:GPU_PARALLEL_LOOP(collapse=3, private='[i,j,k,l,p_infOV, p_infpT, p_infSL, sk, hk, gk, ek, rhok,pS, pSOV, pSSL, TS, TSOV, TSatOV, TSatSL, TSSL, rhoe, dynE, rhos, rho, rM, m1, m2, m2_after, MCT, TvF, pt_state_ok, ptg_state_ok]')
@@ -333,6 +368,16 @@ contains
             end do
         end do
         $:END_GPU_PARALLEL_LOOP()
+
+#ifdef MFC_SIMULATION
+        if (present(t_step_diag)) then
+            if (present(stage_diag)) then
+                call s_zhang_evap_hang_trace(t_step_diag, stage_diag, "S_INFINITE_RELAXATION_K_END")
+            else
+                call s_zhang_evap_hang_trace(t_step_diag, 0, "S_INFINITE_RELAXATION_K_END")
+            end if
+        end if
+#endif
 
     end subroutine s_infinite_relaxation_k
 
