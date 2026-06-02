@@ -105,7 +105,7 @@ contains
 
         call get_environment_variable("TEMP_ZHANG_EVAP_HANG_DIAG", env_value, status=env_status)
         s_zhang_evap_hang_diag_active = env_status == 0 .and. trim(env_value) == "1" &
-                                        .and. t_step >= 8900 .and. t_step <= 9200
+                                        .and. t_step >= 9100 .and. t_step <= 9120
     end function s_zhang_evap_hang_diag_active
 
     subroutine s_zhang_evap_hang_trace(t_step, stage, label)

@@ -12,6 +12,8 @@ module m_mpi_common
     use mpi                    !< Message passing interface (MPI) module
 #endif
 
+    use iso_fortran_env, only: output_unit
+
     use m_derived_types        !< Definitions of the derived types
 
     use m_global_parameters    !< Definitions of the global parameters
@@ -46,6 +48,33 @@ module m_mpi_common
     $:GPU_DECLARE(create='[halo_size]')
 
 contains
+
+    logical function s_zhang_evap_hang_mpi_diag_active(t_step)
+        integer, intent(in) :: t_step
+
+        character(len=16) :: env_value
+        integer :: env_status
+
+        call get_environment_variable("TEMP_ZHANG_EVAP_HANG_DIAG", env_value, status=env_status)
+        s_zhang_evap_hang_mpi_diag_active = env_status == 0 .and. trim(env_value) == "1" &
+                                            .and. t_step >= 9100 .and. t_step <= 9120
+    end function s_zhang_evap_hang_mpi_diag_active
+
+    subroutine s_zhang_evap_hang_mpi_trace(t_step, stage, mpi_dir, pbc_loc, nvar, &
+                                           buffer_count, dst_proc, src_proc, label)
+        integer, intent(in) :: t_step, stage, mpi_dir, pbc_loc, nvar
+        integer, intent(in) :: buffer_count, dst_proc, src_proc
+        character(len=*), intent(in) :: label
+
+        if (.not. s_zhang_evap_hang_mpi_diag_active(t_step)) return
+
+        print '(" TEMP_ZHANG_EVAP_HANG_DIAG_MPI rank=", I6, " t_step=", I8, &
+            & " stage=", I4, " dir=", I2, " side=", I3, " nvar=", I6, &
+            & " buffer_count=", I12, " dst=", I6, " src=", I6, " ", A)', &
+            proc_rank, t_step, stage, mpi_dir, pbc_loc, nvar, buffer_count, &
+            dst_proc, src_proc, trim(label)
+        call flush(output_unit)
+    end subroutine s_zhang_evap_hang_mpi_trace
 
     !> The computation of parameters, the allocation of memory,
         !!      the association of pointers and/or the execution of any
@@ -648,11 +677,16 @@ contains
                                                 mpi_dir, &
                                                 pbc_loc, &
                                                 nVar, &
-                                                pb_in, mv_in)
+                                                pb_in, mv_in, &
+                                                t_step_diag, &
+                                                stage_diag, &
+                                                context_diag)
 
         type(scalar_field), dimension(1:), intent(inout) :: q_comm
         real(stp), optional, dimension(idwbuff(1)%beg:, idwbuff(2)%beg:, idwbuff(3)%beg:, 1:, 1:), intent(inout) :: pb_in, mv_in
         integer, intent(in) :: mpi_dir, pbc_loc, nVar
+        integer, optional, intent(in) :: t_step_diag, stage_diag
+        character(len=*), optional, intent(in) :: context_diag
 
         integer :: i, j, k, l, r, q !< Generic loop iterators
 
@@ -665,9 +699,15 @@ contains
         logical :: beg_end_geq_0, qbmm_comm
 
         integer :: pack_offset, unpack_offset
+        integer :: diag_t_step, diag_stage
 
 #ifdef MFC_MPI
         integer :: ierr !< Generic flag used to identify and report MPI errors
+
+        diag_t_step = -1
+        diag_stage = -1
+        if (present(t_step_diag)) diag_t_step = t_step_diag
+        if (present(stage_diag)) diag_stage = stage_diag
 
         call nvtxStartRange("RHS-COMM-PACKBUF")
 
@@ -723,6 +763,8 @@ contains
         end if
 
         ! Pack Buffer to Send
+        call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                         buffer_count, dst_proc, src_proc, "PACKBUF_BEGIN")
         #:for mpi_dir in [1, 2, 3]
             if (mpi_dir == ${mpi_dir}$) then
                 #:if mpi_dir == 1
@@ -877,6 +919,8 @@ contains
                 #:endif
             end if
         #:endfor
+        call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                         buffer_count, dst_proc, src_proc, "PACKBUF_END")
         call nvtxEndRange ! Packbuf
 
         ! Send/Recv
@@ -887,43 +931,69 @@ contains
                     #:call GPU_HOST_DATA(use_device_addr='[buff_send, buff_recv]')
                         call nvtxStartRange("RHS-COMM-SENDRECV-RDMA")
 
+                        call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                                         buffer_count, dst_proc, src_proc, "MPI_SENDRECV_RDMA_BEGIN")
                         call MPI_SENDRECV( &
                             buff_send, buffer_count, mpi_p, dst_proc, send_tag, &
                             buff_recv, buffer_count, mpi_p, src_proc, recv_tag, &
                             MPI_COMM_WORLD, MPI_STATUS_IGNORE, ierr)
+                        call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                                         buffer_count, dst_proc, src_proc, "MPI_SENDRECV_RDMA_END")
 
                         call nvtxEndRange ! RHS-MPI-SENDRECV-(NO)-RDMA
 
                     #:endcall GPU_HOST_DATA
+                    call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                                     buffer_count, dst_proc, src_proc, "GPU_WAIT_AFTER_RDMA_BEGIN")
                     $:GPU_WAIT()
+                    call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                                     buffer_count, dst_proc, src_proc, "GPU_WAIT_AFTER_RDMA_END")
                 #:else
                     call nvtxStartRange("RHS-COMM-DEV2HOST")
+                    call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                                     buffer_count, dst_proc, src_proc, "DEV2HOST_BEGIN")
                     $:GPU_UPDATE(host='[buff_send]')
+                    call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                                     buffer_count, dst_proc, src_proc, "DEV2HOST_END")
                     call nvtxEndRange
                     call nvtxStartRange("RHS-COMM-SENDRECV-NO-RMDA")
 
+                    call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                                     buffer_count, dst_proc, src_proc, "MPI_SENDRECV_NO_RDMA_BEGIN")
                     call MPI_SENDRECV( &
                         buff_send, buffer_count, mpi_p, dst_proc, send_tag, &
                         buff_recv, buffer_count, mpi_p, src_proc, recv_tag, &
                         MPI_COMM_WORLD, MPI_STATUS_IGNORE, ierr)
+                    call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                                     buffer_count, dst_proc, src_proc, "MPI_SENDRECV_NO_RDMA_END")
 
                     call nvtxEndRange ! RHS-MPI-SENDRECV-(NO)-RDMA
 
                     call nvtxStartRange("RHS-COMM-HOST2DEV")
+                    call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                                     buffer_count, dst_proc, src_proc, "HOST2DEV_BEGIN")
                     $:GPU_UPDATE(device='[buff_recv]')
+                    call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                                     buffer_count, dst_proc, src_proc, "HOST2DEV_END")
                     call nvtxEndRange
                 #:endif
             end if
         #:endfor
 #else
+        call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                         buffer_count, dst_proc, src_proc, "MPI_SENDRECV_BEGIN")
         call MPI_SENDRECV( &
             buff_send, buffer_count, mpi_p, dst_proc, send_tag, &
             buff_recv, buffer_count, mpi_p, src_proc, recv_tag, &
             MPI_COMM_WORLD, MPI_STATUS_IGNORE, ierr)
+        call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                         buffer_count, dst_proc, src_proc, "MPI_SENDRECV_END")
 #endif
 
         ! Unpack Received Buffer
         call nvtxStartRange("RHS-COMM-UNPACKBUF")
+        call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                         buffer_count, dst_proc, src_proc, "UNPACKBUF_BEGIN")
         #:for mpi_dir in [1, 2, 3]
             if (mpi_dir == ${mpi_dir}$) then
                 #:if mpi_dir == 1
@@ -1101,6 +1171,8 @@ contains
                 #:endif
             end if
         #:endfor
+        call s_zhang_evap_hang_mpi_trace(diag_t_step, diag_stage, mpi_dir, pbc_loc, nVar, &
+                                         buffer_count, dst_proc, src_proc, "UNPACKBUF_END")
         call nvtxEndRange
 #endif
 

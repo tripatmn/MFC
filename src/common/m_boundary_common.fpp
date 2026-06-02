@@ -8,6 +8,8 @@
 
 module m_boundary_common
 
+    use iso_fortran_env, only: output_unit
+
     use m_derived_types        !< Definitions of the derived types
 
     use m_global_parameters    !< Definitions of the global parameters
@@ -51,6 +53,29 @@ module m_boundary_common
 
 contains
 
+    logical function s_zhang_evap_hang_diag_active(t_step)
+        integer, intent(in) :: t_step
+
+        character(len=16) :: env_value
+        integer :: env_status
+
+        call get_environment_variable("TEMP_ZHANG_EVAP_HANG_DIAG", env_value, status=env_status)
+        s_zhang_evap_hang_diag_active = env_status == 0 .and. trim(env_value) == "1" &
+                                        .and. t_step >= 9100 .and. t_step <= 9120
+    end function s_zhang_evap_hang_diag_active
+
+    subroutine s_zhang_evap_hang_comm_trace(t_step, stage, direction, side, nvar, label)
+        integer, intent(in) :: t_step, stage, direction, side, nvar
+        character(len=*), intent(in) :: label
+
+        if (.not. s_zhang_evap_hang_diag_active(t_step)) return
+
+        print '(" TEMP_ZHANG_EVAP_HANG_DIAG_COMM rank=", I6, " t_step=", I8, &
+            & " stage=", I4, " dir=", I2, " side=", I3, " nvar=", I6, " ", A)', &
+            proc_rank, t_step, stage, direction, side, nvar, trim(label)
+        call flush(output_unit)
+    end subroutine s_zhang_evap_hang_comm_trace
+
     !> @brief Allocates and sets up boundary condition buffer arrays for all coordinate directions.
     impure subroutine s_initialize_boundary_common_module()
 
@@ -86,18 +111,36 @@ contains
     !>  The purpose of this procedure is to populate the buffers
     !!      of the primitive variables, depending on the selected
     !!      boundary conditions.
-    impure subroutine s_populate_variables_buffers(bc_type, q_prim_vf, pb_in, mv_in)
+    impure subroutine s_populate_variables_buffers(bc_type, q_prim_vf, pb_in, mv_in, t_step_diag, stage_diag, context_diag)
 
         type(scalar_field), dimension(sys_size), intent(inout) :: q_prim_vf
         real(stp), optional, dimension(idwbuff(1)%beg:, idwbuff(2)%beg:, idwbuff(3)%beg:, 1:, 1:), intent(inout) :: pb_in, mv_in
         type(integer_field), dimension(1:num_dims, 1:2), intent(in) :: bc_type
+        integer, optional, intent(in) :: t_step_diag, stage_diag
+        character(len=*), optional, intent(in) :: context_diag
 
         integer :: k, l
+        integer :: diag_t_step, diag_stage
+
+        diag_t_step = -1
+        diag_stage = -1
+        if (present(t_step_diag)) diag_t_step = t_step_diag
+        if (present(stage_diag)) diag_stage = stage_diag
+
+        call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 0, 0, sys_size, &
+                                          "POPULATE_VARIABLES_BUFFERS_BEGIN")
 
         ! Population of Buffers in x-direction
         if (bc_x%beg >= 0) then
-            call s_mpi_sendrecv_variables_buffers(q_prim_vf, 1, -1, sys_size, pb_in, mv_in)
+            call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 1, -1, sys_size, &
+                                              "X_BEG_MPI_SENDRECV_CALL_BEGIN")
+            call s_mpi_sendrecv_variables_buffers(q_prim_vf, 1, -1, sys_size, pb_in, mv_in, &
+                                                  diag_t_step, diag_stage, "X_BEG")
+            call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 1, -1, sys_size, &
+                                              "X_BEG_MPI_SENDRECV_CALL_END")
         else
+            call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 1, -1, sys_size, &
+                                              "X_BEG_LOCAL_BC_KERNEL_BEGIN")
             $:GPU_PARALLEL_LOOP(private='[l,k]', collapse=2)
             do l = 0, p
                 do k = 0, n
@@ -123,11 +166,20 @@ contains
                 end do
             end do
             $:END_GPU_PARALLEL_LOOP()
+            call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 1, -1, sys_size, &
+                                              "X_BEG_LOCAL_BC_KERNEL_END")
         end if
 
         if (bc_x%end >= 0) then
-            call s_mpi_sendrecv_variables_buffers(q_prim_vf, 1, 1, sys_size, pb_in, mv_in)
+            call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 1, 1, sys_size, &
+                                              "X_END_MPI_SENDRECV_CALL_BEGIN")
+            call s_mpi_sendrecv_variables_buffers(q_prim_vf, 1, 1, sys_size, pb_in, mv_in, &
+                                                  diag_t_step, diag_stage, "X_END")
+            call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 1, 1, sys_size, &
+                                              "X_END_MPI_SENDRECV_CALL_END")
         else
+            call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 1, 1, sys_size, &
+                                              "X_END_LOCAL_BC_KERNEL_BEGIN")
             $:GPU_PARALLEL_LOOP(private='[l,k]', collapse=2)
             do l = 0, p
                 do k = 0, n
@@ -153,17 +205,30 @@ contains
                 end do
             end do
             $:END_GPU_PARALLEL_LOOP()
+            call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 1, 1, sys_size, &
+                                              "X_END_LOCAL_BC_KERNEL_END")
         end if
 
         ! Population of Buffers in y-direction
 
-        if (n == 0) return
+        if (n == 0) then
+            call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 0, 0, sys_size, &
+                                              "POPULATE_VARIABLES_BUFFERS_END_N_EQ_0")
+            return
+        end if
 
         #:if not MFC_CASE_OPTIMIZATION or num_dims > 1
 
             if (bc_y%beg >= 0) then
-                call s_mpi_sendrecv_variables_buffers(q_prim_vf, 2, -1, sys_size, pb_in, mv_in)
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 2, -1, sys_size, &
+                                                  "Y_BEG_MPI_SENDRECV_CALL_BEGIN")
+                call s_mpi_sendrecv_variables_buffers(q_prim_vf, 2, -1, sys_size, pb_in, mv_in, &
+                                                      diag_t_step, diag_stage, "Y_BEG")
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 2, -1, sys_size, &
+                                                  "Y_BEG_MPI_SENDRECV_CALL_END")
             else
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 2, -1, sys_size, &
+                                                  "Y_BEG_LOCAL_BC_KERNEL_BEGIN")
                 $:GPU_PARALLEL_LOOP(private='[l,k]', collapse=2)
                 do l = 0, p
                     do k = -buff_size, m + buff_size
@@ -192,11 +257,20 @@ contains
                     end do
                 end do
                 $:END_GPU_PARALLEL_LOOP()
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 2, -1, sys_size, &
+                                                  "Y_BEG_LOCAL_BC_KERNEL_END")
             end if
 
             if (bc_y%end >= 0) then
-                call s_mpi_sendrecv_variables_buffers(q_prim_vf, 2, 1, sys_size, pb_in, mv_in)
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 2, 1, sys_size, &
+                                                  "Y_END_MPI_SENDRECV_CALL_BEGIN")
+                call s_mpi_sendrecv_variables_buffers(q_prim_vf, 2, 1, sys_size, pb_in, mv_in, &
+                                                      diag_t_step, diag_stage, "Y_END")
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 2, 1, sys_size, &
+                                                  "Y_END_MPI_SENDRECV_CALL_END")
             else
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 2, 1, sys_size, &
+                                                  "Y_END_LOCAL_BC_KERNEL_BEGIN")
                 $:GPU_PARALLEL_LOOP(private='[l,k]', collapse=2)
                 do l = 0, p
                     do k = -buff_size, m + buff_size
@@ -222,19 +296,32 @@ contains
                     end do
                 end do
                 $:END_GPU_PARALLEL_LOOP()
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 2, 1, sys_size, &
+                                                  "Y_END_LOCAL_BC_KERNEL_END")
             end if
 
         #:endif
 
         ! Population of Buffers in z-direction
 
-        if (p == 0) return
+        if (p == 0) then
+            call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 0, 0, sys_size, &
+                                              "POPULATE_VARIABLES_BUFFERS_END_P_EQ_0")
+            return
+        end if
 
         #:if not MFC_CASE_OPTIMIZATION or num_dims > 2
 
             if (bc_z%beg >= 0) then
-                call s_mpi_sendrecv_variables_buffers(q_prim_vf, 3, -1, sys_size, pb_in, mv_in)
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 3, -1, sys_size, &
+                                                  "Z_BEG_MPI_SENDRECV_CALL_BEGIN")
+                call s_mpi_sendrecv_variables_buffers(q_prim_vf, 3, -1, sys_size, pb_in, mv_in, &
+                                                      diag_t_step, diag_stage, "Z_BEG")
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 3, -1, sys_size, &
+                                                  "Z_BEG_MPI_SENDRECV_CALL_END")
             else
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 3, -1, sys_size, &
+                                                  "Z_BEG_LOCAL_BC_KERNEL_BEGIN")
                 $:GPU_PARALLEL_LOOP(private='[l,k]', collapse=2)
                 do l = -buff_size, n + buff_size
                     do k = -buff_size, m + buff_size
@@ -260,11 +347,20 @@ contains
                     end do
                 end do
                 $:END_GPU_PARALLEL_LOOP()
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 3, -1, sys_size, &
+                                                  "Z_BEG_LOCAL_BC_KERNEL_END")
             end if
 
             if (bc_z%end >= 0) then
-                call s_mpi_sendrecv_variables_buffers(q_prim_vf, 3, 1, sys_size, pb_in, mv_in)
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 3, 1, sys_size, &
+                                                  "Z_END_MPI_SENDRECV_CALL_BEGIN")
+                call s_mpi_sendrecv_variables_buffers(q_prim_vf, 3, 1, sys_size, pb_in, mv_in, &
+                                                      diag_t_step, diag_stage, "Z_END")
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 3, 1, sys_size, &
+                                                  "Z_END_MPI_SENDRECV_CALL_END")
             else
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 3, 1, sys_size, &
+                                                  "Z_END_LOCAL_BC_KERNEL_BEGIN")
                 $:GPU_PARALLEL_LOOP(private='[l,k]', collapse=2)
                 do l = -buff_size, n + buff_size
                     do k = -buff_size, m + buff_size
@@ -290,9 +386,14 @@ contains
                     end do
                 end do
                 $:END_GPU_PARALLEL_LOOP()
+                call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 3, 1, sys_size, &
+                                                  "Z_END_LOCAL_BC_KERNEL_END")
             end if
         #:endif
         ! END: Population of Buffers in z-direction
+
+        call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 0, 0, sys_size, &
+                                          "POPULATE_VARIABLES_BUFFERS_END")
 
     end subroutine s_populate_variables_buffers
 

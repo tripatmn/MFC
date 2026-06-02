@@ -178,7 +178,7 @@ contains
 
         call get_environment_variable("TEMP_ZHANG_EVAP_HANG_DIAG", env_value, status=env_status)
         s_zhang_evap_hang_diag_active = env_status == 0 .and. trim(env_value) == "1" &
-                                        .and. t_step >= 8900 .and. t_step <= 9200
+                                        .and. t_step >= 9100 .and. t_step <= 9120
     end function s_zhang_evap_hang_diag_active
 
     subroutine s_zhang_evap_hang_trace(t_step, stage, label)
@@ -744,7 +744,8 @@ contains
 
             call s_zhang_evap_hang_trace(t_step, stage, "RHS_COMMUNICATION_PRIM_BEGIN")
             call nvtxStartRange("RHS-COMMUNICATION")
-            call s_populate_variables_buffers(bc_type, q_prim_qp%vf, pb_in, mv_in)
+            call s_populate_variables_buffers(bc_type, q_prim_qp%vf, pb_in, mv_in, &
+                                              t_step, stage, "RHS_PRIM")
             call nvtxEndRange
             call s_zhang_evap_hang_trace(t_step, stage, "RHS_COMMUNICATION_PRIM_END")
         end if
