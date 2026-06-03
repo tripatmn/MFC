@@ -106,6 +106,19 @@ Smoke FAIL means NaNs, pressure blowup, or a stall before `t_stop`; record the
 first failing time/step and compare it with the nonreacting failure near
 `t = 5.46e-6 s`.
 
+If the smoke run stalls or is manually cancelled, extract a compact in-place
+diagnostic bundle on HPC instead of copying the full raw output:
+
+```bash
+build/venv/bin/python examples/2D_dodecane_global_reduced/extract_quiescent_burning_smoke_diagnostics.py \
+  --run-dir "$RUN_ROOT/burning_smoke" \
+  --out-dir "$RUN_ROOT/burning_smoke_diagnostics"
+```
+
+The extractor reads logs plus the first, previous-to-last, and last saved raw
+states from `D/` or `p_all/`, then writes JSON/CSV/text summaries and small PNG
+plots when plotting support is available.
+
 Foreground or interactive allocation:
 
 ```bash
