@@ -78,6 +78,34 @@ The burning case uses the baseline one-step mechanism, reactions on, and
 reaction heat with `chem_reaction_heat_limit_frac = 0.05`. It does not use the
 rate1000 stress mechanism.
 
+If the nonreacting pilot fails early, run the short burning smoke before trying
+the full `0.5 ms` burning pilot. This keeps the same physics and stops at
+`2.0e-5 s`, with saves every `1.0e-6 s`.
+
+```bash
+mkdir -p "$RUN_ROOT/burning_smoke"
+cp examples/2D_dodecane_global_reduced/case_hpc_d2_quiescent_burning_025mm_smoke.py \
+  "$RUN_ROOT/burning_smoke/case.py"
+
+./mfc.sh run "$RUN_ROOT/burning_smoke/case.py" \
+  -t pre_process simulation \
+  --gpu acc -n 2 -j 8 --clean -b mpirun
+```
+
+Nautilus batch smoke:
+
+```bash
+./mfc.sh run "$RUN_ROOT/burning_smoke/case.py" \
+  -t pre_process simulation \
+  -e batch -c nautilus -N 1 -n 2 -j 8 \
+  --gpu acc --clean
+```
+
+Smoke PASS means the case reaches `t_stop = 2.0e-5 s` with finite outputs.
+Smoke FAIL means NaNs, pressure blowup, or a stall before `t_stop`; record the
+first failing time/step and compare it with the nonreacting failure near
+`t = 5.46e-6 s`.
+
 Foreground or interactive allocation:
 
 ```bash
