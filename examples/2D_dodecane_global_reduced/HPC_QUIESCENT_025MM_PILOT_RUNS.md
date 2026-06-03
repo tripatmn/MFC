@@ -72,6 +72,48 @@ Check:
 - vapor `alpha_rho` increase is consistent with liquid loss;
 - mass-equivalent D2 is smoother than threshold D2.
 
+## Nonreacting Temperature Sweep
+
+Before running more burning cases, use the nonreacting smoke sweep to find a
+stable, non-explosive phase-change regime. These cases keep `D0 = 0.25 mm`,
+`2 mm x 2 mm`, `256 x 256`, CFL-adaptive stepping with `cfl_target = 0.10`,
+phase change on, and chemistry/reactions off. They use `p0 = 1 bar`,
+`rho_l = 750 kg/m3`, `t_stop = 2.0e-5 s`, and `t_save = 2.0e-6 s`.
+
+Run order: `T500` first, then `T600`, then `T700` only if the lower
+temperatures are finite and do not show runaway vaporization or pressure
+growth.
+
+```bash
+for TEMP in T500 T600 T700; do
+  mkdir -p "$RUN_ROOT/evap_${TEMP}_smoke"
+  cp "examples/2D_dodecane_global_reduced/case_hpc_d2_quiescent_evap_025mm_${TEMP}_smoke.py" \
+    "$RUN_ROOT/evap_${TEMP}_smoke/case.py"
+done
+```
+
+Run `T500`:
+
+```bash
+./mfc.sh run "$RUN_ROOT/evap_T500_smoke/case.py" \
+  -t pre_process simulation \
+  -e batch -c nautilus -N 1 -n 2 -j 8 \
+  --gpu acc --clean
+```
+
+After each completed or cancelled smoke, extract compact diagnostics:
+
+```bash
+build/venv/bin/python examples/2D_dodecane_global_reduced/extract_quiescent_burning_smoke_diagnostics.py \
+  --run-dir "$RUN_ROOT/evap_T500_smoke" \
+  --out-dir "$RUN_ROOT/evap_T500_smoke_diagnostics"
+```
+
+Repeat the same command pattern for `evap_T600_smoke` and `evap_T700_smoke`
+only when the previous temperature is acceptable. Compare liquid `alpha_rho`
+loss, vapor `alpha_rho` gain, pressure extrema, gas density minimum, finite
+status, and `D2_mass_norm`.
+
 ## Run Burning After Nonreacting Passes
 
 The burning case uses the baseline one-step mechanism, reactions on, and
