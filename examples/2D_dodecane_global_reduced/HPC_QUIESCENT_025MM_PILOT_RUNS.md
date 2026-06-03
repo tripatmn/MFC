@@ -80,6 +80,11 @@ stable, non-explosive phase-change regime. These cases keep `D0 = 0.25 mm`,
 phase change on, and chemistry/reactions off. They use `p0 = 1 bar`,
 `rho_l = 750 kg/m3`, `t_stop = 2.0e-5 s`, and `t_save = 2.0e-6 s`.
 
+Current diagnostic branch note: `m_phase_change.fpp` restores the older
+shock-vaporization mixture-cell threshold `mixM = 1.0e-5` for this sweep. This
+is intended to test whether avoiding pTg activation in trace-mixture cells
+reduces early over-vaporization and timestep collapse.
+
 Run order: `T500` first, then `T600`, then `T700` only if the lower
 temperatures are finite and do not show runaway vaporization or pressure
 growth.

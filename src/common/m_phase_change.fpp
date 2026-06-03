@@ -35,7 +35,7 @@ module m_phase_change
     integer, parameter :: max_iter = 1e8_wp        !< max # of iterations
     real(wp), parameter :: pCr = 1.817e6_wp   !< Critical pressure
     real(wp), parameter :: TCr = 658.2_wp  !< Critical temperature
-    real(wp), parameter :: mixM = 1.0e-8_wp !< threshold for 'mixture cell'. If Y < mixM, phase change does not happen
+    real(wp), parameter :: mixM = 1.0e-5_wp !< threshold for 'mixture cell'. If Y < mixM, phase change does not happen
     integer, parameter :: lp = 1    !< index for the liquid phase of the reacting fluid
     integer, parameter :: vp = 2    !< index for the vapor phase of the reacting fluid
     !> @}
