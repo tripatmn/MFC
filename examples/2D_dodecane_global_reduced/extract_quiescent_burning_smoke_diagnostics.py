@@ -427,15 +427,16 @@ def parse_adaptive_dt(run_dir: Path) -> bool:
 
 def parse_d0_mm(run_dir: Path) -> tuple[float, str]:
     text = run_text(run_dir)
+    number = NUM_RE.pattern
     radius_match = re.search(
-        r"patch_icpp\(2\)%radius[^0-9+\-.]*(%s)" % NUM_RE.pattern,
+        rf"patch_icpp\(2\)%radius[^0-9+\-.]*({number})",
         text,
         flags=re.IGNORECASE,
     )
     if radius_match:
         return 2.0*float(radius_match.group(1))*1.0e3, "patch_icpp(2)%radius"
 
-    d0_match = re.search(r"\bD0\s*=\s*(%s)" % NUM_RE.pattern, text)
+    d0_match = re.search(rf"\bD0\s*=\s*({number})", text)
     if d0_match:
         return float(d0_match.group(1))*1.0e3, "case.py D0"
 
@@ -445,7 +446,7 @@ def parse_d0_mm(run_dir: Path) -> tuple[float, str]:
 
     path_match = re.search(r"025mm|0\.25", str(run_dir), flags=re.IGNORECASE)
     if path_match:
-        return 0.25, "run-dir name 0.25 mm"
+        return 0.25, "inferred approximate D0=0.25 mm from run-dir name"
 
     return math.nan, "missing"
 
