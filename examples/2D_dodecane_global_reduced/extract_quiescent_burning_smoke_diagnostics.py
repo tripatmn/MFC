@@ -600,6 +600,37 @@ def final_mass_k(rows: list[dict], d0_mm: float) -> dict:
     }
 
 
+def final_species_deltas(rows: list[dict]) -> dict:
+    if len(rows) < 2:
+        return {"status": "insufficient", "reason": "need at least two states"}
+    first = rows[0]
+    last = rows[-1]
+    out = {
+        "status": "ok",
+        "step_initial": int(first["step"]),
+        "step_final": int(last["step"]),
+        "time_initial_s": float(first.get("time", math.nan)),
+        "time_final_s": float(last.get("time", math.nan)),
+    }
+    any_available = False
+    for species in ("C12H26", "O2", "CO2", "H2O"):
+        key = f"rhoY_{species}_sum"
+        initial = float(first.get(key, math.nan))
+        final = float(last.get(key, math.nan))
+        available = math.isfinite(initial) and math.isfinite(final)
+        any_available = any_available or available
+        out[species] = {
+            "available": available,
+            "initial_sum": initial,
+            "final_sum": final,
+            "delta_sum": final - initial if available else math.nan,
+        }
+    if not any_available:
+        out["status"] = "missing"
+        out["reason"] = "species raw fields unavailable"
+    return out
+
+
 def write_csv(path: Path, rows: list[dict]) -> None:
     fieldnames = sorted({key for row in rows for key in row})
     with path.open("w", newline="") as handle:
@@ -767,6 +798,7 @@ def main() -> None:
         "D0_mm": d0_mm,
         "D0_source": d0_source,
         "mass_d2_estimate": final_mass_k(state_rows, d0_mm),
+        "species_deltas": final_species_deltas(state_rows),
         "last_run_time": log_summary["last_run_time"],
         "min_dt": log_summary["min_dt"],
         "max_dt": log_summary["max_dt"],

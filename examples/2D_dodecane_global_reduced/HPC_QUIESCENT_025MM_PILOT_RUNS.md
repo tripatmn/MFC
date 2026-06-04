@@ -119,6 +119,50 @@ only when the previous temperature is acceptable. Compare liquid `alpha_rho`
 loss, vapor `alpha_rho` gain, pressure extrema, gas density minimum, finite
 status, and `D2_mass_norm`.
 
+## T600 Burning Smoke
+
+After the `mixM = 1.0e-5` T600 nonreacting smoke is finite with bounded
+pressure and a reasonable evaporation constant, run the matched burning smoke
+with one MPI rank first.
+
+```bash
+RUN_ROOT="$PWD/runs/quiescent_025mm_condition_sweep_mixM1e5"
+mkdir -p "$RUN_ROOT/T600_burning_n1"
+cp examples/2D_dodecane_global_reduced/case_hpc_d2_quiescent_burning_025mm_T600_smoke.py \
+  "$RUN_ROOT/T600_burning_n1/case.py"
+```
+
+The copied case locates its imported T600 evaporation base case from the repo,
+so no additional case dependencies need to be copied when running under this
+repository checkout.
+
+JSON emission check:
+
+```bash
+build/venv/bin/python "$RUN_ROOT/T600_burning_n1/case.py" --mfc '{}' \
+  > "$RUN_ROOT/T600_burning_n1/case.json"
+```
+
+Run `-n 1` first:
+
+```bash
+./mfc.sh run "$RUN_ROOT/T600_burning_n1/case.py" \
+  -t pre_process simulation \
+  --gpu acc -n 1 -j 8 --clean -b mpirun
+```
+
+Extract diagnostics:
+
+```bash
+build/venv/bin/python examples/2D_dodecane_global_reduced/extract_quiescent_burning_smoke_diagnostics.py \
+  --run-dir "$RUN_ROOT/T600_burning_n1" \
+  --out-dir "$RUN_ROOT/T600_burning_n1_diagnostics"
+```
+
+Compare the burning and nonreacting `mass_d2_estimate.K_mass_mm2_s` values
+from their `smoke_diagnostics_summary.json` files to get the burning/nonreacting
+K ratio. Species signs should be fuel/O2 negative and CO2/H2O positive.
+
 ## Run Burning After Nonreacting Passes
 
 The burning case uses the baseline one-step mechanism, reactions on, and
