@@ -246,6 +246,97 @@ and burning species signs of C12H26/O2 decreasing with CO2/H2O increasing.
 FAIL means NaNs, pressure blowup, stall before `t_stop`, or species/energy
 pathologies; preserve the run folder and extract diagnostics before retrying.
 
+## Frolov 0.7 mm T700 Bridge Pilot
+
+These cases are Frolov-inspired bridge pilots, not full Frolov and Basevich
+2.8-4.3 mm reproductions. They use the smaller reported self-ignition droplet
+scale, `D0 = 0.7 mm`, with `XO2 = 0.21`, `XN2 = 0.79`, `p0 = 1 bar`, and
+`T_hot = 700 K`. The target literature burning constant scale is roughly
+`0.38-0.50 mm2/s`; this short bridge run is intended to check stable coupled
+behavior and early D2-law order, not a full droplet lifetime.
+
+Case settings:
+
+- `D0 = 0.7 mm`
+- Domain `5.6 mm x 5.6 mm` (`8D`)
+- Grid `256 x 256` (`32 cells/D`)
+- `rho_l = 750 kg/m3`
+- CFL-adaptive stepping, `cfl_target = 0.10`
+- `t_stop = 1.0e-4 s`, `t_save = 1.0e-5 s`
+- Burning uses the baseline one-step dodecane mechanism, not rate1000
+
+Setup:
+
+```bash
+RUN_ROOT="$PWD/runs/frolov_dodecane_validation"
+mkdir -p \
+  "$RUN_ROOT/070mm_T700_evap_n1" \
+  "$RUN_ROOT/070mm_T700_burning_n1" \
+  "$RUN_ROOT/070mm_T700_comparison_diagnostics"
+
+cp examples/2D_dodecane_global_reduced/case_hpc_d2_frolov_dodecane_070mm_T700_evap_pilot.py \
+  "$RUN_ROOT/070mm_T700_evap_n1/case.py"
+cp examples/2D_dodecane_global_reduced/case_hpc_d2_frolov_dodecane_070mm_T700_burning_pilot.py \
+  "$RUN_ROOT/070mm_T700_burning_n1/case.py"
+```
+
+JSON emission checks:
+
+```bash
+build/venv/bin/python "$RUN_ROOT/070mm_T700_evap_n1/case.py" --mfc '{}' \
+  > "$RUN_ROOT/070mm_T700_evap_n1/case.json"
+build/venv/bin/python "$RUN_ROOT/070mm_T700_burning_n1/case.py" --mfc '{}' \
+  > "$RUN_ROOT/070mm_T700_burning_n1/case.json"
+```
+
+Run the nonreacting bridge first with one rank:
+
+```bash
+./mfc.sh run "$RUN_ROOT/070mm_T700_evap_n1/case.py" \
+  -t pre_process simulation \
+  --gpu acc -n 1 -j 8 --clean -b mpirun
+```
+
+Run the burning bridge only after nonreacting is finite:
+
+```bash
+./mfc.sh run "$RUN_ROOT/070mm_T700_burning_n1/case.py" \
+  -t pre_process simulation \
+  --gpu acc -n 1 -j 8 --clean -b mpirun
+```
+
+After both `-n 1` runs pass, repeat with `-n 2` in separate folders:
+
+```bash
+mkdir -p "$RUN_ROOT/070mm_T700_evap_n2" "$RUN_ROOT/070mm_T700_burning_n2"
+cp examples/2D_dodecane_global_reduced/case_hpc_d2_frolov_dodecane_070mm_T700_evap_pilot.py \
+  "$RUN_ROOT/070mm_T700_evap_n2/case.py"
+cp examples/2D_dodecane_global_reduced/case_hpc_d2_frolov_dodecane_070mm_T700_burning_pilot.py \
+  "$RUN_ROOT/070mm_T700_burning_n2/case.py"
+
+./mfc.sh run "$RUN_ROOT/070mm_T700_evap_n2/case.py" \
+  -t pre_process simulation \
+  --gpu acc -n 2 -j 8 --clean -b mpirun
+./mfc.sh run "$RUN_ROOT/070mm_T700_burning_n2/case.py" \
+  -t pre_process simulation \
+  --gpu acc -n 2 -j 8 --clean -b mpirun
+```
+
+Analyze the one-rank bridge comparison:
+
+```bash
+build/venv/bin/python examples/2D_dodecane_global_reduced/extract_quiescent_burning_smoke_diagnostics.py \
+  --evap-run-dir "$RUN_ROOT/070mm_T700_evap_n1" \
+  --burning-run-dir "$RUN_ROOT/070mm_T700_burning_n1" \
+  --out-dir "$RUN_ROOT/070mm_T700_comparison_diagnostics"
+```
+
+PASS means both runs reach `t_stop = 1.0e-4 s` with finite fields, bounded
+pressure, stable adaptive `dt`, sensible liquid/vapor budgets, and burning
+species signs of C12H26/O2 decreasing with CO2/H2O increasing. FAIL means NaNs,
+pressure blowup, severe timestep collapse, stall, or species/energy
+pathologies; extract diagnostics before changing conditions.
+
 ## Run Burning After Nonreacting Passes
 
 The burning case uses the baseline one-step mechanism, reactions on, and
