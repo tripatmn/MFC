@@ -156,6 +156,8 @@ def collect_log_summary(run_dir: Path) -> dict:
     files = [scan_text_file(path) for path in unique_paths]
     run_time_rows = parse_numeric_rows(run_dir / "run_time.inf")
     last_run_time = run_time_rows[-1] if run_time_rows else None
+    nonzero_dt = [float(row["dt"]) for row in run_time_rows if float(row["dt"]) > 0.0]
+    nonzero_time = [float(row["time"]) for row in run_time_rows if float(row["time"]) > 0.0]
     min_dt = min((float(row["dt"]) for row in run_time_rows), default=math.nan)
     max_dt = max((float(row["dt"]) for row in run_time_rows), default=math.nan)
     return {
@@ -164,6 +166,11 @@ def collect_log_summary(run_dir: Path) -> dict:
         "last_run_time": last_run_time,
         "min_dt": min_dt,
         "max_dt": max_dt,
+        "min_dt_nonzero": min(nonzero_dt, default=math.nan),
+        "max_dt_nonzero": max(nonzero_dt, default=math.nan),
+        "max_time_nonzero": max(nonzero_time, default=math.nan),
+        "run_time_inf_dt_rounded_to_zero": bool(run_time_rows and not nonzero_dt),
+        "run_time_inf_time_rounded_to_zero": bool(run_time_rows and not nonzero_time),
         "n_run_time_rows": len(run_time_rows),
     }
 
@@ -367,18 +374,35 @@ def combined_field_stats(fields: dict[str, dict], names: tuple[str, ...]) -> dic
     }
 
 
-def state_time(step: int, time_by_step: dict[int, dict], fixed_dt: float | None) -> tuple[float, float, str]:
-    if step in time_by_step:
+def time_row_is_usable(step: int, row: dict) -> bool:
+    time = float(row.get("time", math.nan))
+    return math.isfinite(time) and (step == 0 or time > 0.0)
+
+
+def state_time(step: int, time_by_step: dict[int, dict], fixed_dt: float | None, adaptive_dt: bool) -> tuple[float, float, str]:
+    if step in time_by_step and time_row_is_usable(step, time_by_step[step]):
         row = time_by_step[step]
         return float(row["time"]), float(row["dt"]), "run_time.inf"
-    lower = [s for s in time_by_step if s <= step]
+    lower = [s for s in time_by_step if s <= step and time_row_is_usable(s, time_by_step[s])]
     if lower:
         nearest = max(lower)
         row = time_by_step[nearest]
         return float(row["time"]), float(row["dt"]), f"nearest_run_time_step_{nearest}"
     if fixed_dt is not None:
-        return float(step * fixed_dt), fixed_dt, "simulation.inp_dt"
+        source = "approx_initial_dt_adaptive" if adaptive_dt else "simulation.inp_dt"
+        return float(step * fixed_dt), fixed_dt, source
     return math.nan, math.nan, "missing"
+
+
+def read_text_if_exists(path: Path) -> str:
+    return path.read_text(errors="replace") if path.is_file() else ""
+
+
+def run_text(run_dir: Path) -> str:
+    return "\n".join(
+        read_text_if_exists(path)
+        for path in (run_dir / "simulation.inp", run_dir / "case.py")
+    )
 
 
 def parse_fixed_dt(run_dir: Path) -> float | None:
@@ -393,6 +417,37 @@ def parse_fixed_dt(run_dir: Path) -> float | None:
             except (IndexError, ValueError):
                 return None
     return None
+
+
+def parse_adaptive_dt(run_dir: Path) -> bool:
+    text = run_text(run_dir).lower()
+    match = re.search(r"cfl_adap_dt[^a-z0-9_]*['\"]?([tf])['\"]?", text)
+    return bool(match and match.group(1) == "t")
+
+
+def parse_d0_mm(run_dir: Path) -> tuple[float, str]:
+    text = run_text(run_dir)
+    radius_match = re.search(
+        r"patch_icpp\(2\)%radius[^0-9+\-.]*(%s)" % NUM_RE.pattern,
+        text,
+        flags=re.IGNORECASE,
+    )
+    if radius_match:
+        return 2.0*float(radius_match.group(1))*1.0e3, "patch_icpp(2)%radius"
+
+    d0_match = re.search(r"\bD0\s*=\s*(%s)" % NUM_RE.pattern, text)
+    if d0_match:
+        return float(d0_match.group(1))*1.0e3, "case.py D0"
+
+    mm_match = re.search(r"\b(0\.25|\.25)\s*mm\b", text, flags=re.IGNORECASE)
+    if mm_match:
+        return 0.25, "case.py text 0.25 mm"
+
+    path_match = re.search(r"025mm|0\.25", str(run_dir), flags=re.IGNORECASE)
+    if path_match:
+        return 0.25, "run-dir name 0.25 mm"
+
+    return math.nan, "missing"
 
 
 def selected_steps(steps_by_field: dict[str, list[int]]) -> list[int]:
@@ -421,11 +476,11 @@ def history_steps(steps_by_field: dict[str, list[int]], stride: int, max_states:
     return sorted(set(base) | set(selected_steps(steps_by_field)))
 
 
-def analyze_state(run_dir: Path, step: int, time_by_step: dict[int, dict], fixed_dt: float | None) -> tuple[dict, dict]:
+def analyze_state(run_dir: Path, step: int, time_by_step: dict[int, dict], fixed_dt: float | None, adaptive_dt: bool) -> tuple[dict, dict]:
     fields = {name: read_field(run_dir, name, step) for name in STATE_FIELD_ORDER}
     reference = next((fields[name]["values"] for name in ("liquid_alpha_rho", "liquid_alpha", "pressure") if fields[name]["available"]), {})
     dx, dy, d_area = grid_area_from_values(reference)
-    time, dt, time_source = state_time(step, time_by_step, fixed_dt)
+    time, dt, time_source = state_time(step, time_by_step, fixed_dt, adaptive_dt)
 
     row = {
         "step": step,
@@ -491,13 +546,21 @@ def short_prefix(name: str) -> str:
     }[name]
 
 
-def enrich_d2(rows: list[dict]) -> None:
+def enrich_d2(rows: list[dict], d0_mm: float) -> None:
     if not rows:
         return
     first_mass = rows[0].get("liq_arho_integral", math.nan)
+    d0_squared = d0_mm*d0_mm if math.isfinite(d0_mm) else math.nan
+    first_time = rows[0].get("time", math.nan)
     for row in rows:
         mass = row.get("liq_arho_integral", math.nan)
         row["D2_mass_norm"] = mass / first_mass if first_mass and math.isfinite(first_mass) else math.nan
+        row["D2_mass_mm2"] = d0_squared*row["D2_mass_norm"] if math.isfinite(d0_squared) and math.isfinite(row["D2_mass_norm"]) else math.nan
+        elapsed = row.get("time", math.nan) - first_time if math.isfinite(row.get("time", math.nan)) and math.isfinite(first_time) else math.nan
+        if elapsed and math.isfinite(elapsed) and elapsed > 0.0 and math.isfinite(row["D2_mass_mm2"]):
+            row["K_mass_mm2_s_cumulative"] = -(row["D2_mass_mm2"] - d0_squared)/elapsed
+        else:
+            row["K_mass_mm2_s_cumulative"] = math.nan
 
         alpha_sum = row.get("liq_alpha_sum", math.nan)
         area = row.get("cell_area", math.nan)
@@ -505,6 +568,35 @@ def enrich_d2(rows: list[dict]) -> None:
             row["liquid_alpha_integral"] = alpha_sum * area
         else:
             row["liquid_alpha_integral"] = math.nan
+
+
+def final_mass_k(rows: list[dict], d0_mm: float) -> dict:
+    if len(rows) < 2 or not math.isfinite(d0_mm):
+        return {"status": "insufficient", "reason": "need at least two states and D0"}
+    first = rows[0]
+    last = rows[-1]
+    t0 = float(first.get("time", math.nan))
+    t1 = float(last.get("time", math.nan))
+    d20 = float(first.get("D2_mass_mm2", math.nan))
+    d21 = float(last.get("D2_mass_mm2", math.nan))
+    if not all(math.isfinite(v) for v in (t0, t1, d20, d21)) or t1 <= t0:
+        return {"status": "insufficient", "reason": "invalid time or D2 values"}
+    return {
+        "status": "ok",
+        "D0_mm": d0_mm,
+        "D0_squared_mm2": d0_mm*d0_mm,
+        "step_initial": int(first["step"]),
+        "step_final": int(last["step"]),
+        "time_initial_s": t0,
+        "time_final_s": t1,
+        "time_delta_s": t1 - t0,
+        "time_source_initial": first.get("time_source", ""),
+        "time_source_final": last.get("time_source", ""),
+        "D2_initial_mm2": d20,
+        "D2_final_mm2": d21,
+        "D2_mass_norm_final": float(last.get("D2_mass_norm", math.nan)),
+        "K_mass_mm2_s": -(d21 - d20)/(t1 - t0),
+    }
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -538,24 +630,50 @@ def write_log_text(path: Path, log_summary: dict) -> None:
                 handle.write(f"{line}\n")
 
 
-def maybe_write_plots(out_dir: Path, rows: list[dict], run_time_rows: list[dict]) -> list[str]:
+def time_history_for_plot(run_time_rows: list[dict], fixed_dt: float | None, adaptive_dt: bool) -> tuple[list[dict], str]:
+    usable = [
+        {
+            "step": int(row["step"]),
+            "time": float(row["time"]),
+            "dt": float(row["dt"]),
+        }
+        for row in run_time_rows
+        if time_row_is_usable(int(row["step"]), row) and float(row["dt"]) > 0.0
+    ]
+    if usable:
+        return usable, "run_time.inf"
+    if fixed_dt is None:
+        return [], "missing"
+    source = "approx_initial_dt_adaptive" if adaptive_dt else "simulation.inp_dt"
+    return [
+        {
+            "step": int(row["step"]),
+            "time": int(row["step"])*fixed_dt,
+            "dt": fixed_dt,
+        }
+        for row in run_time_rows
+    ], source
+
+
+def maybe_write_plots(out_dir: Path, rows: list[dict], run_time_rows: list[dict], fixed_dt: float | None, adaptive_dt: bool) -> tuple[list[str], str]:
     try:
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except Exception:
-        return []
+        return [], "matplotlib_unavailable"
 
     paths: list[str] = []
-    if run_time_rows:
-        times = np.array([row["time"] for row in run_time_rows], dtype=float)
-        dts = np.array([row["dt"] for row in run_time_rows], dtype=float)
+    plot_time_rows, time_plot_source = time_history_for_plot(run_time_rows, fixed_dt, adaptive_dt)
+    if plot_time_rows:
+        times = np.array([row["time"] for row in plot_time_rows], dtype=float)
+        dts = np.array([row["dt"] for row in plot_time_rows], dtype=float)
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.plot(times, dts, marker=".", linewidth=1)
         ax.set_xlabel("Time [s]")
         ax.set_ylabel("dt [s]")
-        ax.set_title("Adaptive timestep history")
+        ax.set_title(f"Timestep history ({time_plot_source})")
         ax.grid(True, alpha=0.3)
         path = out_dir / "smoke_dt_history.png"
         fig.tight_layout()
@@ -587,7 +705,7 @@ def maybe_write_plots(out_dir: Path, rows: list[dict], run_time_rows: list[dict]
             fig.savefig(path, dpi=160)
             plt.close(fig)
             paths.append(str(path))
-    return paths
+    return paths, time_plot_source
 
 
 def main() -> None:
@@ -601,25 +719,36 @@ def main() -> None:
     chosen_steps = selected_steps(steps_by_field)
     trend_steps = history_steps(steps_by_field, args.history_stride, args.max_history_states)
     fixed_dt = parse_fixed_dt(run_dir)
+    adaptive_dt = parse_adaptive_dt(run_dir)
+    d0_mm, d0_source = parse_d0_mm(run_dir)
     time_by_step = {int(row["step"]): row for row in log_summary["run_time_rows"]}
 
     state_rows = []
     state_details = []
     for step in chosen_steps:
-        row, detail = analyze_state(run_dir, step, time_by_step, fixed_dt)
+        row, detail = analyze_state(run_dir, step, time_by_step, fixed_dt, adaptive_dt)
         state_rows.append(row)
         state_details.append(detail)
-    enrich_d2(state_rows)
+    enrich_d2(state_rows, d0_mm)
 
     trend_rows = []
     for step in trend_steps:
-        row, _detail = analyze_state(run_dir, step, time_by_step, fixed_dt)
+        row, _detail = analyze_state(run_dir, step, time_by_step, fixed_dt, adaptive_dt)
         trend_rows.append(row)
-    enrich_d2(trend_rows)
+    enrich_d2(trend_rows, d0_mm)
 
     d_count, d_size = directory_size(run_dir / "D")
     p_all_count, p_all_size = directory_size(run_dir / "p_all")
-    plots = maybe_write_plots(out_dir, trend_rows, log_summary["run_time_rows"])
+    plots, time_plot_source = maybe_write_plots(out_dir, trend_rows, log_summary["run_time_rows"], fixed_dt, adaptive_dt)
+
+    notes = []
+    if all(not steps_by_field[name] for name in ("rhoY_C12H26", "rhoY_O2", "rhoY_CO2", "rhoY_H2O")):
+        notes.append("chemistry/species raw fields are unavailable; this is expected for nonreacting chemistry-off cases")
+    if log_summary["run_time_inf_dt_rounded_to_zero"] or log_summary["run_time_inf_time_rounded_to_zero"]:
+        notes.append(
+            "run_time.inf dt/time columns appear rounded to zero; saved-state times use "
+            "an approximate initial-dt mapping when no usable log time is available"
+        )
 
     summary = {
         "run_dir": str(run_dir),
@@ -633,11 +762,22 @@ def main() -> None:
         "selected_steps": chosen_steps,
         "trend_steps": trend_steps,
         "fixed_dt_from_simulation_inp": fixed_dt,
+        "cfl_adap_dt": adaptive_dt,
+        "D0_mm": d0_mm,
+        "D0_source": d0_source,
+        "mass_d2_estimate": final_mass_k(state_rows, d0_mm),
         "last_run_time": log_summary["last_run_time"],
         "min_dt": log_summary["min_dt"],
         "max_dt": log_summary["max_dt"],
+        "min_dt_nonzero": log_summary["min_dt_nonzero"],
+        "max_dt_nonzero": log_summary["max_dt_nonzero"],
+        "max_time_nonzero": log_summary["max_time_nonzero"],
+        "run_time_inf_dt_rounded_to_zero": log_summary["run_time_inf_dt_rounded_to_zero"],
+        "run_time_inf_time_rounded_to_zero": log_summary["run_time_inf_time_rounded_to_zero"],
+        "time_plot_source": time_plot_source,
         "state_details": state_details,
         "plots": plots,
+        "notes": notes,
     }
 
     summary_path = out_dir / "smoke_diagnostics_summary.json"
