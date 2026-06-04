@@ -163,6 +163,89 @@ Compare the burning and nonreacting `mass_d2_estimate.K_mass_mm2_s` values
 from their `smoke_diagnostics_summary.json` files to get the burning/nonreacting
 K ratio. Species signs should be fuel/O2 negative and CO2/H2O positive.
 
+## T600 Long Evaporation/Burning Comparison
+
+After the T600 nonreacting and burning smoke cases both pass, run the matched
+long comparison cases. These keep the same `D0 = 0.25 mm`, `2 mm x 2 mm`,
+`256 x 256`, `p0 = 1 bar`, `T_hot = 600 K`, `rho_l = 750 kg/m3`, adaptive
+`cfl_target = 0.10`, and `mixM = 1.0e-5` diagnostic phase-change threshold.
+They extend only the runtime to `t_stop = 1.0e-4 s` with `t_save = 1.0e-5 s`.
+
+```bash
+RUN_ROOT="$PWD/runs/quiescent_025mm_condition_sweep_mixM1e5"
+mkdir -p \
+  "$RUN_ROOT/T600_evap_long" \
+  "$RUN_ROOT/T600_burning_long" \
+  "$RUN_ROOT/T600_long_comparison_diagnostics"
+
+cp examples/2D_dodecane_global_reduced/case_hpc_d2_quiescent_evap_025mm_T600_long.py \
+  "$RUN_ROOT/T600_evap_long/case.py"
+cp examples/2D_dodecane_global_reduced/case_hpc_d2_quiescent_burning_025mm_T600_long.py \
+  "$RUN_ROOT/T600_burning_long/case.py"
+```
+
+JSON emission checks:
+
+```bash
+build/venv/bin/python "$RUN_ROOT/T600_evap_long/case.py" --mfc '{}' \
+  > "$RUN_ROOT/T600_evap_long/case.json"
+build/venv/bin/python "$RUN_ROOT/T600_burning_long/case.py" --mfc '{}' \
+  > "$RUN_ROOT/T600_burning_long/case.json"
+```
+
+Run nonreacting first with two ranks:
+
+```bash
+./mfc.sh run "$RUN_ROOT/T600_evap_long/case.py" \
+  -t pre_process simulation \
+  --gpu acc -n 2 -j 8 --clean -b mpirun
+```
+
+Run burning only after the nonreacting long run is finite:
+
+```bash
+./mfc.sh run "$RUN_ROOT/T600_burning_long/case.py" \
+  -t pre_process simulation \
+  --gpu acc -n 2 -j 8 --clean -b mpirun
+```
+
+If the two-rank run stalls or diverges, fall back to the same case with
+`-n 1` to separate local stiffness from MPI/rank effects:
+
+```bash
+./mfc.sh run "$RUN_ROOT/T600_burning_long/case.py" \
+  -t pre_process simulation \
+  --gpu acc -n 1 -j 8 --clean -b mpirun
+```
+
+After both long runs finish, extract the compact comparison diagnostics:
+
+```bash
+build/venv/bin/python examples/2D_dodecane_global_reduced/extract_quiescent_burning_smoke_diagnostics.py \
+  --evap-run-dir "$RUN_ROOT/T600_evap_long" \
+  --burning-run-dir "$RUN_ROOT/T600_burning_long" \
+  --out-dir "$RUN_ROOT/T600_long_comparison_diagnostics"
+```
+
+The comparison extractor writes:
+
+```text
+$RUN_ROOT/T600_long_comparison_diagnostics/comparison_summary.json
+$RUN_ROOT/T600_long_comparison_diagnostics/comparison_timeseries.csv
+$RUN_ROOT/T600_long_comparison_diagnostics/D2_mass_mm2_vs_time_comparison.png
+$RUN_ROOT/T600_long_comparison_diagnostics/D2_mass_norm_vs_time_comparison.png
+$RUN_ROOT/T600_long_comparison_diagnostics/*alpha_liq*.png
+$RUN_ROOT/T600_long_comparison_diagnostics/*pressure_final.png
+$RUN_ROOT/T600_long_comparison_diagnostics/*vapor_alpha_rho_final.png
+$RUN_ROOT/T600_long_comparison_diagnostics/burning_final_rhoY_*.png
+```
+
+Long-comparison PASS means both runs reach `t_stop = 1.0e-4 s` with finite
+outputs, bounded pressure, stable adaptive `dt`, sensible liquid/vapor budgets,
+and burning species signs of C12H26/O2 decreasing with CO2/H2O increasing.
+FAIL means NaNs, pressure blowup, stall before `t_stop`, or species/energy
+pathologies; preserve the run folder and extract diagnostics before retrying.
+
 ## Run Burning After Nonreacting Passes
 
 The burning case uses the baseline one-step mechanism, reactions on, and

@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 from collections import defaultdict
 from collections import deque
@@ -69,7 +70,9 @@ KEYWORDS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-dir", type=Path, required=True, help="Run folder, e.g. runs/.../burning_smoke")
+    parser.add_argument("--run-dir", type=Path, help="Single run folder, e.g. runs/.../burning_smoke")
+    parser.add_argument("--evap-run-dir", type=Path, help="Nonreacting evaporation run folder for comparison mode")
+    parser.add_argument("--burning-run-dir", type=Path, help="Burning run folder for comparison mode")
     parser.add_argument("--out-dir", type=Path, required=True, help="Output folder for compact diagnostics")
     parser.add_argument(
         "--history-stride",
@@ -83,7 +86,18 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Maximum saved states to read for optional raw-field plots and trends.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--comparison-max-states",
+        type=int,
+        default=200,
+        help="Maximum saved states to read per run in comparison mode.",
+    )
+    args = parser.parse_args()
+    single_mode = args.run_dir is not None
+    comparison_mode = args.evap_run_dir is not None or args.burning_run_dir is not None
+    if single_mode == comparison_mode:
+        parser.error("use either --run-dir or comparison mode with --evap-run-dir/--burning-run-dir")
+    return args
 
 
 def clean_line(line: str) -> str:
@@ -477,6 +491,33 @@ def history_steps(steps_by_field: dict[str, list[int]], stride: int, max_states:
     return sorted(set(base) | set(selected_steps(steps_by_field)))
 
 
+def comparison_steps(steps_by_field: dict[str, list[int]], max_states: int) -> list[int]:
+    base = sorted(set(steps_by_field.get("liquid_alpha_rho", [])) | set(steps_by_field.get("pressure", [])))
+    if not base:
+        return []
+    if len(base) > max_states:
+        take = np.linspace(0, len(base) - 1, max_states, dtype=int)
+        base = [base[i] for i in take]
+    return sorted(set(base))
+
+
+def analysis_context(run_dir: Path) -> dict:
+    log_summary = collect_log_summary(run_dir)
+    fixed_dt = parse_fixed_dt(run_dir)
+    adaptive_dt = parse_adaptive_dt(run_dir)
+    d0_mm, d0_source = parse_d0_mm(run_dir)
+    return {
+        "run_dir": run_dir,
+        "log_summary": log_summary,
+        "steps_by_field": available_steps(run_dir),
+        "fixed_dt": fixed_dt,
+        "adaptive_dt": adaptive_dt,
+        "d0_mm": d0_mm,
+        "d0_source": d0_source,
+        "time_by_step": {int(row["step"]): row for row in log_summary["run_time_rows"]},
+    }
+
+
 def analyze_state(run_dir: Path, step: int, time_by_step: dict[int, dict], fixed_dt: float | None, adaptive_dt: bool) -> tuple[dict, dict]:
     fields = {name: read_field(run_dir, name, step) for name in STATE_FIELD_ORDER}
     reference = next((fields[name]["values"] for name in ("liquid_alpha_rho", "liquid_alpha", "pressure") if fields[name]["available"]), {})
@@ -662,6 +703,14 @@ def write_log_text(path: Path, log_summary: dict) -> None:
                 handle.write(f"{line}\n")
 
 
+def ensure_matplotlib_config(out_dir: Path) -> None:
+    if "MPLCONFIGDIR" in os.environ:
+        return
+    cache_dir = out_dir / ".matplotlib"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["MPLCONFIGDIR"] = str(cache_dir)
+
+
 def time_history_for_plot(run_time_rows: list[dict], fixed_dt: float | None, adaptive_dt: bool) -> tuple[list[dict], str]:
     usable = [
         {
@@ -688,6 +737,7 @@ def time_history_for_plot(run_time_rows: list[dict], fixed_dt: float | None, ada
 
 
 def maybe_write_plots(out_dir: Path, rows: list[dict], run_time_rows: list[dict], fixed_dt: float | None, adaptive_dt: bool) -> tuple[list[str], str]:
+    ensure_matplotlib_config(out_dir)
     try:
         import matplotlib
 
@@ -740,20 +790,185 @@ def maybe_write_plots(out_dir: Path, rows: list[dict], run_time_rows: list[dict]
     return paths, time_plot_source
 
 
-def main() -> None:
-    args = parse_args()
+def field_to_grid(values: dict[tuple[float, float], float]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    coords = np.array(list(values.keys()), dtype=float)
+    xs = np.unique(coords[:, 0])
+    ys = np.unique(coords[:, 1])
+    grid = np.full((ys.size, xs.size), np.nan, dtype=float)
+    x_index = {float(x): i for i, x in enumerate(xs)}
+    y_index = {float(y): i for i, y in enumerate(ys)}
+    for (x, y), value in values.items():
+        grid[y_index[float(y)], x_index[float(x)]] = value
+    return xs, ys, grid
+
+
+def plot_field_image(run_dir: Path, field_name: str, step: int, out_path: Path, title: str) -> tuple[bool, str]:
+    ensure_matplotlib_config(out_path.parent)
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        return False, f"matplotlib_unavailable: {exc}"
+
+    field = read_field(run_dir, field_name, step)
+    if not field["available"]:
+        return False, f"{field_name} unavailable at step {step}"
+    xs, ys, grid = field_to_grid(field["values"])
+    if xs.size == 0 or ys.size == 0:
+        return False, f"{field_name} grid empty at step {step}"
+
+    dx = median_positive_spacing(xs)
+    dy = median_positive_spacing(ys)
+    xpad = 0.5*dx if math.isfinite(dx) else 0.0
+    ypad = 0.5*dy if math.isfinite(dy) else 0.0
+    extent = [float(xs[0] - xpad), float(xs[-1] + xpad), float(ys[0] - ypad), float(ys[-1] + ypad)]
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    image = ax.imshow(grid, origin="lower", extent=extent, aspect="equal")
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+    ax.set_title(title)
+    fig.colorbar(image, ax=ax, shrink=0.86)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+    return True, str(out_path)
+
+
+def comparison_rows_for_run(label: str, run_dir: Path, max_states: int) -> tuple[list[dict], dict, dict]:
+    context = analysis_context(run_dir)
+    steps = comparison_steps(context["steps_by_field"], max_states)
+    rows = []
+    for step in steps:
+        row, _detail = analyze_state(
+            run_dir,
+            step,
+            context["time_by_step"],
+            context["fixed_dt"],
+            context["adaptive_dt"],
+        )
+        row["case"] = label
+        rows.append(row)
+    enrich_d2(rows, context["d0_mm"])
+    d_count, d_size = directory_size(run_dir / "D")
+    p_all_count, p_all_size = directory_size(run_dir / "p_all")
+    meta = {
+        "label": label,
+        "run_dir": str(run_dir),
+        "selected_steps": steps,
+        "D_file_count": d_count,
+        "D_bytes": d_size,
+        "p_all_file_count": p_all_count,
+        "p_all_bytes": p_all_size,
+        "fixed_dt_from_simulation_inp": context["fixed_dt"],
+        "cfl_adap_dt": context["adaptive_dt"],
+        "D0_mm": context["d0_mm"],
+        "D0_source": context["d0_source"],
+        "mass_d2_estimate": final_mass_k(rows, context["d0_mm"]),
+        "species_deltas": final_species_deltas(rows),
+        "last_run_time": context["log_summary"]["last_run_time"],
+        "min_dt_nonzero": context["log_summary"]["min_dt_nonzero"],
+        "max_dt_nonzero": context["log_summary"]["max_dt_nonzero"],
+        "max_time_nonzero": context["log_summary"]["max_time_nonzero"],
+    }
+    return rows, meta, context
+
+
+def maybe_write_comparison_plots(out_dir: Path, rows_by_label: dict[str, list[dict]]) -> tuple[list[str], str]:
+    ensure_matplotlib_config(out_dir)
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        return [], f"matplotlib_unavailable: {exc}"
+
+    paths = []
+    specs = [
+        ("D2_mass_mm2", "D2_mass_mm2_vs_time_comparison.png", "Mass-equivalent D2", "D2 [mm2]"),
+        ("D2_mass_norm", "D2_mass_norm_vs_time_comparison.png", "Mass-equivalent normalized D2", "D2 / D0^2"),
+    ]
+    for field, filename, title, ylabel in specs:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        wrote_any = False
+        for label, rows in rows_by_label.items():
+            valid = [
+                (float(row.get("time", math.nan)), float(row.get(field, math.nan)))
+                for row in rows
+                if math.isfinite(float(row.get("time", math.nan))) and math.isfinite(float(row.get(field, math.nan)))
+            ]
+            if not valid:
+                continue
+            times, values = zip(*valid)
+            ax.plot(times, values, marker="o", linewidth=1.5, label=label)
+            wrote_any = True
+        if not wrote_any:
+            plt.close(fig)
+            continue
+        ax.set_xlabel("Time [s]")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        path = out_dir / filename
+        fig.tight_layout()
+        fig.savefig(path, dpi=170)
+        plt.close(fig)
+        paths.append(str(path))
+    return paths, "ok"
+
+
+def maybe_write_comparison_field_images(out_dir: Path, run_contexts: dict[str, dict]) -> tuple[list[str], list[str]]:
+    paths = []
+    skipped = []
+    case_prefix = {"Nonreacting": "evap", "Burning": "burning"}
+
+    for label, context in run_contexts.items():
+        steps = comparison_steps(context["steps_by_field"], 10_000)
+        if not steps:
+            skipped.append(f"{label}: no image-capable saved steps")
+            continue
+        prefix = case_prefix.get(label, label.lower())
+        first_step = steps[0]
+        last_step = steps[-1]
+        specs = [
+            ("liquid_alpha", first_step, f"{prefix}_alpha_liq_initial.png", f"{label} initial liquid alpha"),
+            ("liquid_alpha", last_step, f"{prefix}_alpha_liq_final.png", f"{label} final liquid alpha"),
+            ("pressure", last_step, f"{prefix}_pressure_final.png", f"{label} final pressure"),
+            ("vapor_alpha_rho", last_step, f"{prefix}_vapor_alpha_rho_final.png", f"{label} final vapor alpha_rho"),
+        ]
+        if label == "Burning":
+            specs.extend(
+                (field, last_step, f"burning_final_{field}.png", f"Burning final {field}")
+                for field in ("rhoY_C12H26", "rhoY_O2", "rhoY_CO2", "rhoY_H2O")
+            )
+        for field, step, filename, title in specs:
+            ok, message = plot_field_image(context["run_dir"], field, step, out_dir / filename, title)
+            if ok:
+                paths.append(message)
+            else:
+                skipped.append(f"{label}: {message}")
+    return paths, skipped
+
+
+def run_single(args: argparse.Namespace) -> None:
     run_dir = args.run_dir.resolve()
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    log_summary = collect_log_summary(run_dir)
-    steps_by_field = available_steps(run_dir)
+    context = analysis_context(run_dir)
+    log_summary = context["log_summary"]
+    steps_by_field = context["steps_by_field"]
     chosen_steps = selected_steps(steps_by_field)
     trend_steps = history_steps(steps_by_field, args.history_stride, args.max_history_states)
-    fixed_dt = parse_fixed_dt(run_dir)
-    adaptive_dt = parse_adaptive_dt(run_dir)
-    d0_mm, d0_source = parse_d0_mm(run_dir)
-    time_by_step = {int(row["step"]): row for row in log_summary["run_time_rows"]}
+    fixed_dt = context["fixed_dt"]
+    adaptive_dt = context["adaptive_dt"]
+    d0_mm = context["d0_mm"]
+    d0_source = context["d0_source"]
+    time_by_step = context["time_by_step"]
 
     state_rows = []
     state_details = []
@@ -829,6 +1044,70 @@ def main() -> None:
     print(f"log_summary={log_path}")
     for path in plots:
         print(f"plot={path}")
+
+
+def run_comparison(args: argparse.Namespace) -> None:
+    out_dir = args.out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    run_specs = []
+    if args.evap_run_dir is not None:
+        run_specs.append(("Nonreacting", args.evap_run_dir.resolve()))
+    if args.burning_run_dir is not None:
+        run_specs.append(("Burning", args.burning_run_dir.resolve()))
+
+    rows_by_label = {}
+    contexts = {}
+    runs = {}
+    combined_rows = []
+    for label, run_dir in run_specs:
+        rows, meta, context = comparison_rows_for_run(label, run_dir, args.comparison_max_states)
+        rows_by_label[label] = rows
+        contexts[label] = context
+        runs[label] = meta
+        combined_rows.extend(rows)
+
+    comparison_plots, plot_status = maybe_write_comparison_plots(out_dir, rows_by_label)
+    field_images, skipped_images = maybe_write_comparison_field_images(out_dir, contexts)
+
+    k_ratio = math.nan
+    evap_k = runs.get("Nonreacting", {}).get("mass_d2_estimate", {})
+    burning_k = runs.get("Burning", {}).get("mass_d2_estimate", {})
+    if evap_k.get("status") == "ok" and burning_k.get("status") == "ok":
+        denom = float(evap_k["K_mass_mm2_s"])
+        if denom:
+            k_ratio = float(burning_k["K_mass_mm2_s"]) / denom
+
+    summary = {
+        "mode": "comparison",
+        "out_dir": str(out_dir),
+        "runs": runs,
+        "burning_to_nonreacting_K_mass_ratio": k_ratio,
+        "comparison_plots": comparison_plots,
+        "field_images": field_images,
+        "skipped_images": skipped_images,
+        "plot_status": plot_status,
+    }
+
+    summary_path = out_dir / "comparison_summary.json"
+    timeseries_path = out_dir / "comparison_timeseries.csv"
+    summary_path.write_text(json.dumps(summary, indent=2, allow_nan=True))
+    write_csv(timeseries_path, combined_rows)
+
+    print(f"comparison_summary={summary_path}")
+    print(f"comparison_timeseries={timeseries_path}")
+    for path in comparison_plots:
+        print(f"plot={path}")
+    for path in field_images:
+        print(f"image={path}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.run_dir is not None:
+        run_single(args)
+    else:
+        run_comparison(args)
 
 
 if __name__ == "__main__":
