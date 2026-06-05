@@ -322,6 +322,38 @@ cp examples/2D_dodecane_global_reduced/case_hpc_d2_frolov_dodecane_070mm_T700_bu
   --gpu acc -n 2 -j 8 --clean -b mpirun
 ```
 
+For the matching `-n 2` evaporation baseline, emit JSON before submitting:
+
+```bash
+build/venv/bin/python "$RUN_ROOT/070mm_T700_evap_n2/case.py" --mfc '{}' \
+  > "$RUN_ROOT/070mm_T700_evap_n2/case.json"
+```
+
+Run the matching `-n 2` evaporation baseline:
+
+```bash
+./mfc.sh run "$RUN_ROOT/070mm_T700_evap_n2/case.py" \
+  -t pre_process simulation \
+  --gpu acc -n 2 -j 8 --clean -b mpirun
+```
+
+Extract single-run evaporation diagnostics:
+
+```bash
+build/venv/bin/python examples/2D_dodecane_global_reduced/extract_quiescent_burning_smoke_diagnostics.py \
+  --run-dir "$RUN_ROOT/070mm_T700_evap_n2" \
+  --out-dir "$RUN_ROOT/070mm_T700_evap_n2_diagnostics"
+```
+
+Compare the matching `-n 2` evaporation and burning runs:
+
+```bash
+build/venv/bin/python examples/2D_dodecane_global_reduced/extract_quiescent_burning_smoke_diagnostics.py \
+  --evap-run-dir "$RUN_ROOT/070mm_T700_evap_n2" \
+  --burning-run-dir "$RUN_ROOT/070mm_T700_burning_n2" \
+  --out-dir "$RUN_ROOT/070mm_T700_n2_comparison_diagnostics"
+```
+
 Analyze the one-rank bridge comparison:
 
 ```bash
