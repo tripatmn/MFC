@@ -408,6 +408,14 @@ def state_time(step: int, time_by_step: dict[int, dict], fixed_dt: float | None,
     return math.nan, math.nan, "missing"
 
 
+def time_is_valid_nonzero(value: object) -> bool:
+    try:
+        time = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(time) and time > 0.0
+
+
 def read_text_if_exists(path: Path) -> str:
     return path.read_text(errors="replace") if path.is_file() else ""
 
@@ -433,6 +441,24 @@ def parse_fixed_dt(run_dir: Path) -> float | None:
     return None
 
 
+def parse_scalar_param(run_dir: Path, name: str) -> tuple[float | None, str]:
+    text = run_text(run_dir)
+    number = NUM_RE.pattern
+    patterns = [
+        rf'["\']?{re.escape(name)}["\']?\s*[:=]\s*({number})',
+        rf"\b{re.escape(name)}\b[^0-9+\-.]*({number})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return float(match.group(1)), f"{name} from run text"
+    return None, "missing"
+
+
+def parse_t_save(run_dir: Path) -> tuple[float | None, str]:
+    return parse_scalar_param(run_dir, "t_save")
+
+
 def parse_adaptive_dt(run_dir: Path) -> bool:
     text = run_text(run_dir).lower()
     match = re.search(r"cfl_adap_dt[^a-z0-9_]*['\"]?([tf])['\"]?", text)
@@ -454,13 +480,34 @@ def parse_d0_mm(run_dir: Path) -> tuple[float, str]:
     if d0_match:
         return float(d0_match.group(1))*1.0e3, "case.py D0"
 
-    mm_match = re.search(r"\b(0\.25|\.25)\s*mm\b", text, flags=re.IGNORECASE)
+    mm_match = re.search(rf"\b({number})\s*mm\b", text, flags=re.IGNORECASE)
     if mm_match:
-        return 0.25, "case.py text 0.25 mm"
+        value = float(mm_match.group(1))
+        if value > 0.0:
+            return value, "case.py text D0 in mm"
 
-    path_match = re.search(r"025mm|0\.25", str(run_dir), flags=re.IGNORECASE)
-    if path_match:
-        return 0.25, "inferred approximate D0=0.25 mm from run-dir name"
+    combined = "\n".join([text, str(run_dir)])
+    compact_match = re.search(r"(?<!\d)(\d{3,4})\s*mm(?![a-z])", combined, flags=re.IGNORECASE)
+    if compact_match:
+        token = compact_match.group(1)
+        if len(token) == 3:
+            return float(token)/100.0, f"inferred approximate D0={float(token)/100.0:g} mm from compact mm token"
+        return float(token)/1000.0, f"inferred approximate D0={float(token)/1000.0:g} mm from compact mm token"
+
+    decimal_path_match = re.search(r"(?<!\d)(0?\.\d+|[1-9]\d*(?:\.\d+)?)\s*mm", str(run_dir), flags=re.IGNORECASE)
+    if decimal_path_match:
+        value = float(decimal_path_match.group(1))
+        if value > 0.0:
+            return value, f"inferred approximate D0={value:g} mm from run-dir name"
+
+    common_token_map = {
+        "025mm": 0.25,
+        "070mm": 0.70,
+    }
+    lower_path = str(run_dir).lower()
+    for token, value in common_token_map.items():
+        if token in lower_path:
+            return value, f"inferred approximate D0={value:g} mm from run-dir name"
 
     return math.nan, "missing"
 
@@ -492,7 +539,7 @@ def history_steps(steps_by_field: dict[str, list[int]], stride: int, max_states:
 
 
 def comparison_steps(steps_by_field: dict[str, list[int]], max_states: int) -> list[int]:
-    base = sorted(set(steps_by_field.get("liquid_alpha_rho", [])) | set(steps_by_field.get("pressure", [])))
+    base = saved_state_steps(steps_by_field)
     if not base:
         return []
     if len(base) > max_states:
@@ -501,17 +548,51 @@ def comparison_steps(steps_by_field: dict[str, list[int]], max_states: int) -> l
     return sorted(set(base))
 
 
+def saved_state_steps(steps_by_field: dict[str, list[int]]) -> list[int]:
+    candidates = []
+    for field in ("liquid_alpha_rho", "pressure", "liquid_alpha"):
+        candidates.extend(steps_by_field.get(field, []))
+    return sorted(set(candidates))
+
+
+def apply_saved_time_fallback(rows: list[dict], all_saved_steps: list[int], t_save: float | None) -> list[str]:
+    warnings = []
+    if not rows or t_save is None or not math.isfinite(t_save) or t_save <= 0.0:
+        return warnings
+
+    index_by_step = {step: idx for idx, step in enumerate(sorted(all_saved_steps))}
+    inferred_count = 0
+    for fallback_idx, row in enumerate(rows):
+        current_time = row.get("time", math.nan)
+        current_source = str(row.get("time_source", ""))
+        source_is_log_time = current_source == "run_time.inf" or current_source.startswith("nearest_run_time_step_")
+        if source_is_log_time and time_is_valid_nonzero(current_time):
+            continue
+        save_index = index_by_step.get(int(row["step"]), fallback_idx)
+        row["time"] = save_index*t_save
+        row["time_source"] = "inferred_from_t_save"
+        inferred_count += 1
+    if inferred_count:
+        warnings.append(
+            f"inferred time for {inferred_count} saved state(s) from output save index and t_save={t_save}"
+        )
+    return warnings
+
+
 def analysis_context(run_dir: Path) -> dict:
     log_summary = collect_log_summary(run_dir)
     fixed_dt = parse_fixed_dt(run_dir)
     adaptive_dt = parse_adaptive_dt(run_dir)
     d0_mm, d0_source = parse_d0_mm(run_dir)
+    t_save, t_save_source = parse_t_save(run_dir)
     return {
         "run_dir": run_dir,
         "log_summary": log_summary,
         "steps_by_field": available_steps(run_dir),
         "fixed_dt": fixed_dt,
         "adaptive_dt": adaptive_dt,
+        "t_save": t_save,
+        "t_save_source": t_save_source,
         "d0_mm": d0_mm,
         "d0_source": d0_source,
         "time_by_step": {int(row["step"]): row for row in log_summary["run_time_rows"]},
@@ -623,6 +704,7 @@ def final_mass_k(rows: list[dict], d0_mm: float) -> dict:
     d21 = float(last.get("D2_mass_mm2", math.nan))
     if not all(math.isfinite(v) for v in (t0, t1, d20, d21)) or t1 <= t0:
         return {"status": "insufficient", "reason": "invalid time or D2 values"}
+    fit = fit_mass_d2(rows)
     return {
         "status": "ok",
         "D0_mm": d0_mm,
@@ -638,7 +720,30 @@ def final_mass_k(rows: list[dict], d0_mm: float) -> dict:
         "D2_final_mm2": d21,
         "D2_mass_norm_final": float(last.get("D2_mass_norm", math.nan)),
         "K_mass_mm2_s": -(d21 - d20)/(t1 - t0),
+        "K_mass_mm2_s_fit": fit["K_mass_mm2_s_fit"],
+        "fit_R2": fit["R2"],
+        "fit_point_count": fit["point_count"],
     }
+
+
+def fit_mass_d2(rows: list[dict]) -> dict:
+    pairs = [
+        (float(row.get("time", math.nan)), float(row.get("D2_mass_mm2", math.nan)))
+        for row in rows
+        if math.isfinite(float(row.get("time", math.nan))) and math.isfinite(float(row.get("D2_mass_mm2", math.nan)))
+    ]
+    if len(pairs) < 2:
+        return {"K_mass_mm2_s_fit": math.nan, "R2": math.nan, "point_count": len(pairs)}
+    times = np.array([pair[0] for pair in pairs], dtype=float)
+    d2 = np.array([pair[1] for pair in pairs], dtype=float)
+    if np.ptp(times) <= 0.0:
+        return {"K_mass_mm2_s_fit": math.nan, "R2": math.nan, "point_count": len(pairs)}
+    slope, intercept = np.polyfit(times, d2, 1)
+    pred = slope*times + intercept
+    ss_res = float(np.sum((d2 - pred)**2))
+    ss_tot = float(np.sum((d2 - np.mean(d2))**2))
+    r2 = 1.0 - ss_res/ss_tot if ss_tot > 0.0 else 1.0
+    return {"K_mass_mm2_s_fit": -float(slope), "R2": r2, "point_count": len(pairs)}
 
 
 def final_species_deltas(rows: list[dict]) -> dict:
@@ -840,6 +945,7 @@ def plot_field_image(run_dir: Path, field_name: str, step: int, out_path: Path, 
 def comparison_rows_for_run(label: str, run_dir: Path, max_states: int) -> tuple[list[dict], dict, dict]:
     context = analysis_context(run_dir)
     steps = comparison_steps(context["steps_by_field"], max_states)
+    all_steps = saved_state_steps(context["steps_by_field"])
     rows = []
     for step in steps:
         row, _detail = analyze_state(
@@ -851,9 +957,19 @@ def comparison_rows_for_run(label: str, run_dir: Path, max_states: int) -> tuple
         )
         row["case"] = label
         rows.append(row)
+    warnings = apply_saved_time_fallback(rows, all_steps, context["t_save"])
     enrich_d2(rows, context["d0_mm"])
     d_count, d_size = directory_size(run_dir / "D")
     p_all_count, p_all_size = directory_size(run_dir / "p_all")
+    if context["d0_source"].startswith("inferred"):
+        warnings.append(f"D0_mm inferred from naming pattern: {context['d0_source']}")
+    if not math.isfinite(context["d0_mm"]):
+        warnings.append("D0_mm could not be parsed; dimensional D2 and K are unavailable")
+    if context["t_save"] is not None and context["t_save_source"] != "missing":
+        t_save_info = {"value": context["t_save"], "source": context["t_save_source"]}
+    else:
+        t_save_info = {"value": math.nan, "source": "missing"}
+    mass_d2_estimate = final_mass_k(rows, context["d0_mm"])
     meta = {
         "label": label,
         "run_dir": str(run_dir),
@@ -864,14 +980,21 @@ def comparison_rows_for_run(label: str, run_dir: Path, max_states: int) -> tuple
         "p_all_bytes": p_all_size,
         "fixed_dt_from_simulation_inp": context["fixed_dt"],
         "cfl_adap_dt": context["adaptive_dt"],
+        "t_save": t_save_info["value"],
+        "t_save_source": t_save_info["source"],
         "D0_mm": context["d0_mm"],
         "D0_source": context["d0_source"],
-        "mass_d2_estimate": final_mass_k(rows, context["d0_mm"]),
+        "D2_mass_norm_final": mass_d2_estimate.get("D2_mass_norm_final", math.nan),
+        "K_mass_mm2_s": mass_d2_estimate.get("K_mass_mm2_s", math.nan),
+        "K_mass_mm2_s_fit": mass_d2_estimate.get("K_mass_mm2_s_fit", math.nan),
+        "fit_R2": mass_d2_estimate.get("fit_R2", math.nan),
+        "mass_d2_estimate": mass_d2_estimate,
         "species_deltas": final_species_deltas(rows),
         "last_run_time": context["log_summary"]["last_run_time"],
         "min_dt_nonzero": context["log_summary"]["min_dt_nonzero"],
         "max_dt_nonzero": context["log_summary"]["max_dt_nonzero"],
         "max_time_nonzero": context["log_summary"]["max_time_nonzero"],
+        "warnings": warnings,
     }
     return rows, meta, context
 
@@ -964,8 +1087,11 @@ def run_single(args: argparse.Namespace) -> None:
     steps_by_field = context["steps_by_field"]
     chosen_steps = selected_steps(steps_by_field)
     trend_steps = history_steps(steps_by_field, args.history_stride, args.max_history_states)
+    all_saved_steps = saved_state_steps(steps_by_field)
     fixed_dt = context["fixed_dt"]
     adaptive_dt = context["adaptive_dt"]
+    t_save = context["t_save"]
+    t_save_source = context["t_save_source"]
     d0_mm = context["d0_mm"]
     d0_source = context["d0_source"]
     time_by_step = context["time_by_step"]
@@ -976,26 +1102,31 @@ def run_single(args: argparse.Namespace) -> None:
         row, detail = analyze_state(run_dir, step, time_by_step, fixed_dt, adaptive_dt)
         state_rows.append(row)
         state_details.append(detail)
+    notes = apply_saved_time_fallback(state_rows, all_saved_steps, t_save)
     enrich_d2(state_rows, d0_mm)
 
     trend_rows = []
     for step in trend_steps:
         row, _detail = analyze_state(run_dir, step, time_by_step, fixed_dt, adaptive_dt)
         trend_rows.append(row)
+    notes.extend(apply_saved_time_fallback(trend_rows, all_saved_steps, t_save))
     enrich_d2(trend_rows, d0_mm)
 
     d_count, d_size = directory_size(run_dir / "D")
     p_all_count, p_all_size = directory_size(run_dir / "p_all")
     plots, time_plot_source = maybe_write_plots(out_dir, trend_rows, log_summary["run_time_rows"], fixed_dt, adaptive_dt)
 
-    notes = []
     if all(not steps_by_field[name] for name in ("rhoY_C12H26", "rhoY_O2", "rhoY_CO2", "rhoY_H2O")):
         notes.append("chemistry/species raw fields are unavailable; this is expected for nonreacting chemistry-off cases")
     if log_summary["run_time_inf_dt_rounded_to_zero"] or log_summary["run_time_inf_time_rounded_to_zero"]:
         notes.append(
             "run_time.inf dt/time columns appear rounded to zero; saved-state times use "
-            "an approximate initial-dt mapping when no usable log time is available"
+            "t_save inference when available, otherwise an approximate initial-dt mapping"
         )
+    if d0_source.startswith("inferred"):
+        notes.append(f"D0_mm inferred from naming pattern: {d0_source}")
+    if not math.isfinite(d0_mm):
+        notes.append("D0_mm could not be parsed; dimensional D2 and K are unavailable")
 
     summary = {
         "run_dir": str(run_dir),
@@ -1010,6 +1141,8 @@ def run_single(args: argparse.Namespace) -> None:
         "trend_steps": trend_steps,
         "fixed_dt_from_simulation_inp": fixed_dt,
         "cfl_adap_dt": adaptive_dt,
+        "t_save": t_save if t_save is not None else math.nan,
+        "t_save_source": t_save_source,
         "D0_mm": d0_mm,
         "D0_source": d0_source,
         "mass_d2_estimate": final_mass_k(state_rows, d0_mm),
