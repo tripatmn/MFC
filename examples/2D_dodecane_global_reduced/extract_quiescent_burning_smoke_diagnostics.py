@@ -67,6 +67,26 @@ KEYWORDS = (
     "stuck",
 )
 
+DODECANE_VAPOR_GAMMA = 1.025
+DODECANE_VAPOR_CV = 1956.0
+AIR_GAMMA = 1.4
+AIR_CV = 739.0
+VAPOR_GAS_CONSTANT = (DODECANE_VAPOR_GAMMA - 1.0) * DODECANE_VAPOR_CV
+AIR_GAS_CONSTANT = (AIR_GAMMA - 1.0) * AIR_CV
+TMAX_LIQUID_ALPHA_MAX = 1.0e-2
+TMAX_GAS_ALPHA_MIN = 1.0e-2
+TMAX_GAS_ALPHA_RHO_MIN = 1.0e-6
+TMAX_MASK_CRITERIA = {
+    "exclude_liquid_alpha_greater_than": TMAX_LIQUID_ALPHA_MAX,
+    "require_vapor_plus_air_alpha_at_least": TMAX_GAS_ALPHA_MIN,
+    "require_vapor_plus_air_alpha_rho_at_least": TMAX_GAS_ALPHA_RHO_MIN,
+    "require_positive_finite_pressure": True,
+    "temperature_formula": "T = p / ((rho_v + rho_air) * R_mix)",
+    "R_mix_formula": "R_mix = (rho_v*R_vapor + rho_air*R_air)/(rho_v + rho_air)",
+    "R_vapor_J_kg_K": VAPOR_GAS_CONSTANT,
+    "R_air_J_kg_K": AIR_GAS_CONSTANT,
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -388,6 +408,112 @@ def combined_field_stats(fields: dict[str, dict], names: tuple[str, ...]) -> dic
     }
 
 
+def reconstructed_temperature_diagnostics(fields: dict[str, dict]) -> dict:
+    required = ("pressure", "vapor_alpha_rho", "air_alpha_rho", "liquid_alpha", "vapor_alpha", "air_alpha")
+    if not all(fields[name]["available"] for name in required):
+        return {
+            "available": False,
+            "source": "missing_pressure_gas_alpha_rho_or_alpha_mask_field",
+            "mask_criteria": TMAX_MASK_CRITERIA,
+            "point_count": 0,
+            "candidate_count": 0,
+            "finite_count": 0,
+            "invalid_count": 0,
+            "masked_liquid_count": 0,
+            "masked_gas_alpha_count": 0,
+            "masked_gas_alpha_rho_count": 0,
+            "Tmax_gas": math.nan,
+            "Tmax_gas_x": math.nan,
+            "Tmax_gas_y": math.nan,
+        }
+
+    keys = set(fields["pressure"]["values"])
+    for name in required[1:]:
+        keys &= set(fields[name]["values"])
+    tmax = -math.inf
+    tmax_x = math.nan
+    tmax_y = math.nan
+    candidate_count = 0
+    finite_count = 0
+    invalid_count = 0
+    masked_liquid_count = 0
+    masked_gas_alpha_count = 0
+    masked_gas_alpha_rho_count = 0
+
+    for key in keys:
+        pressure = fields["pressure"]["values"][key]
+        rho_v = fields["vapor_alpha_rho"]["values"][key]
+        rho_air = fields["air_alpha_rho"]["values"][key]
+        alpha_l = fields["liquid_alpha"]["values"][key]
+        alpha_v = fields["vapor_alpha"]["values"][key]
+        alpha_air = fields["air_alpha"]["values"][key]
+        rho_g = rho_v + rho_air
+        alpha_g = alpha_v + alpha_air
+        if not math.isfinite(alpha_l) or alpha_l > TMAX_LIQUID_ALPHA_MAX:
+            masked_liquid_count += 1
+            continue
+        if not math.isfinite(alpha_g) or alpha_g < TMAX_GAS_ALPHA_MIN:
+            masked_gas_alpha_count += 1
+            continue
+        if not math.isfinite(rho_g) or rho_g < TMAX_GAS_ALPHA_RHO_MIN:
+            masked_gas_alpha_rho_count += 1
+            continue
+        candidate_count += 1
+        if (
+            not math.isfinite(pressure)
+            or not math.isfinite(rho_v)
+            or not math.isfinite(rho_air)
+            or pressure <= 0.0
+        ):
+            invalid_count += 1
+            continue
+        r_mix = (rho_v*VAPOR_GAS_CONSTANT + rho_air*AIR_GAS_CONSTANT) / rho_g
+        if not math.isfinite(r_mix) or r_mix <= 0.0:
+            invalid_count += 1
+            continue
+        temperature = pressure / (rho_g*r_mix)
+        if not math.isfinite(temperature):
+            invalid_count += 1
+            continue
+        finite_count += 1
+        if temperature > tmax:
+            tmax = temperature
+            tmax_x, tmax_y = key
+
+    if finite_count == 0:
+        return {
+            "available": False,
+            "source": "gas_masked_pressure_over_gas_alpha_rho_Rmix",
+            "mask_criteria": TMAX_MASK_CRITERIA,
+            "point_count": len(keys),
+            "candidate_count": candidate_count,
+            "finite_count": 0,
+            "invalid_count": invalid_count,
+            "masked_liquid_count": masked_liquid_count,
+            "masked_gas_alpha_count": masked_gas_alpha_count,
+            "masked_gas_alpha_rho_count": masked_gas_alpha_rho_count,
+            "Tmax_gas": math.nan,
+            "Tmax_gas_x": math.nan,
+            "Tmax_gas_y": math.nan,
+        }
+
+    return {
+        "available": True,
+        "source": "gas_masked_pressure_over_gas_alpha_rho_Rmix",
+        "mask_criteria": TMAX_MASK_CRITERIA,
+        "point_count": len(keys),
+        "candidate_count": candidate_count,
+        "finite_count": finite_count,
+        "invalid_count": invalid_count,
+        "masked_liquid_count": masked_liquid_count,
+        "masked_gas_alpha_count": masked_gas_alpha_count,
+        "masked_gas_alpha_rho_count": masked_gas_alpha_rho_count,
+        "Tmax_gas": float(tmax),
+        "Tmax_gas_x": float(tmax_x),
+        "Tmax_gas_y": float(tmax_y),
+    }
+
+
 def time_row_is_usable(step: int, row: dict) -> bool:
     time = float(row.get("time", math.nan))
     return math.isfinite(time) and (step == 0 or time > 0.0)
@@ -512,6 +638,25 @@ def parse_d0_mm(run_dir: Path) -> tuple[float, str]:
     return math.nan, "missing"
 
 
+def parse_droplet_center_m(run_dir: Path) -> tuple[float, float, str]:
+    text = run_text(run_dir)
+    number = NUM_RE.pattern
+
+    def parse_component(name: str) -> float | None:
+        patterns = [rf"patch_icpp\(2\)%{name}[^0-9+\-.]*({number})"]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return float(match.group(1))
+        return None
+
+    x = parse_component("x_centroid")
+    y = parse_component("y_centroid")
+    if x is not None and y is not None:
+        return x, y, "patch_icpp(2)%x_centroid/y_centroid"
+    return 0.0, 0.0, "default_centered_droplet"
+
+
 def selected_steps(steps_by_field: dict[str, list[int]]) -> list[int]:
     candidates = []
     for field in ("liquid_alpha_rho", "pressure", "liquid_alpha"):
@@ -584,6 +729,7 @@ def analysis_context(run_dir: Path) -> dict:
     fixed_dt = parse_fixed_dt(run_dir)
     adaptive_dt = parse_adaptive_dt(run_dir)
     d0_mm, d0_source = parse_d0_mm(run_dir)
+    center_x, center_y, center_source = parse_droplet_center_m(run_dir)
     t_save, t_save_source = parse_t_save(run_dir)
     return {
         "run_dir": run_dir,
@@ -595,6 +741,8 @@ def analysis_context(run_dir: Path) -> dict:
         "t_save_source": t_save_source,
         "d0_mm": d0_mm,
         "d0_source": d0_source,
+        "droplet_center_m": (center_x, center_y),
+        "droplet_center_source": center_source,
         "time_by_step": {int(row["step"]): row for row in log_summary["run_time_rows"]},
     }
 
@@ -645,6 +793,30 @@ def analyze_state(run_dir: Path, step: int, time_by_step: dict[int, dict], fixed
         row[f"{label}_nonfinite_count"] = stats["nonfinite_count"]
         row[f"{label}_integral"] = stats["sum"] * d_area if stats["available"] and math.isfinite(d_area) else math.nan
 
+    t_diag = reconstructed_temperature_diagnostics(fields)
+    detail["reconstructed_temperature"] = t_diag
+    row["Tmax_available"] = t_diag["available"]
+    row["Tmax_reconstruction_source"] = t_diag["source"]
+    row["Tmax_mask_criteria"] = json.dumps(t_diag.get("mask_criteria", TMAX_MASK_CRITERIA), sort_keys=True)
+    row["Tmax_point_count"] = t_diag["point_count"]
+    row["Tmax_candidate_count"] = t_diag["candidate_count"]
+    row["Tmax_finite_count"] = t_diag["finite_count"]
+    row["Tmax_invalid_count"] = t_diag["invalid_count"]
+    row["Tmax_masked_liquid_count"] = t_diag["masked_liquid_count"]
+    row["Tmax_masked_gas_alpha_count"] = t_diag["masked_gas_alpha_count"]
+    row["Tmax_masked_gas_alpha_rho_count"] = t_diag["masked_gas_alpha_rho_count"]
+    row["Tmax_gas_K"] = t_diag["Tmax_gas"]
+    row["Tmax_gas_x_m"] = t_diag["Tmax_gas_x"]
+    row["Tmax_gas_y_m"] = t_diag["Tmax_gas_y"]
+    row["Tmax_K"] = row["Tmax_gas_K"]
+    row["Tmax_x_m"] = row["Tmax_gas_x_m"]
+    row["Tmax_y_m"] = row["Tmax_gas_y_m"]
+    row["reaction_heat_source_available"] = False
+    row["reaction_heat_source_note"] = "reaction heat/source raw field is not part of the current extractor field map"
+    row["reaction_heat_source_min"] = math.nan
+    row["reaction_heat_source_max"] = math.nan
+    row["reaction_heat_source_integral"] = math.nan
+
     row["finite_loaded_fields"] = all(
         not bool(detail["fields"][name].get("nonfinite_count", 0))
         for name in detail["fields"]
@@ -693,6 +865,54 @@ def enrich_d2(rows: list[dict], d0_mm: float) -> None:
             row["liquid_alpha_integral"] = math.nan
 
 
+def enrich_section34(rows: list[dict], d0_mm: float, droplet_center_m: tuple[float, float]) -> None:
+    if not rows:
+        return
+    cx, cy = droplet_center_m
+    r0_m = 0.5*d0_mm*1.0e-3 if math.isfinite(d0_mm) else math.nan
+    for row in rows:
+        x = float(row.get("Tmax_x_m", math.nan))
+        y = float(row.get("Tmax_y_m", math.nan))
+        if math.isfinite(x) and math.isfinite(y) and math.isfinite(cx) and math.isfinite(cy):
+            radius = math.hypot(x - cx, y - cy)
+        else:
+            radius = math.nan
+        row["Tmax_radius_m"] = radius
+        row["Tmax_radius_over_R0"] = radius/r0_m if math.isfinite(radius) and math.isfinite(r0_m) and r0_m > 0.0 else math.nan
+
+
+def tmax_summary(rows: list[dict]) -> dict:
+    valid = [
+        row for row in rows
+        if math.isfinite(float(row.get("Tmax_gas_K", math.nan)))
+    ]
+    if not valid:
+        return {
+            "status": "missing",
+            "reason": "no gas-masked reconstructed temperature diagnostics available",
+            "mask_criteria": TMAX_MASK_CRITERIA,
+        }
+    max_row = max(valid, key=lambda row: float(row.get("Tmax_gas_K", math.nan)))
+    final = valid[-1]
+    return {
+        "status": "ok",
+        "mask_criteria": TMAX_MASK_CRITERIA,
+        "Tmax_gas_max_K": float(max_row["Tmax_gas_K"]),
+        "Tmax_max_step": int(max_row["step"]),
+        "Tmax_max_time_s": float(max_row.get("time", math.nan)),
+        "Tmax_gas_max_x_m": float(max_row.get("Tmax_gas_x_m", math.nan)),
+        "Tmax_gas_max_y_m": float(max_row.get("Tmax_gas_y_m", math.nan)),
+        "Tmax_max_radius_over_R0": float(max_row.get("Tmax_radius_over_R0", math.nan)),
+        "Tmax_gas_final_K": float(final["Tmax_gas_K"]),
+        "Tmax_final_step": int(final["step"]),
+        "Tmax_final_time_s": float(final.get("time", math.nan)),
+        "Tmax_final_radius_over_R0": float(final.get("Tmax_radius_over_R0", math.nan)),
+        "Tmax_max_K": float(max_row["Tmax_gas_K"]),
+        "Tmax_final_K": float(final["Tmax_gas_K"]),
+        "temperature_reconstruction_source": str(final.get("Tmax_reconstruction_source", "")),
+    }
+
+
 def final_mass_k(rows: list[dict], d0_mm: float) -> dict:
     if len(rows) < 2 or not math.isfinite(d0_mm):
         return {"status": "insufficient", "reason": "need at least two states and D0"}
@@ -705,6 +925,7 @@ def final_mass_k(rows: list[dict], d0_mm: float) -> dict:
     if not all(math.isfinite(v) for v in (t0, t1, d20, d21)) or t1 <= t0:
         return {"status": "insufficient", "reason": "invalid time or D2 values"}
     fit = fit_mass_d2(rows)
+    late_fit = fit_mass_d2_late(rows)
     return {
         "status": "ok",
         "D0_mm": d0_mm,
@@ -723,6 +944,13 @@ def final_mass_k(rows: list[dict], d0_mm: float) -> dict:
         "K_mass_mm2_s_fit": fit["K_mass_mm2_s_fit"],
         "fit_R2": fit["R2"],
         "fit_point_count": fit["point_count"],
+        "K_mass_mm2_s_fit_late": late_fit["K_mass_mm2_s_fit_late"],
+        "fit_R2_late": late_fit["fit_R2_late"],
+        "fit_late_point_count": late_fit["fit_late_point_count"],
+        "fit_late_step_start": late_fit["fit_late_step_start"],
+        "fit_late_step_end": late_fit["fit_late_step_end"],
+        "fit_late_time_start_s": late_fit["fit_late_time_start_s"],
+        "fit_late_time_end_s": late_fit["fit_late_time_end_s"],
     }
 
 
@@ -744,6 +972,49 @@ def fit_mass_d2(rows: list[dict]) -> dict:
     ss_tot = float(np.sum((d2 - np.mean(d2))**2))
     r2 = 1.0 - ss_res/ss_tot if ss_tot > 0.0 else 1.0
     return {"K_mass_mm2_s_fit": -float(slope), "R2": r2, "point_count": len(pairs)}
+
+
+def fit_mass_d2_late(rows: list[dict]) -> dict:
+    late_rows = rows[2:]
+    out = {
+        "K_mass_mm2_s_fit_late": math.nan,
+        "fit_R2_late": math.nan,
+        "fit_late_point_count": len(late_rows),
+        "fit_late_step_start": math.nan,
+        "fit_late_step_end": math.nan,
+        "fit_late_time_start_s": math.nan,
+        "fit_late_time_end_s": math.nan,
+    }
+    if late_rows:
+        out["fit_late_step_start"] = int(late_rows[0].get("step", 0))
+        out["fit_late_step_end"] = int(late_rows[-1].get("step", 0))
+        out["fit_late_time_start_s"] = float(late_rows[0].get("time", math.nan))
+        out["fit_late_time_end_s"] = float(late_rows[-1].get("time", math.nan))
+    if len(late_rows) < 3:
+        return out
+
+    valid_rows = [
+        row for row in late_rows
+        if math.isfinite(float(row.get("time", math.nan))) and math.isfinite(float(row.get("D2_mass_mm2", math.nan)))
+    ]
+    out["fit_late_point_count"] = len(valid_rows)
+    if len(valid_rows) < 3:
+        return out
+    times = np.array([float(row["time"]) for row in valid_rows], dtype=float)
+    d2 = np.array([float(row["D2_mass_mm2"]) for row in valid_rows], dtype=float)
+    if np.ptp(times) <= 0.0:
+        return out
+    slope, intercept = np.polyfit(times, d2, 1)
+    pred = slope*times + intercept
+    ss_res = float(np.sum((d2 - pred)**2))
+    ss_tot = float(np.sum((d2 - np.mean(d2))**2))
+    out["K_mass_mm2_s_fit_late"] = -float(slope)
+    out["fit_R2_late"] = 1.0 - ss_res/ss_tot if ss_tot > 0.0 else 1.0
+    out["fit_late_step_start"] = int(valid_rows[0].get("step", 0))
+    out["fit_late_step_end"] = int(valid_rows[-1].get("step", 0))
+    out["fit_late_time_start_s"] = float(times[0])
+    out["fit_late_time_end_s"] = float(times[-1])
+    return out
 
 
 def final_species_deltas(rows: list[dict]) -> dict:
@@ -841,6 +1112,90 @@ def time_history_for_plot(run_time_rows: list[dict], fixed_dt: float | None, ada
     ], source
 
 
+def finite_plot_pairs(rows: list[dict], field: str) -> list[tuple[float, float]]:
+    pairs = []
+    for row in rows:
+        time = float(row.get("time", math.nan))
+        value = float(row.get(field, math.nan))
+        if math.isfinite(time) and math.isfinite(value):
+            pairs.append((time, value))
+    return pairs
+
+
+def write_section34_plots(out_dir: Path, rows_by_label: dict[str, list[dict]]) -> list[str]:
+    ensure_matplotlib_config(out_dir)
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return []
+
+    paths: list[str] = []
+    specs = [
+        ("Tmax_gas_K", "Tmax_vs_time.png", "Maximum reconstructed gas temperature", "Tmax_gas [K]"),
+        ("D2_mass_norm", "D2_mass_norm_vs_time.png", "Mass-equivalent normalized D2", "D2 / D0^2"),
+        ("Tmax_radius_over_R0", "Tmax_radius_over_R0_vs_time.png", "Maximum-temperature radius", "r_Tmax / R0"),
+    ]
+    for field, filename, title, ylabel in specs:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        wrote_any = False
+        for label, rows in rows_by_label.items():
+            pairs = finite_plot_pairs(rows, field)
+            if not pairs:
+                continue
+            times, values = zip(*pairs)
+            ax.plot(times, values, marker="o", linewidth=1.5, label=label)
+            wrote_any = True
+        if not wrote_any:
+            plt.close(fig)
+            continue
+        ax.set_xlabel("Time [s]")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        path = out_dir / filename
+        fig.tight_layout()
+        fig.savefig(path, dpi=170)
+        plt.close(fig)
+        paths.append(str(path))
+
+    fig, ax_t = plt.subplots(figsize=(7, 4.5))
+    ax_d2 = ax_t.twinx()
+    wrote_any = False
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
+    for idx, (label, rows) in enumerate(rows_by_label.items()):
+        color = colors[idx % len(colors)]
+        t_pairs = finite_plot_pairs(rows, "Tmax_gas_K")
+        d_pairs = finite_plot_pairs(rows, "D2_mass_norm")
+        if t_pairs:
+            times, values = zip(*t_pairs)
+            ax_t.plot(times, values, marker="o", linewidth=1.5, color=color, label=f"{label} Tmax_gas")
+            wrote_any = True
+        if d_pairs:
+            times, values = zip(*d_pairs)
+            ax_d2.plot(times, values, marker="s", linewidth=1.5, linestyle="--", color=color, label=f"{label} D2/D0^2")
+            wrote_any = True
+    if wrote_any:
+        ax_t.set_xlabel("Time [s]")
+        ax_t.set_ylabel("Tmax_gas [K]")
+        ax_d2.set_ylabel("D2 / D0^2")
+        ax_t.set_title("Maximum temperature and normalized D2")
+        ax_t.grid(True, alpha=0.3)
+        handles_t, labels_t = ax_t.get_legend_handles_labels()
+        handles_d, labels_d = ax_d2.get_legend_handles_labels()
+        ax_t.legend(handles_t + handles_d, labels_t + labels_d, loc="best")
+        path = out_dir / "Tmax_and_D2_norm_combined.png"
+        fig.tight_layout()
+        fig.savefig(path, dpi=170)
+        paths.append(str(path))
+    plt.close(fig)
+
+    return paths
+
+
 def maybe_write_plots(out_dir: Path, rows: list[dict], run_time_rows: list[dict], fixed_dt: float | None, adaptive_dt: bool) -> tuple[list[str], str]:
     ensure_matplotlib_config(out_dir)
     try:
@@ -892,6 +1247,7 @@ def maybe_write_plots(out_dir: Path, rows: list[dict], run_time_rows: list[dict]
             fig.savefig(path, dpi=160)
             plt.close(fig)
             paths.append(str(path))
+    paths.extend(write_section34_plots(out_dir, {"Run": rows}))
     return paths, time_plot_source
 
 
@@ -959,6 +1315,7 @@ def comparison_rows_for_run(label: str, run_dir: Path, max_states: int) -> tuple
         rows.append(row)
     warnings = apply_saved_time_fallback(rows, all_steps, context["t_save"])
     enrich_d2(rows, context["d0_mm"])
+    enrich_section34(rows, context["d0_mm"], context["droplet_center_m"])
     d_count, d_size = directory_size(run_dir / "D")
     p_all_count, p_all_size = directory_size(run_dir / "p_all")
     if context["d0_source"].startswith("inferred"):
@@ -984,11 +1341,21 @@ def comparison_rows_for_run(label: str, run_dir: Path, max_states: int) -> tuple
         "t_save_source": t_save_info["source"],
         "D0_mm": context["d0_mm"],
         "D0_source": context["d0_source"],
+        "droplet_center_m": context["droplet_center_m"],
+        "droplet_center_source": context["droplet_center_source"],
         "D2_mass_norm_final": mass_d2_estimate.get("D2_mass_norm_final", math.nan),
         "K_mass_mm2_s": mass_d2_estimate.get("K_mass_mm2_s", math.nan),
         "K_mass_mm2_s_fit": mass_d2_estimate.get("K_mass_mm2_s_fit", math.nan),
         "fit_R2": mass_d2_estimate.get("fit_R2", math.nan),
+        "K_mass_mm2_s_fit_late": mass_d2_estimate.get("K_mass_mm2_s_fit_late", math.nan),
+        "fit_R2_late": mass_d2_estimate.get("fit_R2_late", math.nan),
+        "fit_late_point_count": mass_d2_estimate.get("fit_late_point_count", 0),
+        "fit_late_step_start": mass_d2_estimate.get("fit_late_step_start", math.nan),
+        "fit_late_step_end": mass_d2_estimate.get("fit_late_step_end", math.nan),
+        "fit_late_time_start_s": mass_d2_estimate.get("fit_late_time_start_s", math.nan),
+        "fit_late_time_end_s": mass_d2_estimate.get("fit_late_time_end_s", math.nan),
         "mass_d2_estimate": mass_d2_estimate,
+        "frolov_section34": tmax_summary(rows),
         "species_deltas": final_species_deltas(rows),
         "last_run_time": context["log_summary"]["last_run_time"],
         "min_dt_nonzero": context["log_summary"]["min_dt_nonzero"],
@@ -1041,6 +1408,7 @@ def maybe_write_comparison_plots(out_dir: Path, rows_by_label: dict[str, list[di
         fig.savefig(path, dpi=170)
         plt.close(fig)
         paths.append(str(path))
+    paths.extend(write_section34_plots(out_dir, rows_by_label))
     return paths, "ok"
 
 
@@ -1087,6 +1455,7 @@ def run_single(args: argparse.Namespace) -> None:
     steps_by_field = context["steps_by_field"]
     chosen_steps = selected_steps(steps_by_field)
     trend_steps = history_steps(steps_by_field, args.history_stride, args.max_history_states)
+    fit_steps = comparison_steps(steps_by_field, args.comparison_max_states)
     all_saved_steps = saved_state_steps(steps_by_field)
     fixed_dt = context["fixed_dt"]
     adaptive_dt = context["adaptive_dt"]
@@ -1094,6 +1463,7 @@ def run_single(args: argparse.Namespace) -> None:
     t_save_source = context["t_save_source"]
     d0_mm = context["d0_mm"]
     d0_source = context["d0_source"]
+    droplet_center_m = context["droplet_center_m"]
     time_by_step = context["time_by_step"]
 
     state_rows = []
@@ -1104,6 +1474,7 @@ def run_single(args: argparse.Namespace) -> None:
         state_details.append(detail)
     notes = apply_saved_time_fallback(state_rows, all_saved_steps, t_save)
     enrich_d2(state_rows, d0_mm)
+    enrich_section34(state_rows, d0_mm, droplet_center_m)
 
     trend_rows = []
     for step in trend_steps:
@@ -1111,6 +1482,16 @@ def run_single(args: argparse.Namespace) -> None:
         trend_rows.append(row)
     notes.extend(apply_saved_time_fallback(trend_rows, all_saved_steps, t_save))
     enrich_d2(trend_rows, d0_mm)
+    enrich_section34(trend_rows, d0_mm, droplet_center_m)
+
+    fit_rows = []
+    for step in fit_steps:
+        row, _detail = analyze_state(run_dir, step, time_by_step, fixed_dt, adaptive_dt)
+        fit_rows.append(row)
+    notes.extend(apply_saved_time_fallback(fit_rows, all_saved_steps, t_save))
+    enrich_d2(fit_rows, d0_mm)
+    enrich_section34(fit_rows, d0_mm, droplet_center_m)
+    mass_rows = fit_rows if len(fit_rows) >= len(state_rows) else state_rows
 
     d_count, d_size = directory_size(run_dir / "D")
     p_all_count, p_all_size = directory_size(run_dir / "p_all")
@@ -1139,13 +1520,17 @@ def run_single(args: argparse.Namespace) -> None:
         "fields": {name: {"kind": kind, "index": index, "steps": steps_by_field[name]} for name, (kind, index) in FIELDS.items()},
         "selected_steps": chosen_steps,
         "trend_steps": trend_steps,
+        "fit_steps": fit_steps,
         "fixed_dt_from_simulation_inp": fixed_dt,
         "cfl_adap_dt": adaptive_dt,
         "t_save": t_save if t_save is not None else math.nan,
         "t_save_source": t_save_source,
         "D0_mm": d0_mm,
         "D0_source": d0_source,
-        "mass_d2_estimate": final_mass_k(state_rows, d0_mm),
+        "droplet_center_m": droplet_center_m,
+        "droplet_center_source": context["droplet_center_source"],
+        "mass_d2_estimate": final_mass_k(mass_rows, d0_mm),
+        "frolov_section34": tmax_summary(mass_rows),
         "species_deltas": final_species_deltas(state_rows),
         "last_run_time": log_summary["last_run_time"],
         "min_dt": log_summary["min_dt"],
