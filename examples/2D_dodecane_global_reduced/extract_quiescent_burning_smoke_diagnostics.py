@@ -832,7 +832,7 @@ def analyze_state(run_dir: Path, step: int, time_by_step: dict[int, dict], fixed
 
 
 def short_prefix(name: str) -> str:
-    return {
+    prefixes = {
         "pressure": "pressure",
         "liquid_alpha_rho": "liq_arho",
         "vapor_alpha_rho": "vap_arho",
@@ -844,7 +844,16 @@ def short_prefix(name: str) -> str:
         "rhoY_O2": "rhoY_O2",
         "rhoY_CO2": "rhoY_CO2",
         "rhoY_H2O": "rhoY_H2O",
-    }[name]
+        "rhoY_OH": "rhoY_OH",
+        "rhoY_HO2": "rhoY_HO2",
+        "rhoY_H2O2": "rhoY_H2O2",
+        "rhoY_oh": "rhoY_OH",
+        "rhoY_ho2": "rhoY_HO2",
+        "rhoY_h2o2": "rhoY_H2O2",
+    }
+    if name in prefixes:
+        return prefixes[name]
+    return re.sub(r"[^0-9A-Za-z_]+", "_", name).strip("_") or "field"
 
 
 def enrich_d2(rows: list[dict], d0_mm: float) -> None:
