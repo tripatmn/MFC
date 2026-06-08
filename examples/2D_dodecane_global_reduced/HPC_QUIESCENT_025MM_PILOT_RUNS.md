@@ -369,6 +369,54 @@ species signs of C12H26/O2 decreasing with CO2/H2O increasing. FAIL means NaNs,
 pressure blowup, severe timestep collapse, stall, or species/energy
 pathologies; extract diagnostics before changing conditions.
 
+## Frolov 0.7 mm T700 Reitz Smoke
+
+This is the first multiphase smoke test with the Cantera
+`nDodecane_Reitz.yaml` mechanism (`nDodecane_IG`, about 100 species and 553
+reactions). It keeps the Frolov bridge conditions but intentionally uses a
+`128 x 128` smoke grid and only runs to `t_stop = 1.0e-6 s`; this is not the
+final 32-cells/D validation grid or a validation-length run.
+
+Setup:
+
+```bash
+RUN_ROOT="$PWD/runs/frolov_dodecane_validation"
+mkdir -p "$RUN_ROOT/070mm_T700_reitz_smoke_n1"
+
+cp examples/2D_dodecane_global_reduced/case_hpc_d2_frolov_dodecane_070mm_T700_reitz_smoke.py \
+  "$RUN_ROOT/070mm_T700_reitz_smoke_n1/case.py"
+```
+
+JSON emission check:
+
+```bash
+build/venv/bin/python "$RUN_ROOT/070mm_T700_reitz_smoke_n1/case.py" --mfc '{}' \
+  > "$RUN_ROOT/070mm_T700_reitz_smoke_n1/case.json"
+```
+
+Run one rank first:
+
+```bash
+./mfc.sh run "$RUN_ROOT/070mm_T700_reitz_smoke_n1/case.py" \
+  -t pre_process simulation \
+  --gpu acc -n 1 -j 4 --clean -b mpirun
+```
+
+Extract compact diagnostics after completion:
+
+```bash
+build/venv/bin/python examples/2D_dodecane_global_reduced/extract_quiescent_burning_smoke_diagnostics.py \
+  --run-dir "$RUN_ROOT/070mm_T700_reitz_smoke_n1" \
+  --out-dir "$RUN_ROOT/070mm_T700_reitz_smoke_n1_diagnostics"
+```
+
+PASS means codegen/build/pre_process/simulation complete, the case reaches
+`1.0e-6 s`, pressure and density remain finite, liquid/vapor budgets remain
+bounded, and species diagnostics show physically sensible reactant/product or
+radical movement. Stop and preserve the folder if codegen fails, build time is
+impractical, NaNs appear, pressure blows up, `dt` collapses severely, or the
+run stalls before the first few saves.
+
 ## Run Burning After Nonreacting Passes
 
 The burning case uses the baseline one-step mechanism, reactions on, and

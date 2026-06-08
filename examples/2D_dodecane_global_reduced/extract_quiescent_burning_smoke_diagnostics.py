@@ -37,6 +37,9 @@ FIELDS = {
     "rhoY_O2": ("cons", 14),
     "rhoY_CO2": ("cons", 16),
     "rhoY_H2O": ("cons", 17),
+    "rhoY_OH": ("cons", 20),
+    "rhoY_H2O2": ("cons", 21),
+    "rhoY_HO2": ("cons", 22),
 }
 
 STATE_FIELD_ORDER = (
@@ -51,6 +54,9 @@ STATE_FIELD_ORDER = (
     "rhoY_O2",
     "rhoY_CO2",
     "rhoY_H2O",
+    "rhoY_OH",
+    "rhoY_H2O2",
+    "rhoY_HO2",
 )
 
 KEYWORDS = (
@@ -1030,7 +1036,7 @@ def final_species_deltas(rows: list[dict]) -> dict:
         "time_final_s": float(last.get("time", math.nan)),
     }
     any_available = False
-    for species in ("C12H26", "O2", "CO2", "H2O"):
+    for species in ("C12H26", "O2", "CO2", "H2O", "OH", "H2O2", "HO2"):
         key = f"rhoY_{species}_sum"
         initial = float(first.get(key, math.nan))
         final = float(last.get(key, math.nan))
@@ -1434,7 +1440,15 @@ def maybe_write_comparison_field_images(out_dir: Path, run_contexts: dict[str, d
         if label == "Burning":
             specs.extend(
                 (field, last_step, f"burning_final_{field}.png", f"Burning final {field}")
-                for field in ("rhoY_C12H26", "rhoY_O2", "rhoY_CO2", "rhoY_H2O")
+                for field in (
+                    "rhoY_C12H26",
+                    "rhoY_O2",
+                    "rhoY_CO2",
+                    "rhoY_H2O",
+                    "rhoY_OH",
+                    "rhoY_H2O2",
+                    "rhoY_HO2",
+                )
             )
         for field, step, filename, title in specs:
             ok, message = plot_field_image(context["run_dir"], field, step, out_dir / filename, title)
