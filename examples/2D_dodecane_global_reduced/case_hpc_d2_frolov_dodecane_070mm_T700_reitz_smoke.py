@@ -46,6 +46,9 @@ import case_hpc_d2_quiescent_evap_025mm_pilot as base
 
 sol = ct.Solution(CTFILE, CTPHASE)
 sol.TPX = 700.0, 1.0e5, "o2:0.21,n2:0.79"
+air_Y = sol.Y
+sol.TPX = 700.0, 1.0e5, "c12h26:1.0"
+fuel_vapor_Y = sol.Y
 species_indices = {
     species: sol.species_index(species) + 1
     for species in KEY_SPECIES
@@ -74,9 +77,13 @@ base.t_save = 1.0e-7
 
 
 def add_reitz_species_ic(case):
-    for pid in (1, 2):
-        for i, value in enumerate(sol.Y, start=1):
-            case[f"patch_icpp({pid})%Y({i})"] = float(value)
+    # Patch 1 is the ambient gas. Patch 2 is the liquid droplet override; its
+    # trace gas/vapor content is initialized as dodecane vapor so the short
+    # Reitz smoke does not depend on resolving appreciable evaporation first.
+    for i, value in enumerate(air_Y, start=1):
+        case[f"patch_icpp(1)%Y({i})"] = float(value)
+    for i, value in enumerate(fuel_vapor_Y, start=1):
+        case[f"patch_icpp(2)%Y({i})"] = float(value)
 
     for species, index in species_indices.items():
         case[f"chem_wrt_Y({index})"] = "T"
