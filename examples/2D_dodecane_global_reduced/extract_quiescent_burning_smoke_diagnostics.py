@@ -1063,6 +1063,69 @@ def final_species_deltas(rows: list[dict]) -> dict:
     return out
 
 
+def compact_smoke_summary(rows: list[dict]) -> dict:
+    if not rows:
+        return {"status": "missing", "reason": "no analyzed saved states"}
+
+    pressure_mins = [
+        float(row.get("pressure_min", math.nan))
+        for row in rows
+        if math.isfinite(float(row.get("pressure_min", math.nan)))
+    ]
+    pressure_maxs = [
+        float(row.get("pressure_max", math.nan))
+        for row in rows
+        if math.isfinite(float(row.get("pressure_max", math.nan)))
+    ]
+    final = rows[-1]
+    species = final_species_deltas(rows)
+
+    nonfinite_keys = sorted({key for row in rows for key in row if key.endswith("_nonfinite_count")})
+    nonfinite = {}
+    total_nonfinite = 0
+    for key in nonfinite_keys:
+        counts = [
+            int(float(row.get(key, 0) or 0))
+            for row in rows
+            if math.isfinite(float(row.get(key, 0) or 0))
+        ]
+        if not counts:
+            continue
+        nonfinite[key] = {"max": max(counts), "sum": sum(counts)}
+        total_nonfinite += sum(counts)
+
+    intermediates_zero = True
+    for species_name in ("OH", "H2O2", "HO2"):
+        item = species.get(species_name, {})
+        values = [
+            float(item.get(field, math.nan))
+            for field in ("initial_sum", "final_sum", "delta_sum")
+            if math.isfinite(float(item.get(field, math.nan)))
+        ]
+        if item.get("available") and any(abs(value) > 0.0 for value in values):
+            intermediates_zero = False
+
+    return {
+        "status": "ok",
+        "step_final": int(final.get("step", 0)),
+        "time_final_s": float(final.get("time", math.nan)),
+        "D2_mass_norm_final": float(final.get("D2_mass_norm", math.nan)),
+        "pressure_min_over_saved_states": min(pressure_mins) if pressure_mins else math.nan,
+        "pressure_max_over_saved_states": max(pressure_maxs) if pressure_maxs else math.nan,
+        "species_deltas": species,
+        "Tmax_gas_final_K": float(final.get("Tmax_gas_K", math.nan)),
+        "Tmax_gas_max_K": tmax_summary(rows).get("Tmax_gas_max_K", math.nan),
+        "total_loaded_nonfinite_count": total_nonfinite,
+        "nonfinite_counts": nonfinite,
+        "chemistry_intermediates_remain_zero": intermediates_zero,
+        "chemistry_intermediate_note": (
+            "OH/H2O2/HO2 sums remain exactly zero over analyzed saved states"
+            if intermediates_zero else
+            "At least one OH/H2O2/HO2 sum is nonzero over analyzed saved states"
+        ),
+    }
+
+
 def write_csv(path: Path, rows: list[dict]) -> None:
     fieldnames = sorted({key for row in rows for key in row})
     with path.open("w", newline="") as handle:
@@ -1092,6 +1155,30 @@ def write_log_text(path: Path, log_summary: dict) -> None:
             handle.write(f"\n== {file_info['path']} ==\n")
             for line in file_info.get("tail", []):
                 handle.write(f"{line}\n")
+
+
+def write_key_summary_text(path: Path, summary: dict) -> None:
+    with path.open("w") as handle:
+        handle.write("Smoke key diagnostic summary\n")
+        handle.write(f"status={summary.get('status')}\n")
+        handle.write(f"step_final={summary.get('step_final')}\n")
+        handle.write(f"time_final_s={summary.get('time_final_s')}\n")
+        handle.write(f"D2_mass_norm_final={summary.get('D2_mass_norm_final')}\n")
+        handle.write(f"pressure_min_over_saved_states={summary.get('pressure_min_over_saved_states')}\n")
+        handle.write(f"pressure_max_over_saved_states={summary.get('pressure_max_over_saved_states')}\n")
+        handle.write(f"Tmax_gas_final_K={summary.get('Tmax_gas_final_K')}\n")
+        handle.write(f"Tmax_gas_max_K={summary.get('Tmax_gas_max_K')}\n")
+        handle.write(f"total_loaded_nonfinite_count={summary.get('total_loaded_nonfinite_count')}\n")
+        handle.write(f"chemistry_intermediate_note={summary.get('chemistry_intermediate_note')}\n")
+        species = summary.get("species_deltas", {})
+        for name in ("C12H26", "O2", "CO2", "H2O", "OH", "H2O2", "HO2"):
+            item = species.get(name, {})
+            handle.write(
+                f"{name}: available={item.get('available')} "
+                f"initial={item.get('initial_sum')} "
+                f"final={item.get('final_sum')} "
+                f"delta={item.get('delta_sum')}\n"
+            )
 
 
 def ensure_matplotlib_config(out_dir: Path) -> None:
@@ -1137,6 +1224,13 @@ def finite_plot_pairs(rows: list[dict], field: str) -> list[tuple[float, float]]
     return pairs
 
 
+def disable_axis_offset(ax, axis: str = "y") -> None:
+    try:
+        ax.ticklabel_format(axis=axis, style="plain", useOffset=False)
+    except Exception:
+        pass
+
+
 def write_section34_plots(out_dir: Path, rows_by_label: dict[str, list[dict]]) -> list[str]:
     ensure_matplotlib_config(out_dir)
     try:
@@ -1150,7 +1244,7 @@ def write_section34_plots(out_dir: Path, rows_by_label: dict[str, list[dict]]) -
     paths: list[str] = []
     specs = [
         ("Tmax_gas_K", "Tmax_vs_time.png", "Maximum reconstructed gas temperature", "Tmax_gas [K]"),
-        ("D2_mass_norm", "D2_mass_norm_vs_time.png", "Mass-equivalent normalized D2", "D2 / D0^2"),
+        ("D2_mass_norm", "D2_mass_norm_vs_time.png", "Mass-equivalent normalized D2", "D2 / D0^2 = (D/D0)^2"),
         ("Tmax_radius_over_R0", "Tmax_radius_over_R0_vs_time.png", "Maximum-temperature radius", "r_Tmax / R0"),
     ]
     for field, filename, title, ylabel in specs:
@@ -1169,6 +1263,8 @@ def write_section34_plots(out_dir: Path, rows_by_label: dict[str, list[dict]]) -
         ax.set_xlabel("Time [s]")
         ax.set_ylabel(ylabel)
         ax.set_title(title)
+        if field == "D2_mass_norm":
+            disable_axis_offset(ax, "y")
         ax.grid(True, alpha=0.3)
         ax.legend()
         path = out_dir / filename
@@ -1176,6 +1272,29 @@ def write_section34_plots(out_dir: Path, rows_by_label: dict[str, list[dict]]) -
         fig.savefig(path, dpi=170)
         plt.close(fig)
         paths.append(str(path))
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    wrote_any = False
+    for label, rows in rows_by_label.items():
+        pairs = finite_plot_pairs(rows, "D2_mass_norm")
+        if not pairs:
+            continue
+        times, values = zip(*pairs)
+        losses = [1.0 - value for value in values]
+        ax.plot(times, losses, marker="o", linewidth=1.5, label=label)
+        wrote_any = True
+    if wrote_any:
+        ax.set_xlabel("Time [s]")
+        ax.set_ylabel("1 - D2 / D0^2 = 1 - (D/D0)^2")
+        ax.set_title("Mass-equivalent normalized D2 loss")
+        disable_axis_offset(ax, "y")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        path = out_dir / "D2_mass_norm_loss_vs_time.png"
+        fig.tight_layout()
+        fig.savefig(path, dpi=170)
+        paths.append(str(path))
+    plt.close(fig)
 
     fig, ax_t = plt.subplots(figsize=(7, 4.5))
     ax_d2 = ax_t.twinx()
@@ -1196,7 +1315,8 @@ def write_section34_plots(out_dir: Path, rows_by_label: dict[str, list[dict]]) -
     if wrote_any:
         ax_t.set_xlabel("Time [s]")
         ax_t.set_ylabel("Tmax_gas [K]")
-        ax_d2.set_ylabel("D2 / D0^2")
+        ax_d2.set_ylabel("D2 / D0^2 = (D/D0)^2")
+        disable_axis_offset(ax_d2, "y")
         ax_t.set_title("Maximum temperature and normalized D2")
         ax_t.grid(True, alpha=0.3)
         handles_t, labels_t = ax_t.get_legend_handles_labels()
@@ -1372,6 +1492,7 @@ def comparison_rows_for_run(label: str, run_dir: Path, max_states: int) -> tuple
         "mass_d2_estimate": mass_d2_estimate,
         "frolov_section34": tmax_summary(rows),
         "species_deltas": final_species_deltas(rows),
+        "smoke_test_key_quantities": compact_smoke_summary(rows),
         "last_run_time": context["log_summary"]["last_run_time"],
         "min_dt_nonzero": context["log_summary"]["min_dt_nonzero"],
         "max_dt_nonzero": context["log_summary"]["max_dt_nonzero"],
@@ -1394,7 +1515,7 @@ def maybe_write_comparison_plots(out_dir: Path, rows_by_label: dict[str, list[di
     paths = []
     specs = [
         ("D2_mass_mm2", "D2_mass_mm2_vs_time_comparison.png", "Mass-equivalent D2", "D2 [mm2]"),
-        ("D2_mass_norm", "D2_mass_norm_vs_time_comparison.png", "Mass-equivalent normalized D2", "D2 / D0^2"),
+        ("D2_mass_norm", "D2_mass_norm_vs_time_comparison.png", "Mass-equivalent normalized D2", "D2 / D0^2 = (D/D0)^2"),
     ]
     for field, filename, title, ylabel in specs:
         fig, ax = plt.subplots(figsize=(7, 4.5))
@@ -1416,6 +1537,8 @@ def maybe_write_comparison_plots(out_dir: Path, rows_by_label: dict[str, list[di
         ax.set_xlabel("Time [s]")
         ax.set_ylabel(ylabel)
         ax.set_title(title)
+        if field == "D2_mass_norm":
+            disable_axis_offset(ax, "y")
         ax.grid(True, alpha=0.3)
         ax.legend()
         path = out_dir / filename
@@ -1423,6 +1546,34 @@ def maybe_write_comparison_plots(out_dir: Path, rows_by_label: dict[str, list[di
         fig.savefig(path, dpi=170)
         plt.close(fig)
         paths.append(str(path))
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    wrote_any = False
+    for label, rows in rows_by_label.items():
+        valid = [
+            (float(row.get("time", math.nan)), 1.0 - float(row.get("D2_mass_norm", math.nan)))
+            for row in rows
+            if math.isfinite(float(row.get("time", math.nan))) and math.isfinite(float(row.get("D2_mass_norm", math.nan)))
+        ]
+        if not valid:
+            continue
+        times, values = zip(*valid)
+        ax.plot(times, values, marker="o", linewidth=1.5, label=label)
+        wrote_any = True
+    if wrote_any:
+        ax.set_xlabel("Time [s]")
+        ax.set_ylabel("1 - D2 / D0^2 = 1 - (D/D0)^2")
+        ax.set_title("Mass-equivalent normalized D2 loss")
+        disable_axis_offset(ax, "y")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        path = out_dir / "D2_mass_norm_loss_vs_time_comparison.png"
+        fig.tight_layout()
+        fig.savefig(path, dpi=170)
+        plt.close(fig)
+        paths.append(str(path))
+    else:
+        plt.close(fig)
     paths.extend(write_section34_plots(out_dir, rows_by_label))
     return paths, "ok"
 
@@ -1532,6 +1683,7 @@ def run_single(args: argparse.Namespace) -> None:
     if not math.isfinite(d0_mm):
         notes.append("D0_mm could not be parsed; dimensional D2 and K are unavailable")
 
+    key_summary = compact_smoke_summary(state_rows)
     summary = {
         "run_dir": str(run_dir),
         "out_dir": str(out_dir),
@@ -1555,6 +1707,7 @@ def run_single(args: argparse.Namespace) -> None:
         "mass_d2_estimate": final_mass_k(mass_rows, d0_mm),
         "frolov_section34": tmax_summary(mass_rows),
         "species_deltas": final_species_deltas(state_rows),
+        "smoke_test_key_quantities": key_summary,
         "last_run_time": log_summary["last_run_time"],
         "min_dt": log_summary["min_dt"],
         "max_dt": log_summary["max_dt"],
@@ -1573,16 +1726,19 @@ def run_single(args: argparse.Namespace) -> None:
     by_state_path = out_dir / "smoke_diagnostics_by_state.csv"
     trend_path = out_dir / "smoke_diagnostics_trend.csv"
     log_path = out_dir / "smoke_diagnostics_log_summary.txt"
+    key_summary_path = out_dir / "smoke_diagnostics_key_summary.txt"
 
     summary_path.write_text(json.dumps(summary, indent=2, allow_nan=True))
     write_csv(by_state_path, state_rows)
     write_csv(trend_path, trend_rows)
     write_log_text(log_path, log_summary)
+    write_key_summary_text(key_summary_path, key_summary)
 
     print(f"summary={summary_path}")
     print(f"by_state_csv={by_state_path}")
     print(f"trend_csv={trend_path}")
     print(f"log_summary={log_path}")
+    print(f"key_summary={key_summary_path}")
     for path in plots:
         print(f"plot={path}")
 
