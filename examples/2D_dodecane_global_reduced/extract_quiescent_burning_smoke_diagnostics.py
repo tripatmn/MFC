@@ -40,6 +40,13 @@ FIELDS = {
     "rhoY_OH": ("cons", 20),
     "rhoY_H2O2": ("cons", 21),
     "rhoY_HO2": ("cons", 22),
+    "rhoY_NC12H26": ("cons", 58),
+    "rhoY_SK54_O2": ("cons", 22),
+    "rhoY_SK54_CO2": ("cons", 31),
+    "rhoY_SK54_H2O": ("cons", 20),
+    "rhoY_SK54_OH": ("cons", 17),
+    "rhoY_SK54_HO2": ("cons", 18),
+    "rhoY_SK54_H2O2": ("cons", 21),
 }
 
 STATE_FIELD_ORDER = (
@@ -57,6 +64,13 @@ STATE_FIELD_ORDER = (
     "rhoY_OH",
     "rhoY_H2O2",
     "rhoY_HO2",
+    "rhoY_NC12H26",
+    "rhoY_SK54_O2",
+    "rhoY_SK54_CO2",
+    "rhoY_SK54_H2O",
+    "rhoY_SK54_OH",
+    "rhoY_SK54_HO2",
+    "rhoY_SK54_H2O2",
 )
 
 KEYWORDS = (
@@ -850,6 +864,13 @@ def short_prefix(name: str) -> str:
         "rhoY_oh": "rhoY_OH",
         "rhoY_ho2": "rhoY_HO2",
         "rhoY_h2o2": "rhoY_H2O2",
+        "rhoY_NC12H26": "rhoY_NC12H26",
+        "rhoY_SK54_O2": "rhoY_SK54_O2",
+        "rhoY_SK54_CO2": "rhoY_SK54_CO2",
+        "rhoY_SK54_H2O": "rhoY_SK54_H2O",
+        "rhoY_SK54_OH": "rhoY_SK54_OH",
+        "rhoY_SK54_HO2": "rhoY_SK54_HO2",
+        "rhoY_SK54_H2O2": "rhoY_SK54_H2O2",
     }
     if name in prefixes:
         return prefixes[name]
@@ -1045,8 +1066,23 @@ def final_species_deltas(rows: list[dict]) -> dict:
         "time_final_s": float(last.get("time", math.nan)),
     }
     any_available = False
-    for species in ("C12H26", "O2", "CO2", "H2O", "OH", "H2O2", "HO2"):
-        key = f"rhoY_{species}_sum"
+    species_keys = (
+        ("C12H26", "rhoY_C12H26_sum"),
+        ("NC12H26", "rhoY_NC12H26_sum"),
+        ("O2", "rhoY_O2_sum"),
+        ("SK54_O2", "rhoY_SK54_O2_sum"),
+        ("CO2", "rhoY_CO2_sum"),
+        ("SK54_CO2", "rhoY_SK54_CO2_sum"),
+        ("H2O", "rhoY_H2O_sum"),
+        ("SK54_H2O", "rhoY_SK54_H2O_sum"),
+        ("OH", "rhoY_OH_sum"),
+        ("SK54_OH", "rhoY_SK54_OH_sum"),
+        ("H2O2", "rhoY_H2O2_sum"),
+        ("SK54_H2O2", "rhoY_SK54_H2O2_sum"),
+        ("HO2", "rhoY_HO2_sum"),
+        ("SK54_HO2", "rhoY_SK54_HO2_sum"),
+    )
+    for species, key in species_keys:
         initial = float(first.get(key, math.nan))
         final = float(last.get(key, math.nan))
         available = math.isfinite(initial) and math.isfinite(final)
@@ -1095,7 +1131,7 @@ def compact_smoke_summary(rows: list[dict]) -> dict:
         total_nonfinite += sum(counts)
 
     intermediates_zero = True
-    for species_name in ("OH", "H2O2", "HO2"):
+    for species_name in ("OH", "H2O2", "HO2", "SK54_OH", "SK54_H2O2", "SK54_HO2"):
         item = species.get(species_name, {})
         values = [
             float(item.get(field, math.nan))
@@ -1171,7 +1207,11 @@ def write_key_summary_text(path: Path, summary: dict) -> None:
         handle.write(f"total_loaded_nonfinite_count={summary.get('total_loaded_nonfinite_count')}\n")
         handle.write(f"chemistry_intermediate_note={summary.get('chemistry_intermediate_note')}\n")
         species = summary.get("species_deltas", {})
-        for name in ("C12H26", "O2", "CO2", "H2O", "OH", "H2O2", "HO2"):
+        for name in (
+            "C12H26", "NC12H26", "O2", "SK54_O2", "CO2", "SK54_CO2",
+            "H2O", "SK54_H2O", "OH", "SK54_OH", "H2O2", "SK54_H2O2",
+            "HO2", "SK54_HO2",
+        ):
             item = species.get(name, {})
             handle.write(
                 f"{name}: available={item.get('available')} "
@@ -1364,7 +1404,9 @@ def maybe_write_plots(out_dir: Path, rows: list[dict], run_time_rows: list[dict]
             ("pressure_min", "pressure_max", "Pressure extrema", "Pressure [Pa]", "smoke_pressure_extrema.png"),
             ("liq_arho_integral", "vap_arho_integral", "Liquid/vapor alpha_rho integrals", "Integral", "smoke_alpha_rho_integrals.png"),
             ("rhoY_C12H26_integral", "rhoY_O2_integral", "Fuel/O2 species integrals", "Integral", "smoke_species_fuel_o2.png"),
+            ("rhoY_NC12H26_integral", "rhoY_SK54_O2_integral", "SK54 fuel/O2 species integrals", "Integral", "smoke_species_sk54_fuel_o2.png"),
             ("rhoY_CO2_integral", "rhoY_H2O_integral", "Product species integrals", "Integral", "smoke_species_products.png"),
+            ("rhoY_SK54_CO2_integral", "rhoY_SK54_H2O_integral", "SK54 product species integrals", "Integral", "smoke_species_sk54_products.png"),
         ]
         for y1, y2, title, ylabel, filename in plot_specs:
             if not any(math.isfinite(float(row.get(y1, math.nan))) for row in rows):
@@ -1608,6 +1650,13 @@ def maybe_write_comparison_field_images(out_dir: Path, run_contexts: dict[str, d
                     "rhoY_OH",
                     "rhoY_H2O2",
                     "rhoY_HO2",
+                    "rhoY_NC12H26",
+                    "rhoY_SK54_O2",
+                    "rhoY_SK54_CO2",
+                    "rhoY_SK54_H2O",
+                    "rhoY_SK54_OH",
+                    "rhoY_SK54_H2O2",
+                    "rhoY_SK54_HO2",
                 )
             )
         for field, step, filename, title in specs:
@@ -1671,7 +1720,11 @@ def run_single(args: argparse.Namespace) -> None:
     p_all_count, p_all_size = directory_size(run_dir / "p_all")
     plots, time_plot_source = maybe_write_plots(out_dir, trend_rows, log_summary["run_time_rows"], fixed_dt, adaptive_dt)
 
-    if all(not steps_by_field[name] for name in ("rhoY_C12H26", "rhoY_O2", "rhoY_CO2", "rhoY_H2O")):
+    species_availability_fields = (
+        "rhoY_C12H26", "rhoY_NC12H26", "rhoY_O2", "rhoY_SK54_O2",
+        "rhoY_CO2", "rhoY_SK54_CO2", "rhoY_H2O", "rhoY_SK54_H2O",
+    )
+    if all(not steps_by_field[name] for name in species_availability_fields):
         notes.append("chemistry/species raw fields are unavailable; this is expected for nonreacting chemistry-off cases")
     if log_summary["run_time_inf_dt_rounded_to_zero"] or log_summary["run_time_inf_time_rounded_to_zero"]:
         notes.append(
