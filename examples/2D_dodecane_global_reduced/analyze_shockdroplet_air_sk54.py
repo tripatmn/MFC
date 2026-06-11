@@ -21,6 +21,7 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-mfc-shockdroplet")
 import matplotlib
 
 matplotlib.use("Agg")
+from matplotlib import colors
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -56,6 +57,7 @@ for species, species_index in SK54_SPECIES_INDEX.items():
 PLOT_FIELDS = (
     "pressure",
     "temperature",
+    "temperature_masked",
     "liquid_alpha",
     "vapor_alpha_rho",
     "rhoY_NC12H26",
@@ -73,6 +75,28 @@ VAPOR_GAMMA = 1.025
 VAPOR_CV = 1956.0
 R_AIR = (AIR_GAMMA - 1.0) * AIR_CV
 R_VAPOR = (VAPOR_GAMMA - 1.0) * VAPOR_CV
+DEFAULT_GAS_MASS_THRESHOLD = 1.0e-6
+
+FIXED_LINEAR_SCALES = {
+    "pressure": (1.0e5, 4.0e6),
+    "liquid_alpha": (0.0, 1.0),
+    "vapor_alpha": (0.0, 1.0),
+    "air_alpha": (0.0, 1.0),
+}
+
+MAX_CELL_CONTEXT_FIELDS = (
+    "pressure",
+    "liquid_alpha",
+    "vapor_alpha",
+    "air_alpha",
+    "vapor_alpha_rho",
+    "air_alpha_rho",
+    "rhoY_NC12H26",
+    "rhoY_O2",
+    "rhoY_OH",
+    "rhoY_HO2",
+    "rhoY_H2O2",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,6 +104,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, required=True, help="MFC run folder containing D/ and logs")
     parser.add_argument("--out-dir", type=Path, required=True, help="Folder for PNG/CSV/text diagnostics")
     parser.add_argument("--max-frames", type=int, default=0, help="Limit frame PNGs; 0 means all saved states")
+    parser.add_argument(
+        "--temperature-gas-mass-threshold",
+        type=float,
+        default=DEFAULT_GAS_MASS_THRESHOLD,
+        help="Only include cells with vapor_alpha_rho + air_alpha_rho above this value in masked temperature extrema.",
+    )
     return parser.parse_args()
 
 
@@ -199,37 +229,22 @@ def missing_stats(paths: list[Path], row_count: int) -> dict:
     }
 
 
-def read_step_fields(run_dir: Path, step: int) -> dict[str, dict]:
+def read_step_fields(run_dir: Path, step: int, gas_mass_threshold: float) -> dict[str, dict]:
     fields = {}
     for name in FIELDS:
         fields[name] = read_field(run_dir, name, step)
-    temperature = reconstruct_temperature(fields)
-    fields["temperature"] = temperature
+    fields["temperature"] = reconstruct_temperature(fields, gas_mass_threshold=None)
+    fields["temperature_masked"] = reconstruct_temperature(fields, gas_mass_threshold=gas_mass_threshold)
     return fields
 
 
-def reconstruct_temperature(fields: dict[str, dict]) -> dict:
-    required = ("pressure", "vapor_alpha_rho", "air_alpha_rho")
-    if not all(fields[name]["available"] for name in required):
-        return {"available": False, "values": {}, "stats": missing_stats([], 0)}
-    keys = set(fields["pressure"]["values"])
-    keys &= set(fields["vapor_alpha_rho"]["values"])
-    keys &= set(fields["air_alpha_rho"]["values"])
-    values: dict[tuple[float, float], float] = {}
-    for key in keys:
-        pressure = fields["pressure"]["values"][key]
-        rho_v = fields["vapor_alpha_rho"]["values"][key]
-        rho_air = fields["air_alpha_rho"]["values"][key]
-        rho_g = rho_v + rho_air
-        if not all(math.isfinite(v) for v in (pressure, rho_v, rho_air, rho_g)) or pressure <= 0.0 or rho_g <= 1.0e-12:
-            values[key] = math.nan
-            continue
-        r_mix = (rho_v * R_VAPOR + rho_air * R_AIR) / rho_g
-        values[key] = pressure / (rho_g * r_mix) if r_mix > 0.0 else math.nan
-    vals = np.fromiter(values.values(), dtype=float, count=len(values)) if values else np.empty(0)
+def stats_from_values(values: dict[tuple[float, float], float], available: bool = True) -> dict:
+    if not values:
+        return missing_stats([], 0)
+    vals = np.fromiter(values.values(), dtype=float, count=len(values))
     finite = vals[np.isfinite(vals)]
-    stats = {
-        "available": bool(values),
+    return {
+        "available": available,
         "files": 0,
         "row_count": len(values),
         "unique_count": len(values),
@@ -243,7 +258,34 @@ def reconstruct_temperature(fields: dict[str, dict]) -> dict:
         "mean": float(np.mean(finite)) if finite.size else math.nan,
         "sum": float(np.sum(finite)) if finite.size else math.nan,
     }
-    return {"available": bool(values), "values": values, "stats": stats}
+
+
+def reconstruct_temperature(fields: dict[str, dict], gas_mass_threshold: float | None) -> dict:
+    required = ("pressure", "vapor_alpha_rho", "air_alpha_rho")
+    if not all(fields[name]["available"] for name in required):
+        return {"available": False, "values": {}, "stats": missing_stats([], 0)}
+    keys = set(fields["pressure"]["values"])
+    keys &= set(fields["vapor_alpha_rho"]["values"])
+    keys &= set(fields["air_alpha_rho"]["values"])
+    values: dict[tuple[float, float], float] = {}
+    for key in keys:
+        pressure = fields["pressure"]["values"][key]
+        rho_v = fields["vapor_alpha_rho"]["values"][key]
+        rho_air = fields["air_alpha_rho"]["values"][key]
+        rho_g = rho_v + rho_air
+        if gas_mass_threshold is not None and (not math.isfinite(rho_g) or rho_g <= gas_mass_threshold):
+            continue
+        if not all(math.isfinite(v) for v in (pressure, rho_v, rho_air, rho_g)) or pressure <= 0.0 or rho_g <= 1.0e-12:
+            values[key] = math.nan
+            continue
+        r_mix = (rho_v * R_VAPOR + rho_air * R_AIR) / rho_g
+        values[key] = pressure / (rho_g * r_mix) if r_mix > 0.0 else math.nan
+    return {
+        "available": bool(values),
+        "values": values,
+        "stats": stats_from_values(values, available=bool(values)),
+        "gas_mass_threshold": gas_mass_threshold,
+    }
 
 
 def parse_run_time_inf(run_dir: Path) -> dict[int, tuple[float, float]]:
@@ -310,6 +352,27 @@ def values_to_grid(values: dict[tuple[float, float], float]) -> tuple[np.ndarray
     return xs, ys, grid
 
 
+def image_kwargs(name: str, grid: np.ndarray) -> dict:
+    if name in FIXED_LINEAR_SCALES:
+        vmin, vmax = FIXED_LINEAR_SCALES[name]
+        return {"vmin": vmin, "vmax": vmax}
+    finite = grid[np.isfinite(grid)]
+    if finite.size == 0:
+        return {}
+    if name.startswith("rhoY_") or name.endswith("alpha_rho"):
+        positive = finite[finite > 0.0]
+        if positive.size and np.nanmax(positive) / max(np.nanmin(positive), 1.0e-300) > 1.0e4:
+            vmax = float(np.nanpercentile(positive, 99.0))
+            vmin = max(float(np.nanpercentile(positive, 1.0)), max(vmax * 1.0e-8, 1.0e-300))
+            if vmax > vmin:
+                return {"norm": colors.LogNorm(vmin=vmin, vmax=vmax)}
+        vmin = float(np.nanpercentile(finite, 1.0))
+        vmax = float(np.nanpercentile(finite, 99.0))
+        if vmax > vmin:
+            return {"vmin": vmin, "vmax": vmax}
+    return {}
+
+
 def plot_panel(fields: dict[str, dict], names: list[str], titles: list[str], out_path: Path, time_s: float) -> None:
     ncols = 2
     nrows = math.ceil(len(names) / ncols)
@@ -330,7 +393,14 @@ def plot_panel(fields: dict[str, dict], names: list[str], titles: list[str], out
             continue
         xs, ys, grid = grid_data
         extent = [float(xs.min() * 1.0e6), float(xs.max() * 1.0e6), float(ys.min() * 1.0e6), float(ys.max() * 1.0e6)]
-        image = ax.imshow(grid, origin="lower", extent=extent, aspect="equal", interpolation="nearest")
+        image = ax.imshow(
+            grid,
+            origin="lower",
+            extent=extent,
+            aspect="equal",
+            interpolation="nearest",
+            **image_kwargs(name, grid),
+        )
         ax.set_title(title)
         ax.set_xlabel("x [um]")
         ax.set_ylabel("y [um]")
@@ -375,11 +445,77 @@ def shock_location_from_pressure(field: dict) -> tuple[float, str]:
     p_col = np.nanmean(finite, axis=0)
     if p_col.size < 3 or not np.isfinite(p_col).any():
         return math.nan, "insufficient_pressure_profile"
+    margin = max(1, int(math.ceil(0.05 * p_col.size)))
+    interior = np.arange(margin, p_col.size - margin)
+    if interior.size < 3:
+        interior = np.arange(p_col.size)
     grad = np.abs(np.gradient(p_col, xs))
-    if not np.isfinite(grad).any():
+    interior_grad = grad[interior]
+    if not np.isfinite(interior_grad).any():
         return math.nan, "nonfinite_pressure_gradient"
-    idx = int(np.nanargmax(grad))
-    return float(xs[idx]), "max_abs_dmeanp_dx"
+    idx = int(interior[int(np.nanargmax(interior_grad))])
+    return float(xs[idx]), "interior_max_abs_dmeanp_dx_excluding_5pct_edges"
+
+
+def shock_location_threshold_from_pressure(field: dict) -> tuple[float, float, str]:
+    if not field["available"]:
+        return math.nan, math.nan, "missing_pressure"
+    grid_data = values_to_grid(field["values"])
+    if grid_data is None:
+        return math.nan, math.nan, "empty_pressure"
+    xs, _ys, grid = grid_data
+    finite = np.where(np.isfinite(grid), grid, np.nan)
+    if finite.size == 0 or not np.isfinite(finite).any():
+        return math.nan, math.nan, "nonfinite_pressure"
+    p_col = np.nanmean(finite, axis=0)
+    margin = max(1, int(math.ceil(0.05 * p_col.size)))
+    interior = np.arange(margin, p_col.size - margin)
+    if interior.size < 3:
+        interior = np.arange(p_col.size)
+    p_int = p_col[interior]
+    finite_int = p_int[np.isfinite(p_int)]
+    if finite_int.size < 2:
+        return math.nan, math.nan, "insufficient_pressure_profile"
+    threshold = 0.5 * (float(np.nanmin(finite_int)) + float(np.nanmax(finite_int)))
+    idx = int(interior[int(np.nanargmin(np.abs(p_int - threshold)))])
+    return float(xs[idx]), threshold, "interior_mid_pressure_threshold"
+
+
+def finite_max_location(field: dict) -> tuple[float, float, float]:
+    if not field["available"] or not field["values"]:
+        return math.nan, math.nan, math.nan
+    best_value = -math.inf
+    best_x = math.nan
+    best_y = math.nan
+    for (x, y), value in field["values"].items():
+        if math.isfinite(value) and value > best_value:
+            best_value = value
+            best_x = x
+            best_y = y
+    if best_value == -math.inf:
+        return math.nan, math.nan, math.nan
+    return float(best_value), float(best_x), float(best_y)
+
+
+def local_value(fields: dict[str, dict], name: str, x: float, y: float) -> float:
+    if not math.isfinite(x) or not math.isfinite(y):
+        return math.nan
+    field = fields.get(name)
+    if not field or not field["available"]:
+        return math.nan
+    return float(field["values"].get((x, y), math.nan))
+
+
+def add_temperature_max_context(row: dict, fields: dict[str, dict], temp_name: str, prefix: str) -> None:
+    value, x, y = finite_max_location(fields[temp_name])
+    row[f"{prefix}_Tmax"] = value
+    row[f"{prefix}_Tmax_x"] = x
+    row[f"{prefix}_Tmax_y"] = y
+    row[f"{prefix}_Tmax_gas_mass"] = (
+        local_value(fields, "vapor_alpha_rho", x, y) + local_value(fields, "air_alpha_rho", x, y)
+    )
+    for field_name in MAX_CELL_CONTEXT_FIELDS:
+        row[f"{prefix}_Tmax_cell_{field_name}"] = local_value(fields, field_name, x, y)
 
 
 def row_for_state(step: int, save_index: int, time_s: float, time_source: str, fields: dict[str, dict]) -> dict:
@@ -405,8 +541,15 @@ def row_for_state(step: int, save_index: int, time_s: float, time_source: str, f
     row["total_nonfinite_count"] = sum(fields[name]["stats"]["nonfinite_count"] for name in fields)
     row["liquid_alpha_centroid_x"] = centroid_from_alpha(fields["liquid_alpha"])[0]
     row["liquid_alpha_centroid_y"] = centroid_from_alpha(fields["liquid_alpha"])[1]
-    row["shock_front_x"] = shock_location_from_pressure(fields["pressure"])[0]
-    row["shock_front_source"] = shock_location_from_pressure(fields["pressure"])[1]
+    shock_grad_x, shock_grad_source = shock_location_from_pressure(fields["pressure"])
+    shock_thresh_x, shock_threshold, shock_thresh_source = shock_location_threshold_from_pressure(fields["pressure"])
+    row["shock_front_x_gradient"] = shock_grad_x
+    row["shock_front_gradient_source"] = shock_grad_source
+    row["shock_front_x_threshold"] = shock_thresh_x
+    row["shock_front_pressure_threshold"] = shock_threshold
+    row["shock_front_threshold_source"] = shock_thresh_source
+    add_temperature_max_context(row, fields, "temperature", "raw")
+    add_temperature_max_context(row, fields, "temperature_masked", "masked")
     return row
 
 
@@ -441,9 +584,21 @@ def write_summary(path: Path, rows: list[dict], run_dir: Path, png_count: int) -
             f"  step: {final['step']}",
             f"  time_s: {final['time_s']} ({final['time_source']})",
             f"  pressure_min/max: {final['pressure_min']} / {final['pressure_max']} Pa",
-            f"  temperature_min/max: {final['temperature_min']} / {final['temperature_max']} K",
+            f"  raw_temperature_min/max: {final['temperature_min']} / {final['temperature_max']} K",
+            f"  masked_temperature_min/max: {final['temperature_masked_min']} / {final['temperature_masked_max']} K",
+            f"  raw_Tmax_location: ({final['raw_Tmax_x']}, {final['raw_Tmax_y']}) m",
+            f"  raw_Tmax_cell_pressure: {final['raw_Tmax_cell_pressure']} Pa",
+            f"  raw_Tmax_cell_gas_mass: {final['raw_Tmax_gas_mass']} kg/m^3",
+            f"  raw_Tmax_cell_alpha_liq/vap/air: {final['raw_Tmax_cell_liquid_alpha']} / {final['raw_Tmax_cell_vapor_alpha']} / {final['raw_Tmax_cell_air_alpha']}",
+            f"  raw_Tmax_cell_rhoY_NC12H26/O2/OH/HO2/H2O2: {final['raw_Tmax_cell_rhoY_NC12H26']} / {final['raw_Tmax_cell_rhoY_O2']} / {final['raw_Tmax_cell_rhoY_OH']} / {final['raw_Tmax_cell_rhoY_HO2']} / {final['raw_Tmax_cell_rhoY_H2O2']}",
+            f"  masked_Tmax_location: ({final['masked_Tmax_x']}, {final['masked_Tmax_y']}) m",
+            f"  masked_Tmax_cell_pressure: {final['masked_Tmax_cell_pressure']} Pa",
+            f"  masked_Tmax_cell_gas_mass: {final['masked_Tmax_gas_mass']} kg/m^3",
+            f"  masked_Tmax_cell_alpha_liq/vap/air: {final['masked_Tmax_cell_liquid_alpha']} / {final['masked_Tmax_cell_vapor_alpha']} / {final['masked_Tmax_cell_air_alpha']}",
+            f"  masked_Tmax_cell_rhoY_NC12H26/O2/OH/HO2/H2O2: {final['masked_Tmax_cell_rhoY_NC12H26']} / {final['masked_Tmax_cell_rhoY_O2']} / {final['masked_Tmax_cell_rhoY_OH']} / {final['masked_Tmax_cell_rhoY_HO2']} / {final['masked_Tmax_cell_rhoY_H2O2']}",
             f"  total_nonfinite_count: {final['total_nonfinite_count']}",
-            f"  shock_front_x: {final['shock_front_x']} m ({final['shock_front_source']})",
+            f"  shock_front_x_gradient: {final['shock_front_x_gradient']} m ({final['shock_front_gradient_source']})",
+            f"  shock_front_x_threshold: {final['shock_front_x_threshold']} m at p={final['shock_front_pressure_threshold']} Pa ({final['shock_front_threshold_source']})",
             f"  liquid_alpha_centroid: ({final['liquid_alpha_centroid_x']}, {final['liquid_alpha_centroid_y']}) m",
             f"  rhoY_NC12H26_sum: {final['rhoY_NC12H26_sum']}",
             f"  rhoY_O2_sum: {final['rhoY_O2_sum']}",
@@ -470,13 +625,13 @@ def main() -> None:
 
     for save_index, step in enumerate(steps):
         time_s, time_source = times.get(step, (math.nan, "missing"))
-        fields = read_step_fields(run_dir, step)
+        fields = read_step_fields(run_dir, step, args.temperature_gas_mass_threshold)
         row = row_for_state(step, save_index, time_s, time_source, fields)
         rows.append(row)
 
         if save_index < frame_limit:
-            hydro_names = ["pressure", "temperature", "liquid_alpha", "vapor_alpha_rho"]
-            hydro_titles = ["Pressure [Pa]", "Gas temperature estimate [K]", "Liquid alpha", "Vapor alpha-rho"]
+            hydro_names = ["pressure", "temperature_masked", "liquid_alpha", "vapor_alpha_rho"]
+            hydro_titles = ["Pressure [Pa]", "Masked gas temperature [K]", "Liquid alpha", "Vapor alpha-rho"]
             chem_names = ["rhoY_NC12H26", "rhoY_O2", "rhoY_CO2", "rhoY_H2O", "rhoY_OH", "rhoY_HO2", "rhoY_H2O2"]
             chem_titles = ["NC12H26 rhoY", "O2 rhoY", "CO2 rhoY", "H2O rhoY", "OH rhoY", "HO2 rhoY", "H2O2 rhoY"]
             plot_panel(fields, hydro_names, hydro_titles, out_dir / f"frame_{save_index:06d}_hydro.png", time_s)
@@ -496,6 +651,18 @@ def main() -> None:
             "R_mix": "(rho_v*R_vapor + rho_air*R_air)/(rho_v + rho_air)",
             "R_air": R_AIR,
             "R_vapor": R_VAPOR,
+            "raw_temperature": "all finite positive-pressure cells with gas mass > 1e-12 kg/m^3",
+            "masked_temperature": "only cells with vapor_alpha_rho + air_alpha_rho above threshold",
+            "gas_mass_threshold": args.temperature_gas_mass_threshold,
+        },
+        "shock_front_detection": {
+            "gradient": "max |d(mean pressure)/dx| after excluding first and last 5 percent of x columns",
+            "threshold": "interior x column closest to midpoint between interior min and max mean pressure",
+        },
+        "plot_scaling": {
+            "pressure": "fixed 1e5..4e6 Pa",
+            "liquid_alpha": "fixed 0..1",
+            "species": "log scale for high dynamic range positive fields, otherwise 1st..99th percentile clipping",
         },
     }
     (out_dir / "shockdroplet_metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
