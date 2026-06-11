@@ -605,6 +605,14 @@ def parse_t_save(run_dir: Path) -> tuple[float | None, str]:
     return parse_scalar_param(run_dir, "t_save")
 
 
+def parse_ambient_temperature(run_dir: Path) -> tuple[float, str]:
+    for name in ("T_gas", "t_hot", "T_hot"):
+        value, source = parse_scalar_param(run_dir, name)
+        if value is not None and math.isfinite(value) and value > 0.0:
+            return value, source
+    return math.nan, "missing"
+
+
 def parse_adaptive_dt(run_dir: Path) -> bool:
     text = run_text(run_dir).lower()
     match = re.search(r"cfl_adap_dt[^a-z0-9_]*['\"]?([tf])['\"]?", text)
@@ -751,6 +759,7 @@ def analysis_context(run_dir: Path) -> dict:
     d0_mm, d0_source = parse_d0_mm(run_dir)
     center_x, center_y, center_source = parse_droplet_center_m(run_dir)
     t_save, t_save_source = parse_t_save(run_dir)
+    ambient_temperature, ambient_temperature_source = parse_ambient_temperature(run_dir)
     return {
         "run_dir": run_dir,
         "log_summary": log_summary,
@@ -759,6 +768,8 @@ def analysis_context(run_dir: Path) -> dict:
         "adaptive_dt": adaptive_dt,
         "t_save": t_save,
         "t_save_source": t_save_source,
+        "ambient_temperature_K": ambient_temperature,
+        "ambient_temperature_source": ambient_temperature_source,
         "d0_mm": d0_mm,
         "d0_source": d0_source,
         "droplet_center_m": (center_x, center_y),
@@ -947,6 +958,84 @@ def tmax_summary(rows: list[dict]) -> dict:
         "Tmax_final_K": float(final["Tmax_gas_K"]),
         "temperature_reconstruction_source": str(final.get("Tmax_reconstruction_source", "")),
     }
+
+
+def first_threshold_crossing(rows: list[dict], threshold: float) -> dict:
+    valid = [
+        row for row in rows
+        if math.isfinite(float(row.get("time", math.nan)))
+        and math.isfinite(float(row.get("Tmax_gas_K", math.nan)))
+    ]
+    for row in valid:
+        if float(row["Tmax_gas_K"]) >= threshold:
+            return {
+                "status": "reached",
+                "threshold_K": threshold,
+                "time_s": float(row["time"]),
+                "step": int(row["step"]),
+                "Tmax_gas_K": float(row["Tmax_gas_K"]),
+            }
+    if valid:
+        final = valid[-1]
+        return {
+            "status": "not_reached",
+            "threshold_K": threshold,
+            "time_s": math.nan,
+            "step": math.nan,
+            "Tmax_gas_K": math.nan,
+            "final_time_s": float(final["time"]),
+            "final_Tmax_gas_K": float(final["Tmax_gas_K"]),
+        }
+    return {
+        "status": "missing",
+        "threshold_K": threshold,
+        "time_s": math.nan,
+        "step": math.nan,
+        "Tmax_gas_K": math.nan,
+        "reason": "no finite time/Tmax_gas_K rows",
+    }
+
+
+def tanabe_induction_summary(rows: list[dict], ambient_temperature_K: float) -> dict:
+    ambient = ambient_temperature_K if math.isfinite(ambient_temperature_K) else math.nan
+    first_threshold = ambient + 20.0 if math.isfinite(ambient) else math.nan
+    total_threshold = 2000.0
+    out = {
+        "ambient_temperature_K": ambient,
+        "first_induction_rule": "first saved state with Tmax_gas >= T_ambient + 20 K",
+        "total_induction_rule": "first saved state with Tmax_gas >= 2000 K",
+        "first_induction_threshold_K": first_threshold,
+        "total_induction_threshold_K": total_threshold,
+    }
+    out["first_induction_estimate"] = (
+        first_threshold_crossing(rows, first_threshold)
+        if math.isfinite(first_threshold)
+        else {"status": "missing", "reason": "ambient temperature unavailable"}
+    )
+    out["total_induction_estimate"] = first_threshold_crossing(rows, total_threshold)
+    valid = [
+        row for row in rows
+        if math.isfinite(float(row.get("time", math.nan)))
+        and math.isfinite(float(row.get("Tmax_gas_K", math.nan)))
+    ]
+    if len(valid) >= 2:
+        times = np.array([float(row["time"]) for row in valid], dtype=float)
+        temps = np.array([float(row["Tmax_gas_K"]) for row in valid], dtype=float)
+        if np.ptp(times) > 0.0:
+            dtdt = np.gradient(temps, times)
+            idx = int(np.nanargmax(dtdt))
+            out["max_dTmax_dt_K_s"] = float(dtdt[idx])
+            out["max_dTmax_dt_time_s"] = float(times[idx])
+            out["max_dTmax_dt_step"] = int(valid[idx]["step"])
+        else:
+            out["max_dTmax_dt_K_s"] = math.nan
+            out["max_dTmax_dt_time_s"] = math.nan
+            out["max_dTmax_dt_step"] = math.nan
+    else:
+        out["max_dTmax_dt_K_s"] = math.nan
+        out["max_dTmax_dt_time_s"] = math.nan
+        out["max_dTmax_dt_step"] = math.nan
+    return out
 
 
 def final_mass_k(rows: list[dict], d0_mm: float) -> dict:
@@ -1204,6 +1293,22 @@ def write_key_summary_text(path: Path, summary: dict) -> None:
         handle.write(f"pressure_max_over_saved_states={summary.get('pressure_max_over_saved_states')}\n")
         handle.write(f"Tmax_gas_final_K={summary.get('Tmax_gas_final_K')}\n")
         handle.write(f"Tmax_gas_max_K={summary.get('Tmax_gas_max_K')}\n")
+        induction = summary.get("tanabe1996_induction", {})
+        if induction:
+            handle.write(f"tanabe_ambient_temperature_K={induction.get('ambient_temperature_K')}\n")
+            first = induction.get("first_induction_estimate", {})
+            total = induction.get("total_induction_estimate", {})
+            handle.write(
+                "tanabe_first_induction="
+                f"status={first.get('status')} threshold_K={first.get('threshold_K')} "
+                f"time_s={first.get('time_s')} step={first.get('step')}\n"
+            )
+            handle.write(
+                "tanabe_total_induction="
+                f"status={total.get('status')} threshold_K={total.get('threshold_K')} "
+                f"time_s={total.get('time_s')} step={total.get('step')}\n"
+            )
+            handle.write(f"tanabe_max_dTmax_dt_K_s={induction.get('max_dTmax_dt_K_s')}\n")
         handle.write(f"total_loaded_nonfinite_count={summary.get('total_loaded_nonfinite_count')}\n")
         handle.write(f"chemistry_intermediate_note={summary.get('chemistry_intermediate_note')}\n")
         species = summary.get("species_deltas", {})
@@ -1516,6 +1621,8 @@ def comparison_rows_for_run(label: str, run_dir: Path, max_states: int) -> tuple
         "cfl_adap_dt": context["adaptive_dt"],
         "t_save": t_save_info["value"],
         "t_save_source": t_save_info["source"],
+        "ambient_temperature_K": context["ambient_temperature_K"],
+        "ambient_temperature_source": context["ambient_temperature_source"],
         "D0_mm": context["d0_mm"],
         "D0_source": context["d0_source"],
         "droplet_center_m": context["droplet_center_m"],
@@ -1533,6 +1640,7 @@ def comparison_rows_for_run(label: str, run_dir: Path, max_states: int) -> tuple
         "fit_late_time_end_s": mass_d2_estimate.get("fit_late_time_end_s", math.nan),
         "mass_d2_estimate": mass_d2_estimate,
         "frolov_section34": tmax_summary(rows),
+        "tanabe1996_induction": tanabe_induction_summary(rows, context["ambient_temperature_K"]),
         "species_deltas": final_species_deltas(rows),
         "smoke_test_key_quantities": compact_smoke_summary(rows),
         "last_run_time": context["log_summary"]["last_run_time"],
@@ -1737,6 +1845,7 @@ def run_single(args: argparse.Namespace) -> None:
         notes.append("D0_mm could not be parsed; dimensional D2 and K are unavailable")
 
     key_summary = compact_smoke_summary(state_rows)
+    key_summary["tanabe1996_induction"] = tanabe_induction_summary(mass_rows, context["ambient_temperature_K"])
     summary = {
         "run_dir": str(run_dir),
         "out_dir": str(out_dir),
@@ -1753,12 +1862,15 @@ def run_single(args: argparse.Namespace) -> None:
         "cfl_adap_dt": adaptive_dt,
         "t_save": t_save if t_save is not None else math.nan,
         "t_save_source": t_save_source,
+        "ambient_temperature_K": context["ambient_temperature_K"],
+        "ambient_temperature_source": context["ambient_temperature_source"],
         "D0_mm": d0_mm,
         "D0_source": d0_source,
         "droplet_center_m": droplet_center_m,
         "droplet_center_source": context["droplet_center_source"],
         "mass_d2_estimate": final_mass_k(mass_rows, d0_mm),
         "frolov_section34": tmax_summary(mass_rows),
+        "tanabe1996_induction": tanabe_induction_summary(mass_rows, context["ambient_temperature_K"]),
         "species_deltas": final_species_deltas(state_rows),
         "smoke_test_key_quantities": key_summary,
         "last_run_time": log_summary["last_run_time"],
