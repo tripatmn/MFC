@@ -228,6 +228,9 @@ module m_global_parameters
     logical :: chem_reaction_heat_enable !< Enable multi-fluid reaction enthalpy feedback
     real(wp) :: chem_reaction_heat_limit_frac !< Fractional per-step reaction heat limiter
     logical :: chem_reaction_heat_diag !< Enable reaction heat debug diagnostics
+    logical :: chem_species_nonneg_limiter !< Enable chemistry species non-negativity limiter
+    real(wp) :: chem_alpha_gas_min !< Minimum gas volume fraction for chemistry
+    real(wp) :: chem_rho_gas_min !< Minimum gas density for chemistry
     logical :: user_species_source !< User-defined species source hook toggle
     integer :: user_species_id !< Species index for user-defined source term
     real(wp) :: user_species_src !< User-defined source term value
@@ -615,6 +618,9 @@ contains
         chem_reaction_heat_enable = .false.
         chem_reaction_heat_limit_frac = 0._wp
         chem_reaction_heat_diag = .false.
+        chem_species_nonneg_limiter = .false.
+        chem_alpha_gas_min = 0.0_wp
+        chem_rho_gas_min = 1.0e-14_wp
         user_species_source = .false.
         user_species_id = 1
         user_species_src = 0._wp
