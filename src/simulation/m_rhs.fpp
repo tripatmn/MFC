@@ -676,6 +676,7 @@ contains
         integer :: user_species_eqn
         integer :: fuel_species_eqn
         integer :: liquid_alpha_eqn
+        real(wp) :: alpha_liq, gas_alpha, gas_mass
         integer(kind=8) :: i, j, k, l, q !< Generic loop iterators
 
         call nvtxStartRange("COMPUTE-RHS")
@@ -1122,11 +1123,21 @@ contains
                 evap_liquid_fluid_id >= 1 .and. evap_liquid_fluid_id <= num_fluids) then
                 fuel_species_eqn = chemxb + fuel_species_id - 1
                 liquid_alpha_eqn = advxb + evap_liquid_fluid_id - 1
-                $:GPU_PARALLEL_LOOP(private='[j,k,l]', collapse=3)
+                $:GPU_PARALLEL_LOOP(private='[i,j,k,l,alpha_liq,gas_alpha,gas_mass]', collapse=3)
                 do l = 0, p
                     do k = 0, n
                         do j = 0, m
-                            if (q_prim_qp%vf(liquid_alpha_eqn)%sf(j, k, l) > evap_alpha_thresh) then
+                            alpha_liq = q_prim_qp%vf(liquid_alpha_eqn)%sf(j, k, l)
+                            gas_alpha = 0._wp
+                            gas_mass = 0._wp
+                            do i = 1, num_fluids
+                                if (i /= evap_liquid_fluid_id) then
+                                    gas_alpha = gas_alpha + q_prim_qp%vf(advxb + i - 1)%sf(j, k, l)
+                                    gas_mass = gas_mass + q_cons_qp%vf(contxb + i - 1)%sf(j, k, l)
+                                end if
+                            end do
+                            if (alpha_liq > evap_alpha_thresh .and. alpha_liq <= evap_species_liq_max .and. &
+                                gas_alpha > evap_species_alpha_min .and. gas_mass > evap_species_mass_min) then
                                 rhs_vf(fuel_species_eqn)%sf(j, k, l) = rhs_vf(fuel_species_eqn)%sf(j, k, l) + evap_species_src
                             end if
                         end do

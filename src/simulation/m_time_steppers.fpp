@@ -811,21 +811,35 @@ contains
         type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
         real(wp), intent(in) :: ldt
         integer :: fuel_species_eqn
-        integer :: j, k, l
+        integer :: i, j, k, l
+        real(wp) :: alpha_liq, gas_alpha, gas_mass
 
         if (.not. relax) return
         if (.not. chemistry) return
         if (.not. evap_species_source) return
         if (fuel_species_id < 1 .or. fuel_species_id > (chemxe - chemxb + 1)) return
+        if (evap_liquid_fluid_id < 1 .or. evap_liquid_fluid_id > num_fluids) return
 
         fuel_species_eqn = chemxb + fuel_species_id - 1
 
-        $:GPU_PARALLEL_LOOP(collapse=3, private='[j,k,l]')
+        $:GPU_PARALLEL_LOOP(collapse=3, private='[i,j,k,l,alpha_liq,gas_alpha,gas_mass]')
         do l = 0, p
             do k = 0, n
                 do j = 0, m
-                    q_cons_vf(fuel_species_eqn)%sf(j, k, l) = q_cons_vf(fuel_species_eqn)%sf(j, k, l) &
-                                                               + ldt*max(0._wp, m_dot_evap%sf(j, k, l))
+                    alpha_liq = q_cons_vf(advxb + evap_liquid_fluid_id - 1)%sf(j, k, l)
+                    gas_alpha = 0._wp
+                    gas_mass = 0._wp
+                    do i = 1, num_fluids
+                        if (i /= evap_liquid_fluid_id) then
+                            gas_alpha = gas_alpha + q_cons_vf(advxb + i - 1)%sf(j, k, l)
+                            gas_mass = gas_mass + q_cons_vf(contxb + i - 1)%sf(j, k, l)
+                        end if
+                    end do
+                    if (alpha_liq <= evap_species_liq_max .and. gas_alpha > evap_species_alpha_min .and. &
+                        gas_mass > evap_species_mass_min) then
+                        q_cons_vf(fuel_species_eqn)%sf(j, k, l) = q_cons_vf(fuel_species_eqn)%sf(j, k, l) &
+                                                                   + ldt*max(0._wp, m_dot_evap%sf(j, k, l))
+                    end if
                 end do
             end do
         end do

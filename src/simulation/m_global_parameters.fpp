@@ -484,12 +484,16 @@ module m_global_parameters
     real(wp) :: evap_alpha_thresh !< Liquid volume-fraction threshold for species source activation
     real(wp) :: evap_alpha_lo !< Lower liquid volume-fraction bound for interface-band species source
     real(wp) :: evap_alpha_hi !< Upper liquid volume-fraction bound for interface-band species source
+    real(wp) :: evap_species_alpha_min !< Minimum gas volume fraction for evaporation-to-species coupling
+    real(wp) :: evap_species_mass_min !< Minimum gas alpha-rho for evaporation-to-species coupling
+    real(wp) :: evap_species_liq_max !< Maximum liquid volume fraction for evaporation-to-species coupling
     $:GPU_DECLARE(create='[chem_params,chem_gas_fluid_id,chem_gas_num_fluids,chem_gas_fluid_ids, &
         & chem_fixed_T_enable,chem_fixed_T,chem_T_min,chem_T_max, &
         & chem_reaction_heat_enable,chem_reaction_heat_limit_frac,chem_reaction_heat_diag, &
         & user_species_source,user_species_id,user_species_src, &
         & fuel_species_id,evap_species_source,evap_species_src,evap_liquid_fluid_id,evap_alpha_thresh, &
-        & evap_alpha_lo,evap_alpha_hi]')
+        & evap_alpha_lo,evap_alpha_hi, &
+        & evap_species_alpha_min,evap_species_mass_min,evap_species_liq_max]')
 
     !> @name Physical bubble parameters (see Ando 2010, Preston 2007)
     !> @{
@@ -700,6 +704,9 @@ contains
         evap_alpha_thresh = 0.01_wp
         evap_alpha_lo = 1e-3_wp
         evap_alpha_hi = 1._wp - 1e-3_wp
+        evap_species_alpha_min = 0._wp
+        evap_species_mass_min = 0._wp
+        evap_species_liq_max = 1._wp
 
         num_bc_patches = 0
         bc_io = .false.
@@ -1292,6 +1299,18 @@ contains
             if (evap_alpha_hi > 1._wp) then
                 evap_alpha_hi = 1._wp
             end if
+            if (evap_species_alpha_min < 0._wp) then
+                evap_species_alpha_min = 0._wp
+            end if
+            if (evap_species_mass_min < 0._wp) then
+                evap_species_mass_min = 0._wp
+            end if
+            if (evap_species_liq_max > 1._wp) then
+                evap_species_liq_max = 1._wp
+            end if
+            if (evap_species_liq_max < 0._wp) then
+                evap_species_liq_max = 0._wp
+            end if
             if (chem_T_min <= 0._wp) then
                 chem_T_min = 250._wp
             end if
@@ -1427,7 +1446,8 @@ contains
             & chem_reaction_heat_enable,chem_reaction_heat_limit_frac,chem_reaction_heat_diag, &
             & user_species_source,user_species_id,user_species_src, &
             & fuel_species_id,evap_species_source,evap_species_src,evap_liquid_fluid_id,evap_alpha_thresh, &
-            & evap_alpha_lo,evap_alpha_hi]')
+            & evap_alpha_lo,evap_alpha_hi, &
+            & evap_species_alpha_min,evap_species_mass_min,evap_species_liq_max]')
 
         $:GPU_UPDATE(device='[cont_damage,tau_star,cont_damage_s,alpha_bar]')
 

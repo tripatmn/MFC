@@ -325,6 +325,9 @@ module m_global_parameters
     real(wp) :: evap_alpha_thresh !< Liquid volume-fraction threshold for species source activation
     real(wp) :: evap_alpha_lo !< Lower liquid volume-fraction bound for interface-band species source
     real(wp) :: evap_alpha_hi !< Upper liquid volume-fraction bound for interface-band species source
+    real(wp) :: evap_species_alpha_min !< Minimum gas volume fraction for evaporation-to-species coupling
+    real(wp) :: evap_species_mass_min !< Minimum gas alpha-rho for evaporation-to-species coupling
+    real(wp) :: evap_species_liq_max !< Maximum liquid volume fraction for evaporation-to-species coupling
     !> @name Bubble modeling variables and parameters
     !> @{
     integer :: nb
@@ -557,6 +560,9 @@ contains
         evap_alpha_thresh = 0.01_wp
         evap_alpha_lo = 1e-3_wp
         evap_alpha_hi = 1._wp - 1e-3_wp
+        evap_species_alpha_min = 0._wp
+        evap_species_mass_min = 0._wp
+        evap_species_liq_max = 1._wp
 
         ! Tait EOS
         rhoref = dflt_real

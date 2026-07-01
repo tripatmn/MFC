@@ -164,7 +164,8 @@ contains
             & 'tau_star', 'cont_damage_s', 'alpha_bar', 'adap_dt_tol', &
             & 'ic_eps', 'ic_beta', 'hyper_cleaning_speed', &
             & 'hyper_cleaning_tau', 'user_species_src', 'evap_species_src', &
-            & 'evap_alpha_thresh', 'evap_alpha_lo', 'evap_alpha_hi' ]
+            & 'evap_alpha_thresh', 'evap_alpha_lo', 'evap_alpha_hi', &
+            & 'evap_species_alpha_min', 'evap_species_mass_min', 'evap_species_liq_max' ]
             call MPI_BCAST(${VAR}$, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
         #:endfor
 

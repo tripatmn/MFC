@@ -121,7 +121,8 @@ contains
             chem_reaction_heat_enable, chem_reaction_heat_limit_frac, chem_reaction_heat_diag, &
             user_species_source, user_species_id, user_species_src, &
             fuel_species_id, evap_species_source, evap_species_src, &
-            evap_liquid_fluid_id, evap_alpha_thresh, evap_alpha_lo, evap_alpha_hi
+            evap_liquid_fluid_id, evap_alpha_thresh, evap_alpha_lo, evap_alpha_hi, &
+            evap_species_alpha_min, evap_species_mass_min, evap_species_liq_max
 
         ! Inquiring the status of the post_process.inp file
         file_loc = 'post_process.inp'

@@ -218,6 +218,9 @@ _SIMPLE_DESCS = {
     "evap_species_src": "Evaporation source term value for selected fuel species",
     "evap_liquid_fluid_id": "Liquid fluid index used for evaporation source gating",
     "evap_alpha_thresh": "Liquid volume-fraction threshold for evaporation species source",
+    "evap_species_alpha_min": "Minimum gas volume fraction for evaporation-to-species source coupling",
+    "evap_species_mass_min": "Minimum gas alpha-rho for evaporation-to-species source coupling",
+    "evap_species_liq_max": "Maximum liquid volume fraction for evaporation-to-species source coupling",
     "evap_alpha_lo": "Lower liquid volume-fraction bound for interface-band evaporation species source",
     "evap_alpha_hi": "Upper liquid volume-fraction bound for interface-band evaporation species source",
     "surface_tension": "Enable surface tension",
@@ -954,6 +957,9 @@ def _load():  # pylint: disable=too-many-locals,too-many-statements
     _r("evap_alpha_thresh", REAL, {"chemistry"})
     _r("evap_alpha_lo", REAL, {"chemistry"})
     _r("evap_alpha_hi", REAL, {"chemistry"})
+    _r("evap_species_alpha_min", REAL, {"chemistry"})
+    _r("evap_species_mass_min", REAL, {"chemistry"})
+    _r("evap_species_liq_max", REAL, {"chemistry"})
 
     # --- Acoustic ---
     _r("num_source", INT, {"acoustic"})
