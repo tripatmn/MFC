@@ -835,7 +835,7 @@ contains
                             gas_mass = gas_mass + q_cons_vf(contxb + i - 1)%sf(j, k, l)
                         end if
                     end do
-                    if (alpha_liq <= evap_species_liq_max .and. gas_alpha > evap_species_alpha_min .and. &
+                    if (alpha_liq > evap_alpha_thresh .and. alpha_liq < evap_species_liq_max .and. gas_alpha > evap_species_alpha_min .and. &
                         gas_mass > evap_species_mass_min) then
                         q_cons_vf(fuel_species_eqn)%sf(j, k, l) = q_cons_vf(fuel_species_eqn)%sf(j, k, l) &
                                                                    + ldt*max(0._wp, m_dot_evap%sf(j, k, l))
