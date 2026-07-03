@@ -76,6 +76,136 @@ contains
         call flush(output_unit)
     end subroutine s_zhang_evap_hang_comm_trace
 
+    logical function s_ybc_edge_state_debug_active() result(is_active)
+        character(len=16) :: env_value
+        integer :: env_status
+
+        call get_environment_variable("TEMP_YBC_EDGE_STATE_DEBUG", env_value, status=env_status)
+        is_active = env_status == 0 .and. trim(env_value) == "1"
+    end function s_ybc_edge_state_debug_active
+
+    subroutine s_ybc_edge_prim_debug_cell(q_vf, label, t_step, stage, cell_j, cell_k, cell_l)
+        type(scalar_field), dimension(sys_size), intent(in) :: q_vf
+        character(len=*), intent(in) :: label
+        integer, intent(in) :: t_step, stage, cell_j, cell_k, cell_l
+
+        integer :: global_j, global_k, global_l
+        logical :: triggered
+        character(len=160) :: reason
+        real(wp) :: alpha_liq, alpha_vap, alpha_air, alpha_sum
+        real(wp) :: arho_liq, arho_vap, arho_air, gas_alpha, gas_mass
+        real(wp) :: rho, pressure, vel_x, vel_y, vel_mag, mom_x, mom_y
+
+        if (cell_j < lbound(q_vf(1)%sf, 1) .or. cell_j > ubound(q_vf(1)%sf, 1)) return
+        if (cell_k < lbound(q_vf(1)%sf, 2) .or. cell_k > ubound(q_vf(1)%sf, 2)) return
+        if (cell_l < lbound(q_vf(1)%sf, 3) .or. cell_l > ubound(q_vf(1)%sf, 3)) return
+
+        alpha_liq = 0._wp
+        alpha_vap = 0._wp
+        alpha_air = 0._wp
+        arho_liq = 0._wp
+        arho_vap = 0._wp
+        arho_air = 0._wp
+        if (num_fluids >= 1) then
+            alpha_liq = q_vf(advxb)%sf(cell_j, cell_k, cell_l)
+            arho_liq = q_vf(contxb)%sf(cell_j, cell_k, cell_l)
+        end if
+        if (num_fluids >= 2) then
+            alpha_vap = q_vf(advxb + 1)%sf(cell_j, cell_k, cell_l)
+            arho_vap = q_vf(contxb + 1)%sf(cell_j, cell_k, cell_l)
+        end if
+        if (num_fluids >= 3) then
+            alpha_air = q_vf(advxb + 2)%sf(cell_j, cell_k, cell_l)
+            arho_air = q_vf(contxb + 2)%sf(cell_j, cell_k, cell_l)
+        end if
+        alpha_sum = alpha_liq + alpha_vap + alpha_air
+        gas_alpha = alpha_vap + alpha_air
+        gas_mass = arho_vap + arho_air
+        rho = arho_liq + arho_vap + arho_air
+
+        pressure = q_vf(E_idx)%sf(cell_j, cell_k, cell_l)
+        vel_x = 0._wp
+        vel_y = 0._wp
+        if (num_vels >= 1) vel_x = q_vf(momxb)%sf(cell_j, cell_k, cell_l)
+        if (num_vels >= 2) vel_y = q_vf(momxb + 1)%sf(cell_j, cell_k, cell_l)
+        vel_mag = sqrt(vel_x*vel_x + vel_y*vel_y)
+        mom_x = rho*vel_x
+        mom_y = rho*vel_y
+
+        triggered = .false.
+        reason = "ok"
+        if (alpha_liq /= alpha_liq .or. alpha_vap /= alpha_vap .or. alpha_air /= alpha_air) then
+            triggered = .true.; reason = "alpha_nonfinite"
+        elseif (alpha_liq < -1.e-8_wp .or. alpha_vap < -1.e-8_wp .or. alpha_air < -1.e-8_wp .or. &
+                alpha_liq > 1._wp + 1.e-8_wp .or. alpha_vap > 1._wp + 1.e-8_wp .or. &
+                alpha_air > 1._wp + 1.e-8_wp) then
+            triggered = .true.; reason = "alpha_bounds"
+        elseif (abs(alpha_sum - 1._wp) > 1.e-3_wp) then
+            triggered = .true.; reason = "alpha_sum"
+        elseif (pressure /= pressure .or. pressure < 1._wp) then
+            triggered = .true.; reason = "pressure"
+        elseif (abs(vel_x) > 1.e6_wp .or. abs(vel_y) > 1.e6_wp) then
+            triggered = .true.; reason = "velocity"
+        end if
+
+        if (.not. triggered) return
+
+        global_j = cell_j
+        global_k = cell_k
+        global_l = cell_l
+        if (allocated(start_idx)) then
+            if (size(start_idx) >= 1) global_j = start_idx(1) + cell_j
+            if (size(start_idx) >= 2) global_k = start_idx(2) + cell_k
+            if (size(start_idx) >= 3) global_l = start_idx(3) + cell_l
+        end if
+
+        print '(" TEMP_YBC_EDGE_STATE_DEBUG label=", A, " rank=", I6, " t_step=", I10, " stage=", I4, &
+            &" local_ijk=", 3(I8,1X), " global_ijk=", 3(I8,1X), " x=", ES14.6, " y=", ES14.6, &
+            &" reason=", A)', &
+            trim(label), proc_rank, t_step, stage, cell_j, cell_k, cell_l, global_j, global_k, global_l, &
+            x_cc(max(min(cell_j, ubound(x_cc, 1)), lbound(x_cc, 1))), &
+            y_cc(max(min(cell_k, ubound(y_cc, 1)), lbound(y_cc, 1))), trim(reason)
+        print '(" TEMP_YBC_EDGE_STATE_DEBUG_PRIM alpha_liq=", ES14.6, " alpha_vap=", ES14.6, &
+            &" alpha_air=", ES14.6, " alpha_sum=", ES14.6, " arho_liq=", ES14.6, &
+            &" arho_vap=", ES14.6, " arho_air=", ES14.6, " gas_alpha=", ES14.6, &
+            &" gas_mass=", ES14.6)', &
+            alpha_liq, alpha_vap, alpha_air, alpha_sum, arho_liq, arho_vap, arho_air, gas_alpha, gas_mass
+        print '(" TEMP_YBC_EDGE_STATE_DEBUG_PRIM_FLOW rho=", ES14.6, " pressure=", ES14.6, &
+            &" mom_x_est=", ES14.6, " mom_y_est=", ES14.6, " u=", ES14.6, " v=", ES14.6, &
+            &" vel_mag=", ES14.6)', &
+            rho, pressure, mom_x, mom_y, vel_x, vel_y, vel_mag
+        call flush(output_unit)
+    end subroutine s_ybc_edge_prim_debug_cell
+
+    subroutine s_ybc_edge_prim_debug_report(q_vf, label, t_step, stage)
+        type(scalar_field), dimension(sys_size), intent(in) :: q_vf
+        character(len=*), intent(in) :: label
+        integer, intent(in) :: t_step, stage
+
+        integer :: cell_j, offset, l0
+        integer :: j_left_end, j_right_beg
+        integer, dimension(4) :: k_cells
+
+        if (.not. s_ybc_edge_state_debug_active()) return
+        if (n == 0) return
+
+        l0 = 0
+        j_left_end = min(m, 3)
+        j_right_beg = max(0, m - 3)
+        k_cells = [0, n, -1, n + 1]
+
+        do offset = 0, j_left_end
+            do cell_j = 1, 4
+                call s_ybc_edge_prim_debug_cell(q_vf, label, t_step, stage, offset, k_cells(cell_j), l0)
+            end do
+        end do
+        do offset = j_right_beg, m
+            do cell_j = 1, 4
+                call s_ybc_edge_prim_debug_cell(q_vf, label, t_step, stage, offset, k_cells(cell_j), l0)
+            end do
+        end do
+    end subroutine s_ybc_edge_prim_debug_report
+
     !> @brief Allocates and sets up boundary condition buffer arrays for all coordinate directions.
     impure subroutine s_initialize_boundary_common_module()
 
@@ -299,6 +429,8 @@ contains
                 call s_zhang_evap_hang_comm_trace(diag_t_step, diag_stage, 2, 1, sys_size, &
                                                   "Y_END_LOCAL_BC_KERNEL_END")
             end if
+
+            call s_ybc_edge_prim_debug_report(q_prim_vf, "AFTER_Y_BOUNDARY_GHOST_FILL", diag_t_step, diag_stage)
 
         #:endif
 
