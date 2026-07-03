@@ -212,6 +212,12 @@ contains
         is_active = env_status == 0 .and. trim(env_value) == "1"
     end function s_ybc_edge_state_debug_active
 
+    logical function s_ybc_edge_bad_real(value) result(is_bad)
+        real(wp), intent(in) :: value
+
+        is_bad = value /= value .or. abs(value) > huge(1._wp)/10._wp
+    end function s_ybc_edge_bad_real
+
     subroutine s_ybc_edge_cons_debug_cell(q_cons_vf, label, t_step, stage, cell_j, cell_k, cell_l)
         type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
         character(len=*), intent(in) :: label
@@ -274,17 +280,22 @@ contains
 
         triggered = .false.
         reason = "ok"
-        if (alpha_liq /= alpha_liq .or. alpha_vap /= alpha_vap .or. alpha_air /= alpha_air) then
-            triggered = .true.; reason = "alpha_nonfinite"
-        elseif (alpha_liq < -1.e-8_wp .or. alpha_vap < -1.e-8_wp .or. alpha_air < -1.e-8_wp .or. &
-                alpha_liq > 1._wp + 1.e-8_wp .or. alpha_vap > 1._wp + 1.e-8_wp .or. &
-                alpha_air > 1._wp + 1.e-8_wp) then
-            triggered = .true.; reason = "alpha_bounds"
-        elseif (abs(alpha_sum - 1._wp) > 1.e-3_wp) then
+        if (s_ybc_edge_bad_real(alpha_liq) .or. s_ybc_edge_bad_real(alpha_vap) .or. &
+            s_ybc_edge_bad_real(alpha_air) .or. s_ybc_edge_bad_real(arho_liq) .or. &
+            s_ybc_edge_bad_real(arho_vap) .or. s_ybc_edge_bad_real(arho_air) .or. &
+            s_ybc_edge_bad_real(rho) .or. s_ybc_edge_bad_real(pressure) .or. &
+            s_ybc_edge_bad_real(mom_x) .or. s_ybc_edge_bad_real(mom_y) .or. &
+            s_ybc_edge_bad_real(vel_x) .or. s_ybc_edge_bad_real(vel_y)) then
+            triggered = .true.; reason = "nonfinite"
+        elseif (alpha_air > 1.05_wp) then
+            triggered = .true.; reason = "alpha_air_high"
+        elseif (gas_alpha > 1.05_wp) then
+            triggered = .true.; reason = "gas_alpha_high"
+        elseif (alpha_sum < 0.95_wp .or. alpha_sum > 1.05_wp) then
             triggered = .true.; reason = "alpha_sum"
-        elseif (pressure /= pressure .or. pressure < 1._wp) then
-            triggered = .true.; reason = "pressure"
-        elseif (abs(vel_x) > 1.e6_wp .or. abs(vel_y) > 1.e6_wp) then
+        elseif (pressure <= 1000._wp) then
+            triggered = .true.; reason = "pressure_low"
+        elseif (abs(vel_x) > 1.e5_wp .or. abs(vel_y) > 1.e5_wp) then
             triggered = .true.; reason = "velocity"
         end if
 
@@ -322,26 +333,19 @@ contains
         character(len=*), intent(in) :: label
         integer, intent(in) :: t_step, stage
 
-        integer :: cell_j, offset, l0
-        integer :: j_left_end, j_right_beg
-        integer, dimension(4) :: k_cells
+        integer :: cell_j, cell_k, l0
+        integer :: j_right_beg, k_top_beg
 
         if (.not. s_ybc_edge_state_debug_active()) return
         if (n == 0) return
 
         l0 = 0
-        j_left_end = min(m, 3)
-        j_right_beg = max(0, m - 3)
-        k_cells = [0, n, -1, n + 1]
+        j_right_beg = max(0, m - 4)
+        k_top_beg = max(0, n - 4)
 
-        do offset = 0, j_left_end
-            do cell_j = 1, 4
-                call s_ybc_edge_cons_debug_cell(q_cons_vf, label, t_step, stage, offset, k_cells(cell_j), l0)
-            end do
-        end do
-        do offset = j_right_beg, m
-            do cell_j = 1, 4
-                call s_ybc_edge_cons_debug_cell(q_cons_vf, label, t_step, stage, offset, k_cells(cell_j), l0)
+        do cell_j = j_right_beg, m
+            do cell_k = k_top_beg, n
+                call s_ybc_edge_cons_debug_cell(q_cons_vf, label, t_step, stage, cell_j, cell_k, l0)
             end do
         end do
     end subroutine s_ybc_edge_cons_debug_report
@@ -1211,7 +1215,8 @@ contains
     end subroutine s_dt_collapse_debug_report
 
     !> @brief Computes the global time step size from CFL stability constraints across all cells.
-    impure subroutine s_compute_dt()
+    impure subroutine s_compute_dt(t_step_debug)
+        integer, intent(in), optional :: t_step_debug
 
         real(wp) :: rho        !< Cell-avg. density
         #:if not MFC_CASE_OPTIMIZATION and USING_AMD
@@ -1233,8 +1238,11 @@ contains
 
         real(wp) :: dt_local
         integer :: j, k, l !< Generic loop iterators
+        integer :: ybc_debug_t_step
 
-        call s_ybc_edge_cons_debug_report(q_cons_ts(1)%vf, "COMPUTE_DT_BEFORE_CONS_TO_PRIM", -1, 0)
+        ybc_debug_t_step = -1
+        if (present(t_step_debug)) ybc_debug_t_step = t_step_debug
+        call s_ybc_edge_cons_debug_report(q_cons_ts(1)%vf, "COMPUTE_DT_BEFORE_CONS_TO_PRIM", ybc_debug_t_step, 0)
 
         if (.not. igr .or. dummy) then
             call s_convert_conservative_to_primitive_variables( &

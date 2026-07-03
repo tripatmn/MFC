@@ -430,8 +430,6 @@ contains
                                                   "Y_END_LOCAL_BC_KERNEL_END")
             end if
 
-            call s_ybc_edge_prim_debug_report(q_prim_vf, "AFTER_Y_BOUNDARY_GHOST_FILL", diag_t_step, diag_stage)
-
         #:endif
 
         ! Population of Buffers in z-direction

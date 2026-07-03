@@ -804,9 +804,9 @@ contains
         call s_zhang_evap_hang_trace(t_step, 0, "TIMESTEP_BEGIN")
 
         if (cfl_dt) then
-            if (cfl_const_dt .and. t_step == 0) call s_compute_dt()
+            if (cfl_const_dt .and. t_step == 0) call s_compute_dt(t_step)
 
-            if (cfl_adap_dt) call s_compute_dt()
+            if (cfl_adap_dt) call s_compute_dt(t_step)
 
             if (t_step == 0) dt_init = dt
 
