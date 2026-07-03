@@ -40,7 +40,7 @@ module m_time_steppers
 
     use m_nvtx
 
-    use m_thermochem, only: num_species
+    use m_thermochem, only: num_species, species_names
 
     use m_body_forces
 
@@ -883,6 +883,189 @@ contains
         end if
 
     end subroutine s_adaptive_dt_bubble
+
+    pure function s_dt_debug_lowercase(value) result(lower_value)
+        character(len=*), intent(in) :: value
+        character(len=len(value)) :: lower_value
+        integer :: i, c
+
+        lower_value = value
+        do i = 1, len(value)
+            c = iachar(value(i:i))
+            if (c >= iachar('A') .and. c <= iachar('Z')) then
+                lower_value(i:i) = achar(c + iachar('a') - iachar('A'))
+            end if
+        end do
+    end function s_dt_debug_lowercase
+
+    integer function s_dt_debug_species_index(name) result(species_id)
+        character(len=*), intent(in) :: name
+        integer :: sp
+        character(len=:), allocatable :: target_name, candidate_name
+
+        species_id = 0
+        target_name = trim(adjustl(s_dt_debug_lowercase(name)))
+        do sp = 1, num_species
+            candidate_name = trim(adjustl(s_dt_debug_lowercase(species_names(sp))))
+            if (candidate_name == target_name) then
+                species_id = sp
+                return
+            end if
+        end do
+    end function s_dt_debug_species_index
+
+    subroutine s_dt_collapse_debug_report(t_step, time_value)
+        integer, intent(in) :: t_step
+        real(wp), intent(in) :: time_value
+
+        integer, parameter :: dt_debug_species_count = 7
+        character(len=16), dimension(dt_debug_species_count), parameter :: dt_debug_species_names = &
+            [character(len=16) :: "NC12H26", "O2", "OH", "HO2", "H2O2", "CO2", "H2O"]
+
+        character(len=16) :: env_value
+        character(len=32) :: region_label
+        integer :: env_status
+        integer :: j, k, l, id, species_pos, species_id, species_eqn
+        integer :: best_j, best_k, best_l
+        integer :: global_j, global_k, global_l
+        integer :: gas_idx, gas_fluid_id
+        logical :: found_finite
+        real(wp) :: local_min_dt, cfl_denom, x_loc, y_loc
+        real(wp) :: rho, vel_sum, pres, gamma, pi_inf, qv, c, H
+        real(wp) :: vel_x, vel_y, vel_z
+        real(wp) :: alpha_liq, alpha_vap, alpha_air, gas_alpha, gas_mass
+        real(wp), dimension(dt_debug_species_count) :: species_values
+        real(wp), dimension(2) :: Re
+        #:if not MFC_CASE_OPTIMIZATION and USING_AMD
+            real(wp), dimension(3) :: vel
+            real(wp), dimension(3) :: alpha
+        #:else
+            real(wp), dimension(num_vels) :: vel
+            real(wp), dimension(num_fluids) :: alpha
+        #:endif
+
+        call get_environment_variable("TEMP_DT_COLLAPSE_DEBUG", env_value, status=env_status)
+        if (env_status /= 0 .or. trim(env_value) /= "1") return
+
+        $:GPU_UPDATE(host='[max_dt]')
+        do id = 1, sys_size
+            $:GPU_UPDATE(host='[q_cons_ts(1)%vf(id)%sf,q_prim_vf(id)%sf]')
+        end do
+
+        found_finite = .false.
+        local_min_dt = huge(1._wp)
+        best_j = 0
+        best_k = 0
+        best_l = 0
+        do l = 0, p
+            do k = 0, n
+                do j = 0, m
+                    if (max_dt(j, k, l) == max_dt(j, k, l)) then
+                        if (.not. found_finite .or. max_dt(j, k, l) < local_min_dt) then
+                            found_finite = .true.
+                            local_min_dt = max_dt(j, k, l)
+                            best_j = j
+                            best_k = k
+                            best_l = l
+                        end if
+                    end if
+                end do
+            end do
+        end do
+
+        if (.not. found_finite) then
+            local_min_dt = max_dt(0, 0, 0)
+        end if
+
+        if (local_min_dt > tiny(local_min_dt) .and. local_min_dt == local_min_dt) then
+            cfl_denom = cfl_target/local_min_dt
+        else
+            cfl_denom = huge(1._wp)
+        end if
+
+        if (igr) then
+            call s_compute_enthalpy(q_cons_ts(1)%vf, pres, rho, gamma, pi_inf, Re, H, alpha, vel, vel_sum, qv, &
+                                    best_j, best_k, best_l)
+        else
+            call s_compute_enthalpy(q_prim_vf, pres, rho, gamma, pi_inf, Re, H, alpha, vel, vel_sum, qv, &
+                                    best_j, best_k, best_l)
+        end if
+        call s_compute_speed_of_sound(pres, rho, gamma, pi_inf, H, alpha, vel_sum, 0._wp, c, qv)
+
+        vel_x = 0._wp
+        vel_y = 0._wp
+        vel_z = 0._wp
+        if (num_vels >= 1) vel_x = vel(1)
+        if (num_vels >= 2) vel_y = vel(2)
+        if (num_vels >= 3) vel_z = vel(3)
+
+        alpha_liq = 0._wp
+        alpha_vap = 0._wp
+        alpha_air = 0._wp
+        if (num_fluids >= 1) alpha_liq = q_cons_ts(1)%vf(advxb)%sf(best_j, best_k, best_l)
+        if (num_fluids >= 2) alpha_vap = q_cons_ts(1)%vf(advxb + 1)%sf(best_j, best_k, best_l)
+        if (num_fluids >= 3) alpha_air = q_cons_ts(1)%vf(advxb + 2)%sf(best_j, best_k, best_l)
+
+        gas_alpha = 0._wp
+        gas_mass = 0._wp
+        do gas_idx = 1, chem_gas_num_fluids
+            gas_fluid_id = chem_gas_fluid_ids(gas_idx)
+            if (gas_fluid_id >= 1 .and. gas_fluid_id <= num_fluids) then
+                gas_alpha = gas_alpha + q_cons_ts(1)%vf(advxb + gas_fluid_id - 1)%sf(best_j, best_k, best_l)
+                gas_mass = gas_mass + q_cons_ts(1)%vf(contxb + gas_fluid_id - 1)%sf(best_j, best_k, best_l)
+            end if
+        end do
+
+        species_values = 0._wp
+        if (chemistry) then
+            do species_pos = 1, dt_debug_species_count
+                species_id = s_dt_debug_species_index(dt_debug_species_names(species_pos))
+                if (species_id > 0) then
+                    species_eqn = chemxb + species_id - 1
+                    if (species_eqn >= chemxb .and. species_eqn <= chemxe) then
+                        species_values(species_pos) = q_cons_ts(1)%vf(species_eqn)%sf(best_j, best_k, best_l)
+                    end if
+                end if
+            end do
+        end if
+
+        global_j = best_j
+        global_k = best_k
+        global_l = best_l
+        if (allocated(start_idx)) then
+            if (size(start_idx) >= 1) global_j = start_idx(1) + best_j
+            if (size(start_idx) >= 2) global_k = start_idx(2) + best_k
+            if (size(start_idx) >= 3) global_l = start_idx(3) + best_l
+        end if
+
+        x_loc = 0._wp
+        y_loc = 0._wp
+        if (allocated(x_cc)) x_loc = x_cc(best_j)
+        if (allocated(y_cc)) y_loc = y_cc(best_k)
+
+        if (alpha_liq > 0.99_wp) then
+            region_label = "liquid_dominated"
+        elseif (alpha_liq > 0.01_wp .and. alpha_liq < 0.99_wp) then
+            region_label = "interface"
+        elseif (gas_alpha > 0.9_wp .and. alpha_liq < 0.1_wp) then
+            region_label = "gas_dominant"
+        else
+            region_label = "mixed_or_other"
+        end if
+
+        print '(" TEMP_DT_COLLAPSE_DEBUG rank=", I6, " t_step=", I10, " time=", ES16.8, " global_dt=", ES16.8, " local_min_dt=", ES16.8)', &
+            proc_rank, t_step, time_value, dt, local_min_dt
+        print '(" TEMP_DT_COLLAPSE_DEBUG_CELL rank=", I6, " local_ijk=", 3(I8,1X), " global_ijk=", 3(I8,1X), " x=", ES16.8, " y=", ES16.8)', &
+            proc_rank, best_j, best_k, best_l, global_j, global_k, global_l, x_loc, y_loc
+        print '(" TEMP_DT_COLLAPSE_DEBUG_CFL rank=", I6, " cfl_denom=", ES16.8, " u=", ES16.8, " v=", ES16.8, " w=", ES16.8, " c=", ES16.8)', &
+            proc_rank, cfl_denom, vel_x, vel_y, vel_z, c
+        print '(" TEMP_DT_COLLAPSE_DEBUG_STATE rank=", I6, " pressure=", ES16.8, " rho=", ES16.8, " alpha_liq=", ES16.8, " alpha_vap=", ES16.8, " alpha_air=", ES16.8, " gas_alpha=", ES16.8, " gas_mass=", ES16.8, " region=", A)', &
+            proc_rank, pres, rho, alpha_liq, alpha_vap, alpha_air, gas_alpha, gas_mass, trim(region_label)
+        print '(" TEMP_DT_COLLAPSE_DEBUG_SPECIES rank=", I6, " NC12H26=", ES16.8, " O2=", ES16.8, " OH=", ES16.8, " HO2=", ES16.8, " H2O2=", ES16.8, " CO2=", ES16.8, " H2O=", ES16.8)', &
+            proc_rank, species_values(1), species_values(2), species_values(3), species_values(4), &
+            species_values(5), species_values(6), species_values(7)
+        call flush(output_unit)
+    end subroutine s_dt_collapse_debug_report
 
     !> @brief Computes the global time step size from CFL stability constraints across all cells.
     impure subroutine s_compute_dt()
