@@ -1214,6 +1214,161 @@ contains
         call flush(output_unit)
     end subroutine s_dt_collapse_debug_report
 
+    logical function s_dt_target_cell_debug_active() result(is_active)
+        character(len=16) :: env_value
+        integer :: env_status
+
+        call get_environment_variable("TEMP_DT_TARGET_CELL_DEBUG", env_value, status=env_status)
+        is_active = env_status == 0 .and. trim(env_value) == "1"
+    end function s_dt_target_cell_debug_active
+
+    logical function s_dt_target_cell_debug_neighbors() result(use_neighbors)
+        character(len=16) :: env_value
+        integer :: env_status
+
+        call get_environment_variable("TEMP_DT_TARGET_CELL_DEBUG_NEIGHBORS", env_value, status=env_status)
+        use_neighbors = env_status == 0 .and. trim(env_value) == "1"
+    end function s_dt_target_cell_debug_neighbors
+
+    logical function s_dt_target_cell_selected(cell_j, cell_k, cell_l) result(selected)
+        integer, intent(in) :: cell_j, cell_k, cell_l
+
+        selected = .false.
+        if (proc_rank /= 1) return
+        if (cell_l /= 0) return
+
+        if (s_dt_target_cell_debug_neighbors()) then
+            selected = cell_j >= max(0, m - 3) .and. cell_j <= m .and. &
+                       cell_k >= max(0, n - 3) .and. cell_k <= n
+        else
+            selected = cell_j == m .and. cell_k == n
+        end if
+    end function s_dt_target_cell_selected
+
+    subroutine s_dt_target_cell_debug_report(q_vf, label, t_step, use_prim, include_cfl)
+        type(scalar_field), dimension(sys_size), intent(in) :: q_vf
+        character(len=*), intent(in) :: label
+        integer, intent(in) :: t_step
+        logical, intent(in) :: use_prim, include_cfl
+
+        integer :: cell_j, cell_k, cell_l, global_j, global_k, global_l
+        real(wp) :: alpha_liq, alpha_vap, alpha_air, alpha_sum
+        real(wp) :: arho_liq, arho_vap, arho_air, gas_alpha, gas_mass
+        real(wp) :: rho_raw, mom_x, mom_y, vel_x, vel_y, vel_mag
+        real(wp) :: e_or_p, rho, vel_sum, pres, gamma, pi_inf, qv, c, H
+        real(wp) :: max_dt_cell, cfl_denom
+        real(wp), dimension(2) :: Re
+        #:if not MFC_CASE_OPTIMIZATION and USING_AMD
+            real(wp), dimension(3) :: vel
+            real(wp), dimension(3) :: alpha
+        #:else
+            real(wp), dimension(num_vels) :: vel
+            real(wp), dimension(num_fluids) :: alpha
+        #:endif
+
+        if (.not. s_dt_target_cell_debug_active()) return
+
+        cell_l = 0
+        do cell_k = max(0, n - 3), n
+            do cell_j = max(0, m - 3), m
+                if (.not. s_dt_target_cell_selected(cell_j, cell_k, cell_l)) cycle
+
+                alpha_liq = 0._wp
+                alpha_vap = 0._wp
+                alpha_air = 0._wp
+                arho_liq = 0._wp
+                arho_vap = 0._wp
+                arho_air = 0._wp
+                if (num_fluids >= 1) then
+                    alpha_liq = q_vf(advxb)%sf(cell_j, cell_k, cell_l)
+                    arho_liq = q_vf(contxb)%sf(cell_j, cell_k, cell_l)
+                end if
+                if (num_fluids >= 2) then
+                    alpha_vap = q_vf(advxb + 1)%sf(cell_j, cell_k, cell_l)
+                    arho_vap = q_vf(contxb + 1)%sf(cell_j, cell_k, cell_l)
+                end if
+                if (num_fluids >= 3) then
+                    alpha_air = q_vf(advxb + 2)%sf(cell_j, cell_k, cell_l)
+                    arho_air = q_vf(contxb + 2)%sf(cell_j, cell_k, cell_l)
+                end if
+                alpha_sum = alpha_liq + alpha_vap + alpha_air
+                gas_alpha = alpha_vap + alpha_air
+                gas_mass = arho_vap + arho_air
+                rho_raw = arho_liq + arho_vap + arho_air
+
+                mom_x = 0._wp
+                mom_y = 0._wp
+                if (num_vels >= 1) mom_x = q_vf(momxb)%sf(cell_j, cell_k, cell_l)
+                if (num_vels >= 2) mom_y = q_vf(momxb + 1)%sf(cell_j, cell_k, cell_l)
+                if (use_prim) then
+                    vel_x = mom_x
+                    vel_y = mom_y
+                    mom_x = rho_raw*vel_x
+                    mom_y = rho_raw*vel_y
+                elseif (abs(rho_raw) > tiny(1._wp)) then
+                    vel_x = mom_x/rho_raw
+                    vel_y = mom_y/rho_raw
+                else
+                    vel_x = huge(1._wp)
+                    vel_y = huge(1._wp)
+                end if
+                vel_mag = sqrt(vel_x*vel_x + vel_y*vel_y)
+                e_or_p = q_vf(E_idx)%sf(cell_j, cell_k, cell_l)
+
+                pres = 0._wp
+                rho = rho_raw
+                c = 0._wp
+                if (use_prim) then
+                    call s_compute_enthalpy(q_vf, pres, rho, gamma, pi_inf, Re, H, alpha, vel, vel_sum, qv, &
+                                            cell_j, cell_k, cell_l)
+                    call s_compute_speed_of_sound(pres, rho, gamma, pi_inf, H, alpha, vel_sum, 0._wp, c, qv)
+                    if (num_vels >= 1) vel_x = vel(1)
+                    if (num_vels >= 2) vel_y = vel(2)
+                    vel_mag = sqrt(vel_x*vel_x + vel_y*vel_y)
+                end if
+
+                max_dt_cell = 0._wp
+                cfl_denom = 0._wp
+                if (include_cfl) then
+                    max_dt_cell = max_dt(cell_j, cell_k, cell_l)
+                    if (max_dt_cell > tiny(max_dt_cell) .and. max_dt_cell == max_dt_cell) then
+                        cfl_denom = cfl_target/max_dt_cell
+                    else
+                        cfl_denom = huge(1._wp)
+                    end if
+                end if
+
+                global_j = cell_j
+                global_k = cell_k
+                global_l = cell_l
+                if (allocated(start_idx)) then
+                    if (size(start_idx) >= 1) global_j = start_idx(1) + cell_j
+                    if (size(start_idx) >= 2) global_k = start_idx(2) + cell_k
+                    if (size(start_idx) >= 3) global_l = start_idx(3) + cell_l
+                end if
+
+                print '(" TEMP_DT_TARGET_CELL_DEBUG ", A, " rank=", I6, " t_step=", I10, &
+                    &" local_ijk=", 3(I8,1X), " global_ijk=", 3(I8,1X), " x=", ES14.6, &
+                    &" y=", ES14.6, " use_prim=", L1, " include_cfl=", L1)', &
+                    trim(label), proc_rank, t_step, cell_j, cell_k, cell_l, global_j, global_k, global_l, &
+                    x_cc(max(min(cell_j, ubound(x_cc, 1)), lbound(x_cc, 1))), &
+                    y_cc(max(min(cell_k, ubound(y_cc, 1)), lbound(y_cc, 1))), use_prim, include_cfl
+                print '(" TEMP_DT_TARGET_CELL_DEBUG_STATE alpha_liq=", ES14.6, " alpha_vap=", ES14.6, &
+                    &" alpha_air=", ES14.6, " alpha_sum=", ES14.6, " arho_liq=", ES14.6, &
+                    &" arho_vap=", ES14.6, " arho_air=", ES14.6, " gas_alpha=", ES14.6, &
+                    &" gas_mass=", ES14.6)', &
+                    alpha_liq, alpha_vap, alpha_air, alpha_sum, arho_liq, arho_vap, arho_air, &
+                    gas_alpha, gas_mass
+                print '(" TEMP_DT_TARGET_CELL_DEBUG_FLOW rho_raw=", ES14.6, " rho_thermo=", ES14.6, &
+                    &" E_or_p=", ES14.6, " pressure=", ES14.6, " mom_x=", ES14.6, " mom_y=", ES14.6, &
+                    &" u=", ES14.6, " v=", ES14.6, " vel_mag=", ES14.6, " c=", ES14.6, &
+                    &" max_dt=", ES14.6, " cfl_denom=", ES14.6)', &
+                    rho_raw, rho, e_or_p, pres, mom_x, mom_y, vel_x, vel_y, vel_mag, c, max_dt_cell, cfl_denom
+                call flush(output_unit)
+            end do
+        end do
+    end subroutine s_dt_target_cell_debug_report
+
     !> @brief Computes the global time step size from CFL stability constraints across all cells.
     impure subroutine s_compute_dt(t_step_debug)
         integer, intent(in), optional :: t_step_debug
@@ -1238,11 +1393,22 @@ contains
 
         real(wp) :: dt_local
         integer :: j, k, l !< Generic loop iterators
+        integer :: dbg_i
         integer :: ybc_debug_t_step
+        logical :: dt_target_debug
 
         ybc_debug_t_step = -1
         if (present(t_step_debug)) ybc_debug_t_step = t_step_debug
         call s_ybc_edge_cons_debug_report(q_cons_ts(1)%vf, "COMPUTE_DT_BEFORE_CONS_TO_PRIM", ybc_debug_t_step, 0)
+
+        dt_target_debug = s_dt_target_cell_debug_active()
+        if (dt_target_debug) then
+            do dbg_i = 1, sys_size
+                $:GPU_UPDATE(host='[q_cons_ts(1)%vf(dbg_i)%sf]')
+            end do
+            call s_dt_target_cell_debug_report(q_cons_ts(1)%vf, "BEFORE_CONS_TO_PRIM", &
+                                               ybc_debug_t_step, .false., .false.)
+        end if
 
         if (.not. igr .or. dummy) then
             call s_convert_conservative_to_primitive_variables( &
@@ -1250,6 +1416,22 @@ contains
                 q_T_sf, &
                 q_prim_vf, &
                 idwint)
+        end if
+
+        if (dt_target_debug) then
+            if (igr .and. .not. dummy) then
+                do dbg_i = 1, sys_size
+                    $:GPU_UPDATE(host='[q_cons_ts(1)%vf(dbg_i)%sf]')
+                end do
+                call s_dt_target_cell_debug_report(q_cons_ts(1)%vf, "AFTER_CONS_TO_PRIM", &
+                                                   ybc_debug_t_step, .false., .false.)
+            else
+                do dbg_i = 1, sys_size
+                    $:GPU_UPDATE(host='[q_prim_vf(dbg_i)%sf]')
+                end do
+                call s_dt_target_cell_debug_report(q_prim_vf, "AFTER_CONS_TO_PRIM", &
+                                                   ybc_debug_t_step, .true., .false.)
+            end if
         end if
 
         $:GPU_PARALLEL_LOOP(collapse=3, private='[vel, alpha, Re, rho, vel_sum, pres, gamma, pi_inf, c, H, qv]')
@@ -1270,6 +1452,17 @@ contains
             end do
         end do
         $:END_GPU_PARALLEL_LOOP()
+
+        if (dt_target_debug) then
+            $:GPU_UPDATE(host='[max_dt]')
+            if (igr .and. .not. dummy) then
+                call s_dt_target_cell_debug_report(q_cons_ts(1)%vf, "AFTER_CFL_KERNEL", &
+                                                   ybc_debug_t_step, .false., .true.)
+            else
+                call s_dt_target_cell_debug_report(q_prim_vf, "AFTER_CFL_KERNEL", &
+                                                   ybc_debug_t_step, .true., .true.)
+            end if
+        end if
 
         #:call GPU_PARALLEL(copyout='[dt_local]', copyin='[max_dt]')
             dt_local = minval(max_dt)
