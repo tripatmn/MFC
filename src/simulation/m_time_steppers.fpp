@@ -1393,6 +1393,14 @@ contains
         is_bad = value /= value .or. abs(value) > huge(1._wp)/10._wp
     end function s_boundary_bad_real
 
+    logical function s_boundary_cell_watched(cell_j, cell_k, cell_l) result(is_watched)
+        integer, intent(in) :: cell_j, cell_k, cell_l
+
+        is_watched = cell_l == 0 .and. &
+                     (cell_j <= min(4, m) .or. cell_j >= max(0, m - 4) .or. &
+                      cell_k <= min(4, n) .or. cell_k >= max(0, n - 4))
+    end function s_boundary_cell_watched
+
     logical function s_boundary_cell_invalid(q_vf, cell_j, cell_k, cell_l, reason) result(invalid)
         type(scalar_field), dimension(sys_size), intent(in) :: q_vf
         integer, intent(in) :: cell_j, cell_k, cell_l
@@ -1473,21 +1481,20 @@ contains
         real(wp), allocatable, dimension(:, :, :, :), intent(inout) :: q_pre
 
         integer :: i, j, k, l
-        integer :: j_beg, k_beg
 
         if (allocated(q_pre)) deallocate(q_pre)
-        j_beg = max(0, m - 4)
-        k_beg = max(0, n - 4)
-        allocate(q_pre(1:sys_size, 1:m - j_beg + 1, 1:n - k_beg + 1, 1:1))
+        allocate(q_pre(1:sys_size, 0:m, 0:n, 0:0))
 
         do i = 1, sys_size
             $:GPU_UPDATE(host='[q_vf(i)%sf]')
         end do
         do i = 1, sys_size
             do l = 0, 0
-                do k = k_beg, n
-                    do j = j_beg, m
-                        q_pre(i, j - j_beg + 1, k - k_beg + 1, 1) = q_vf(i)%sf(j, k, l)
+                do k = 0, n
+                    do j = 0, m
+                        if (s_boundary_cell_watched(j, k, l)) then
+                            q_pre(i, j, k, l) = q_vf(i)%sf(j, k, l)
+                        end if
                     end do
                 end do
             end do
@@ -1500,21 +1507,20 @@ contains
         integer, intent(in) :: t_step, stage
 
         integer :: i, j, k, l, rollback_count
-        integer :: j_beg, k_beg, global_j, global_k, global_l
+        integer :: global_j, global_k, global_l
         character(len=64) :: reason
 
         if (.not. s_boundary_cell_rollback_active()) return
 
-        j_beg = max(0, m - 4)
-        k_beg = max(0, n - 4)
         rollback_count = 0
 
         do i = 1, sys_size
             $:GPU_UPDATE(host='[q_vf(i)%sf]')
         end do
         do l = 0, 0
-            do k = k_beg, n
-                do j = j_beg, m
+            do k = 0, n
+                do j = 0, m
+                    if (.not. s_boundary_cell_watched(j, k, l)) cycle
                     if (s_boundary_cell_invalid(q_vf, j, k, l, reason)) then
                         global_j = j
                         global_k = k
@@ -1532,7 +1538,7 @@ contains
                         call flush(output_unit)
 
                         do i = 1, sys_size
-                            q_vf(i)%sf(j, k, l) = q_pre(i, j - j_beg + 1, k - k_beg + 1, 1)
+                            q_vf(i)%sf(j, k, l) = q_pre(i, j, k, l)
                         end do
                         rollback_count = rollback_count + 1
                     end if
