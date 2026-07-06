@@ -792,6 +792,8 @@ contains
         integer :: i, j, k, l, q, s !< Generic loop iterator
         real(wp) :: start, finish
         integer :: dest
+        logical :: boundary_rollback_enabled
+        real(wp), allocatable, dimension(:, :, :, :) :: boundary_rollback_pre
 
         call cpu_time(start)
         call nvtxStartRange("TIMESTEP")
@@ -833,6 +835,10 @@ contains
             end if
 
             if (bubbles_lagrange .and. .not. adap_dt) call s_update_lagrange_tdv_rk(stage=s)
+            boundary_rollback_enabled = s_boundary_cell_rollback_active()
+            if (boundary_rollback_enabled) then
+                call s_save_boundary_cell_rollback_state(q_cons_ts(1)%vf, boundary_rollback_pre)
+            end if
             call s_zhang_evap_hang_trace(t_step, s, "RK_CONS_UPDATE_BEGIN")
             $:GPU_PARALLEL_LOOP(collapse=4)
             do i = 1, sys_size
@@ -860,6 +866,10 @@ contains
             end do
             $:END_GPU_PARALLEL_LOOP()
             call s_ybc_edge_cons_debug_report(q_cons_ts(1)%vf, "RK_CONS_UPDATE_AFTER_RAW", t_step, s)
+            if (boundary_rollback_enabled) then
+                call s_apply_boundary_cell_rollback(q_cons_ts(1)%vf, boundary_rollback_pre, t_step, s)
+                if (allocated(boundary_rollback_pre)) deallocate(boundary_rollback_pre)
+            end if
             call s_zhang_evap_hang_trace(t_step, s, "RK_CONS_UPDATE_END")
 
             !Evolve pb and mv for non-polytropic qbmm
@@ -1368,6 +1378,174 @@ contains
             end do
         end do
     end subroutine s_dt_target_cell_debug_report
+
+    logical function s_boundary_cell_rollback_active() result(is_active)
+        character(len=16) :: env_value
+        integer :: env_status
+
+        call get_environment_variable("TEMP_BOUNDARY_CELL_ROLLBACK", env_value, status=env_status)
+        is_active = env_status == 0 .and. trim(env_value) == "1"
+    end function s_boundary_cell_rollback_active
+
+    logical function s_boundary_bad_real(value) result(is_bad)
+        real(wp), intent(in) :: value
+
+        is_bad = value /= value .or. abs(value) > huge(1._wp)/10._wp
+    end function s_boundary_bad_real
+
+    logical function s_boundary_cell_invalid(q_vf, cell_j, cell_k, cell_l, reason) result(invalid)
+        type(scalar_field), dimension(sys_size), intent(in) :: q_vf
+        integer, intent(in) :: cell_j, cell_k, cell_l
+        character(len=*), intent(out) :: reason
+
+        real(wp) :: alpha_liq, alpha_vap, alpha_air, alpha_sum
+        real(wp) :: arho_liq, arho_vap, arho_air, rho_raw
+        real(wp) :: mom_x, mom_y, vel_x, vel_y, vel_mag, energy_proxy
+
+        alpha_liq = 0._wp
+        alpha_vap = 0._wp
+        alpha_air = 0._wp
+        arho_liq = 0._wp
+        arho_vap = 0._wp
+        arho_air = 0._wp
+        if (num_fluids >= 1) then
+            alpha_liq = q_vf(advxb)%sf(cell_j, cell_k, cell_l)
+            arho_liq = q_vf(contxb)%sf(cell_j, cell_k, cell_l)
+        end if
+        if (num_fluids >= 2) then
+            alpha_vap = q_vf(advxb + 1)%sf(cell_j, cell_k, cell_l)
+            arho_vap = q_vf(contxb + 1)%sf(cell_j, cell_k, cell_l)
+        end if
+        if (num_fluids >= 3) then
+            alpha_air = q_vf(advxb + 2)%sf(cell_j, cell_k, cell_l)
+            arho_air = q_vf(contxb + 2)%sf(cell_j, cell_k, cell_l)
+        end if
+        alpha_sum = alpha_liq + alpha_vap + alpha_air
+        rho_raw = arho_liq + arho_vap + arho_air
+
+        mom_x = 0._wp
+        mom_y = 0._wp
+        if (num_vels >= 1) mom_x = q_vf(momxb)%sf(cell_j, cell_k, cell_l)
+        if (num_vels >= 2) mom_y = q_vf(momxb + 1)%sf(cell_j, cell_k, cell_l)
+        if (abs(rho_raw) > tiny(1._wp) .and. rho_raw == rho_raw) then
+            vel_x = mom_x/rho_raw
+            vel_y = mom_y/rho_raw
+        else
+            vel_x = huge(1._wp)
+            vel_y = huge(1._wp)
+        end if
+        vel_mag = sqrt(vel_x*vel_x + vel_y*vel_y)
+        energy_proxy = q_vf(E_idx)%sf(cell_j, cell_k, cell_l)
+
+        invalid = .true.
+        reason = "unknown"
+        if (s_boundary_bad_real(alpha_liq) .or. s_boundary_bad_real(alpha_vap) .or. &
+            s_boundary_bad_real(alpha_air)) then
+            reason = "alpha_nonfinite"
+        elseif (alpha_liq < -1.e-8_wp .or. alpha_vap < -1.e-8_wp .or. alpha_air < -1.e-8_wp) then
+            reason = "alpha_negative"
+        elseif (alpha_liq > 1.000001_wp .or. alpha_vap > 1.000001_wp .or. alpha_air > 1.000001_wp) then
+            reason = "alpha_high"
+        elseif (alpha_sum < 0.95_wp .or. alpha_sum > 1.05_wp) then
+            reason = "alpha_sum"
+        elseif (s_boundary_bad_real(arho_liq) .or. s_boundary_bad_real(arho_vap) .or. &
+                s_boundary_bad_real(arho_air)) then
+            reason = "arho_nonfinite"
+        elseif (arho_liq < -1.e-12_wp .or. arho_vap < -1.e-12_wp .or. arho_air < -1.e-12_wp) then
+            reason = "arho_negative"
+        elseif (abs(arho_liq) > 1.e6_wp .or. abs(arho_vap) > 1.e6_wp .or. abs(arho_air) > 1.e6_wp) then
+            reason = "arho_huge"
+        elseif (s_boundary_bad_real(mom_x) .or. s_boundary_bad_real(mom_y) .or. &
+                s_boundary_bad_real(vel_x) .or. s_boundary_bad_real(vel_y)) then
+            reason = "momentum_nonfinite"
+        elseif (vel_mag > 1.e5_wp) then
+            reason = "velocity_huge"
+        elseif (s_boundary_bad_real(energy_proxy) .or. energy_proxy < 0._wp .or. abs(energy_proxy) > 1.e12_wp) then
+            reason = "energy_proxy"
+        else
+            invalid = .false.
+            reason = "ok"
+        end if
+    end function s_boundary_cell_invalid
+
+    subroutine s_save_boundary_cell_rollback_state(q_vf, q_pre)
+        type(scalar_field), dimension(sys_size), intent(in) :: q_vf
+        real(wp), allocatable, dimension(:, :, :, :), intent(inout) :: q_pre
+
+        integer :: i, j, k, l
+        integer :: j_beg, k_beg
+
+        if (allocated(q_pre)) deallocate(q_pre)
+        j_beg = max(0, m - 4)
+        k_beg = max(0, n - 4)
+        allocate(q_pre(1:sys_size, 1:m - j_beg + 1, 1:n - k_beg + 1, 1:1))
+
+        do i = 1, sys_size
+            $:GPU_UPDATE(host='[q_vf(i)%sf]')
+        end do
+        do i = 1, sys_size
+            do l = 0, 0
+                do k = k_beg, n
+                    do j = j_beg, m
+                        q_pre(i, j - j_beg + 1, k - k_beg + 1, 1) = q_vf(i)%sf(j, k, l)
+                    end do
+                end do
+            end do
+        end do
+    end subroutine s_save_boundary_cell_rollback_state
+
+    subroutine s_apply_boundary_cell_rollback(q_vf, q_pre, t_step, stage)
+        type(scalar_field), dimension(sys_size), intent(inout) :: q_vf
+        real(wp), dimension(:, :, :, :), intent(in) :: q_pre
+        integer, intent(in) :: t_step, stage
+
+        integer :: i, j, k, l, rollback_count
+        integer :: j_beg, k_beg, global_j, global_k, global_l
+        character(len=64) :: reason
+
+        if (.not. s_boundary_cell_rollback_active()) return
+
+        j_beg = max(0, m - 4)
+        k_beg = max(0, n - 4)
+        rollback_count = 0
+
+        do i = 1, sys_size
+            $:GPU_UPDATE(host='[q_vf(i)%sf]')
+        end do
+        do l = 0, 0
+            do k = k_beg, n
+                do j = j_beg, m
+                    if (s_boundary_cell_invalid(q_vf, j, k, l, reason)) then
+                        global_j = j
+                        global_k = k
+                        global_l = l
+                        if (allocated(start_idx)) then
+                            if (size(start_idx) >= 1) global_j = start_idx(1) + j
+                            if (size(start_idx) >= 2) global_k = start_idx(2) + k
+                            if (size(start_idx) >= 3) global_l = start_idx(3) + l
+                        end if
+
+                        print '(" TEMP_BOUNDARY_CELL_ROLLBACK rank=", I6, " t_step=", I10, &
+                            &" stage=", I4, " local_ijk=", 3(I8,1X), " global_ijk=", 3(I8,1X), &
+                            &" reason=", A)', &
+                            proc_rank, t_step, stage, j, k, l, global_j, global_k, global_l, trim(reason)
+                        call flush(output_unit)
+
+                        do i = 1, sys_size
+                            q_vf(i)%sf(j, k, l) = q_pre(i, j - j_beg + 1, k - k_beg + 1, 1)
+                        end do
+                        rollback_count = rollback_count + 1
+                    end if
+                end do
+            end do
+        end do
+
+        if (rollback_count > 0) then
+            do i = 1, sys_size
+                $:GPU_UPDATE(device='[q_vf(i)%sf]')
+            end do
+        end if
+    end subroutine s_apply_boundary_cell_rollback
 
     !> @brief Computes the global time step size from CFL stability constraints across all cells.
     impure subroutine s_compute_dt(t_step_debug)
