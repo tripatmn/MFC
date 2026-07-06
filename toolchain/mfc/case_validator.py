@@ -1663,14 +1663,19 @@ class CaseValidator:  # pylint: disable=too-many-public-methods
         if self.get("chem_species_nonneg_limiter", 'F') == 'T':
             alpha_gas_min = self.get("chem_alpha_gas_min", 0.0)
             rho_gas_min = self.get("chem_rho_gas_min", 1.0e-14)
+            reactive_vapor_alpha_min = self.get("chem_reactive_vapor_alpha_min", 0.0)
             if alpha_gas_min is None:
                 alpha_gas_min = 0.0
             if rho_gas_min is None:
                 rho_gas_min = 1.0e-14
+            if reactive_vapor_alpha_min is None:
+                reactive_vapor_alpha_min = 0.0
             self.prohibit(alpha_gas_min < 0 or alpha_gas_min > 1,
                           "chem_alpha_gas_min must be between 0 and 1")
             self.prohibit(rho_gas_min <= 0,
                           "chem_rho_gas_min must be positive")
+            self.prohibit(reactive_vapor_alpha_min < 0 or reactive_vapor_alpha_min > 1,
+                          "chem_reactive_vapor_alpha_min must be between 0 and 1")
 
         if self.get("user_species_source", 'F') == 'T':
             sid = self.get("user_species_id", 1)

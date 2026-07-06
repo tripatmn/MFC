@@ -129,6 +129,7 @@ contains
         call MPI_BCAST(chem_reaction_heat_limit_frac, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
         call MPI_BCAST(chem_alpha_gas_min, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
         call MPI_BCAST(chem_rho_gas_min, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
+        call MPI_BCAST(chem_reactive_vapor_alpha_min, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
 
         if (chemistry) then
             #:for VAR in [ 'diffusion', 'reactions' ]

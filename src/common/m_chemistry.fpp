@@ -505,6 +505,9 @@ contains
         real(wp) :: heat_limit_frac, gas_internal_energy_density, heat_added, max_heat, heat_scale
         real(wp) :: alpha_g
         real(wp) :: chem_limiter_factor
+        real(wp) :: v_alpha
+        integer :: v_id
+        real(wp) :: v_skip
         real(wp) :: diag_qdot_h_pos, diag_qdot_h_neg, diag_qdot_e_pos, diag_qdot_e_neg
         real(wp) :: diag_raw_qdot_h_pos, diag_raw_qdot_h_neg, diag_raw_qdot_e_pos, diag_raw_qdot_e_neg
         real(wp) :: diag_src_c12h26, diag_src_o2, diag_src_co2, diag_src_h2o
@@ -558,12 +561,13 @@ contains
         diag_scale_mean_limited = 1._wp
         diag_T_clamp_count = 0._wp
         diag_max_raw_qdot_h = 0._wp
+        v_skip = 0._wp
         diag_T_max = 0._wp
         diag_p_max = 0._wp
 
         $:GPU_PARALLEL_LOOP(collapse=3, &
-            private='[Ys, omega, omega_m_species, h_rt, eqn, gas_idx, fluid_id, T, T_raw, rho, rho_g, rhoYk, raw_Y, Y_sum, omega_m, omega_m_limited, omega_finite, h_k, e_k, qdot_h_cell, qdot_e_cell, qdot_h_limited, qdot_e_limited, heat_weight, heat_weight_denom, gas_internal_energy_density, heat_added, max_heat, heat_scale, alpha_g, chem_limiter_factor]', &
-            reduction='[[diag_qdot_h_pos, diag_qdot_h_neg, diag_qdot_e_pos, diag_qdot_e_neg, diag_raw_qdot_h_pos, diag_raw_qdot_h_neg, diag_raw_qdot_e_pos, diag_raw_qdot_e_neg, diag_src_c12h26, diag_src_o2, diag_src_co2, diag_src_h2o, diag_raw_src_c12h26, diag_raw_src_o2, diag_raw_src_co2, diag_raw_src_h2o, diag_heat_applied, diag_raw_heat_applied, diag_partial_heat_applied, diag_partial_heat_skipped, diag_limited_cell_count, diag_scale_sum_limited, diag_T_clamp_count], [diag_T_max, diag_p_max, diag_max_raw_qdot_h], [diag_scale_min]]', &
+            private='[Ys, omega, omega_m_species, h_rt, eqn, gas_idx, fluid_id, T, T_raw, rho, rho_g, rhoYk, raw_Y, Y_sum, omega_m, omega_m_limited, omega_finite, h_k, e_k, qdot_h_cell, qdot_e_cell, qdot_h_limited, qdot_e_limited, heat_weight, heat_weight_denom, gas_internal_energy_density, heat_added, max_heat, heat_scale, alpha_g, chem_limiter_factor, v_alpha, v_id]', &
+            reduction='[[diag_qdot_h_pos, diag_qdot_h_neg, diag_qdot_e_pos, diag_qdot_e_neg, diag_raw_qdot_h_pos, diag_raw_qdot_h_neg, diag_raw_qdot_e_pos, diag_raw_qdot_e_neg, diag_src_c12h26, diag_src_o2, diag_src_co2, diag_src_h2o, diag_raw_src_c12h26, diag_raw_src_o2, diag_raw_src_co2, diag_raw_src_h2o, diag_heat_applied, diag_raw_heat_applied, diag_partial_heat_applied, diag_partial_heat_skipped, diag_limited_cell_count, diag_scale_sum_limited, diag_T_clamp_count, v_skip], [diag_T_max, diag_p_max, diag_max_raw_qdot_h], [diag_scale_min]]', &
             reductionOp='[+, MAX, MIN]', copyin='[bounds]')
         do z = bounds(3)%beg, bounds(3)%end
             do y = bounds(2)%beg, bounds(2)%end
@@ -587,6 +591,27 @@ contains
                             if ((.not. s_is_finite_wp(rho_g)) .or. rho_g <= chem_rho_gas_min .or. &
                                 alpha_g < chem_alpha_gas_min) then
                                 cycle
+                            end if
+
+                            if (chem_reactive_vapor_alpha_min > 0.0_wp) then
+                                if (chem_gas_num_fluids <= 0) then
+                                    v_id = chem_gas_fluid_id
+                                else
+                                    v_id = chem_gas_fluid_ids(1)
+                                end if
+
+                                if (v_id < 1 .or. v_id > num_fluids) then
+                                    cycle
+                                end if
+
+                                v_alpha = q_cons_qp(advxb + v_id - 1)%sf(x, y, z)
+
+                                if (v_alpha < chem_reactive_vapor_alpha_min) then
+                                    if (heat_diag_active) then
+                                        v_skip = v_skip + 1._wp
+                                    end if
+                                    cycle
+                                end if
                             end if
                         else
                             if ((.not. s_is_finite_wp(rho_g)) .or. rho_g <= chem_rho_g_min) then
@@ -857,7 +882,7 @@ contains
                     &" raw_src_h2o_sum=", ES16.6, " limited_src_h2o_sum=", ES16.6, &
                     &" raw_heat_E_sum=", ES16.6, " limited_heat_E_sum=", ES16.6, &
                     &" heat_partial_sum=", ES16.6, " partial_skip_count=", ES16.6, &
-                    &" T_clamp_count=", ES16.6, " max_raw_qdot_h=", ES16.6, &
+                    &" T_clamp_count=", ES16.6, " vap_alpha_skip_count=", ES16.6, " max_raw_qdot_h=", ES16.6, &
                     &" T_max=", ES16.6, " p_max=", ES16.6, &
                     &" energy_application=", A)', &
                 proc_rank, t_step, stage, heat_limit_frac, diag_limited_cell_count, &
@@ -867,7 +892,7 @@ contains
                 diag_raw_src_c12h26, diag_src_c12h26, diag_raw_src_o2, diag_src_o2, &
                 diag_raw_src_co2, diag_src_co2, diag_raw_src_h2o, diag_src_h2o, &
                 diag_raw_heat_applied, diag_heat_applied, diag_partial_heat_applied, &
-                diag_partial_heat_skipped, diag_T_clamp_count, diag_max_raw_qdot_h, &
+                diag_partial_heat_skipped, diag_T_clamp_count, v_skip, diag_max_raw_qdot_h, &
                 diag_T_max, diag_p_max, &
                 merge("TOTAL_AND_GAS_PARTIALS", "NONE                  ", apply_heat_active)
             call flush(output_unit)

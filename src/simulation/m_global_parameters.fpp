@@ -477,6 +477,7 @@ module m_global_parameters
     logical :: chem_species_nonneg_limiter !< Enable chemistry species non-negativity limiter
     real(wp) :: chem_alpha_gas_min !< Minimum gas volume fraction for chemistry
     real(wp) :: chem_rho_gas_min !< Minimum gas density for chemistry
+    real(wp) :: chem_reactive_vapor_alpha_min !< Minimum reactive vapor volume fraction for chemistry
     logical :: user_species_source !< User-defined species source hook toggle
     integer :: user_species_id !< Species index for user-defined source term
     real(wp) :: user_species_src !< User-defined source term value
@@ -490,7 +491,7 @@ module m_global_parameters
     $:GPU_DECLARE(create='[chem_params,chem_gas_fluid_id,chem_gas_num_fluids,chem_gas_fluid_ids, &
         & chem_fixed_T_enable,chem_fixed_T,chem_T_min,chem_T_max, &
         & chem_reaction_heat_enable,chem_reaction_heat_limit_frac,chem_reaction_heat_diag, &
-        & chem_species_nonneg_limiter,chem_alpha_gas_min,chem_rho_gas_min, &
+        & chem_species_nonneg_limiter,chem_alpha_gas_min,chem_rho_gas_min,chem_reactive_vapor_alpha_min, &
         & user_species_source,user_species_id,user_species_src, &
         & fuel_species_id,evap_species_source,evap_species_src,evap_liquid_fluid_id,evap_alpha_thresh, &
         & evap_alpha_lo,evap_alpha_hi]')
@@ -697,6 +698,7 @@ contains
         chem_species_nonneg_limiter = .false.
         chem_alpha_gas_min = 0.0_wp
         chem_rho_gas_min = 1.0e-14_wp
+        chem_reactive_vapor_alpha_min = 0.0_wp
         user_species_source = .false.
         user_species_id = 1
         user_species_src = 0._wp
@@ -1432,7 +1434,7 @@ contains
         $:GPU_UPDATE(device='[chem_params,chem_gas_fluid_id,chem_gas_num_fluids,chem_gas_fluid_ids, &
             & chem_fixed_T_enable,chem_fixed_T,chem_T_min,chem_T_max, &
             & chem_reaction_heat_enable,chem_reaction_heat_limit_frac,chem_reaction_heat_diag, &
-            & chem_species_nonneg_limiter,chem_alpha_gas_min,chem_rho_gas_min, &
+            & chem_species_nonneg_limiter,chem_alpha_gas_min,chem_rho_gas_min,chem_reactive_vapor_alpha_min, &
             & user_species_source,user_species_id,user_species_src, &
             & fuel_species_id,evap_species_source,evap_species_src,evap_liquid_fluid_id,evap_alpha_thresh, &
             & evap_alpha_lo,evap_alpha_hi]')

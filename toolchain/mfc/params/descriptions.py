@@ -171,6 +171,7 @@ DESCRIPTIONS = {
     "chem_species_nonneg_limiter": "Enable species non-negativity rate limiter for chemistry",
     "chem_alpha_gas_min": "Minimum gas volume fraction required to evaluate chemistry",
     "chem_rho_gas_min": "Minimum gas density required to evaluate chemistry",
+    "chem_reactive_vapor_alpha_min": "Minimum vapor carrier volume fraction required to evaluate chemistry",
     "user_species_source": "Enable user-defined source in one species equation",
     "user_species_id": "Species equation index for user source term",
     "user_species_src": "Source term added to selected species equation RHS",

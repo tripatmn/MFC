@@ -947,6 +947,7 @@ def _load():  # pylint: disable=too-many-locals,too-many-statements
     _r("chem_species_nonneg_limiter", LOG, {"chemistry"})
     _r("chem_alpha_gas_min", REAL, {"chemistry"})
     _r("chem_rho_gas_min", REAL, {"chemistry"})
+    _r("chem_reactive_vapor_alpha_min", REAL, {"chemistry"})
     _r("user_species_source", LOG, {"chemistry"})
     _r("user_species_id", INT, {"chemistry"})
     _r("user_species_src", REAL, {"chemistry"})
