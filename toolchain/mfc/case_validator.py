@@ -1672,6 +1672,9 @@ class CaseValidator:  # pylint: disable=too-many-public-methods
             ath = self.get("evap_alpha_thresh", 0.01)
             alo = self.get("evap_alpha_lo", 1e-3)
             ahi = self.get("evap_alpha_hi", 1 - 1e-3)
+            amin = self.get("evap_species_alpha_min", 0)
+            mmin = self.get("evap_species_mass_min", 0)
+            lmax = self.get("evap_species_liq_max", 1)
 
             if fsid is None:
                 fsid = 1
@@ -1683,6 +1686,12 @@ class CaseValidator:  # pylint: disable=too-many-public-methods
                 alo = 1e-3
             if ahi is None:
                 ahi = 1 - 1e-3
+            if amin is None:
+                amin = 0
+            if mmin is None:
+                mmin = 0
+            if lmax is None:
+                lmax = 1
 
             self.prohibit(fsid < 1, "fuel_species_id must be >= 1")
             self.prohibit(lid < 1, "evap_liquid_fluid_id must be >= 1")
@@ -1693,6 +1702,9 @@ class CaseValidator:  # pylint: disable=too-many-public-methods
             self.prohibit(alo < 0, "evap_alpha_lo must be >= 0")
             self.prohibit(ahi > 1, "evap_alpha_hi must be <= 1")
             self.prohibit(alo >= ahi, "evap_alpha_lo must be < evap_alpha_hi")
+            self.prohibit(amin < 0, "evap_species_alpha_min must be >= 0")
+            self.prohibit(mmin < 0, "evap_species_mass_min must be >= 0")
+            self.prohibit(lmax < 0 or lmax > 1, "evap_species_liq_max must be between 0 and 1")
 
     def check_misc_pre_process(self):
         """Checks miscellaneous pre-process constraints"""

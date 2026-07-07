@@ -152,6 +152,7 @@ contains
             user_species_source, user_species_id, user_species_src, &
             fuel_species_id, evap_species_source, evap_species_src, &
             evap_liquid_fluid_id, evap_alpha_thresh, evap_alpha_lo, evap_alpha_hi, &
+            evap_species_alpha_min, evap_species_mass_min, evap_species_liq_max, &
             simplex_perturb, simplex_params, fft_wrt
 
         ! Inquiring the status of the pre_process.inp file
