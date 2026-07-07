@@ -13,6 +13,7 @@ import csv
 import json
 import math
 import re
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -168,6 +169,31 @@ class StateSummary:
     Tmax_is_dense_core: bool
     Tmax_is_interface: bool
     Tmax_is_gas: bool
+    dense_core_equiv_D_m: float
+    Tnear_max_K: float
+    Tnear_p99_9_K: float
+    Tnear_p99_K: float
+    Tnear_mean_K: float
+    Tfar_median_K: float
+    dTnear_max_K: float
+    dTnear_p99_9_K: float
+    dTnear_p99_K: float
+    near_cells_dT_gt_20K: int
+    near_cells_dT_gt_50K: int
+    near_cells_dT_gt_100K: int
+    Tnear_max_x_m: float
+    Tnear_max_y_m: float
+    Tnear_max_r_over_D0: float
+    Ynear_HO2_max: float
+    Ynear_HO2_min: float
+    Ynear_H2O2_max: float
+    Ynear_H2O2_min: float
+    Ynear_OH_max: float
+    Ynear_OH_min: float
+    Ynear_O2_max: float
+    Ynear_O2_min: float
+    Ynear_NC12H26_max: float
+    Ynear_NC12H26_min: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -180,12 +206,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha-gas-min", type=float, default=1.0e-6)
     parser.add_argument("--alpha-liq-max-for-gas", type=float, default=0.99)
     parser.add_argument("--alpha-liq-threshold", type=float, default=0.5)
-    parser.add_argument("--d0", type=float, default=0.7e-3)
+    parser.add_argument("--d0", "--D0", dest="d0", type=float, default=0.7e-3)
     parser.add_argument("--cv-v", type=float, default=1956.0)
     parser.add_argument("--cv-air", type=float, default=717.5)
     parser.add_argument("--t-save", type=float, default=1.0e-3)
     parser.add_argument("--domain-scale", type=float, default=6.0)
     parser.add_argument("--max-states", type=int, default=None)
+    parser.add_argument("--gas-alpha-thresh", type=float, default=0.95)
+    parser.add_argument("--near-rmin-D", type=float, default=0.55)
+    parser.add_argument("--near-rmax-D", type=float, default=2.0)
+    parser.add_argument("--far-rmin-D", type=float, default=3.0)
+    parser.add_argument("--persist-frames", type=int, default=2)
+    parser.add_argument("--make-plots", action="store_true", help="Retained for compatibility; plots are made unless --skip-plots is set.")
     parser.add_argument("--skip-plots", action="store_true")
     parser.add_argument("--skip-contours", action="store_true")
     return parser.parse_args()
@@ -299,6 +331,13 @@ def finite_mean(field: np.ndarray) -> float:
     if values.size == 0:
         return math.nan
     return float(np.mean(values))
+
+
+def finite_median(field: np.ndarray) -> float:
+    values = finite_values(field)
+    if values.size == 0:
+        return math.nan
+    return float(np.median(values))
 
 
 def species_stats(y_field: np.ndarray, cell_area: float) -> dict[str, float]:
@@ -458,11 +497,67 @@ def summarize_state(
     interface_velocity = velocity_stats(interface_mask, u, v, speed)
     gas_velocity = velocity_stats(valid_gas, u, v, speed)
 
+    if np.isfinite(dense_core_centroid[0]) and np.isfinite(dense_core_centroid[1]):
+        r_from_dense_core = np.sqrt((x_grid - dense_core_centroid[0])**2 + (y_grid - dense_core_centroid[1])**2)
+    else:
+        r_from_dense_core = np.full_like(alpha_liq, np.nan, dtype=np.float64)
+
+    gas_only_mask = (
+        np.isfinite(t_gas)
+        & np.isfinite(rho_gas)
+        & np.isfinite(alpha_gas)
+        & (alpha_gas > args.gas_alpha_thresh)
+    )
+    near_shell_mask = (
+        gas_only_mask
+        & np.isfinite(r_from_dense_core)
+        & (r_from_dense_core > args.near_rmin_D*args.d0)
+        & (r_from_dense_core < args.near_rmax_D*args.d0)
+    )
+    far_gas_mask = gas_only_mask & np.isfinite(r_from_dense_core) & (r_from_dense_core > args.far_rmin_D*args.d0)
+    t_near = np.where(near_shell_mask, t_gas, np.nan)
+    t_far = np.where(far_gas_mask, t_gas, np.nan)
+    tnear_max = finite_max(t_near)
+    tnear_p99_9 = finite_percentile(t_near, 99.9)
+    tnear_p99 = finite_percentile(t_near, 99.0)
+    tnear_mean = finite_mean(t_near)
+    tfar_median = finite_median(t_far)
+    if np.isfinite(tfar_median):
+        dt_near = t_near - tfar_median
+        dtnear_max = tnear_max - tfar_median if np.isfinite(tnear_max) else math.nan
+        dtnear_p99_9 = tnear_p99_9 - tfar_median if np.isfinite(tnear_p99_9) else math.nan
+        dtnear_p99 = tnear_p99 - tfar_median if np.isfinite(tnear_p99) else math.nan
+    else:
+        dt_near = np.full_like(t_near, np.nan, dtype=np.float64)
+        dtnear_max = math.nan
+        dtnear_p99_9 = math.nan
+        dtnear_p99 = math.nan
+
+    if np.any(np.isfinite(t_near)):
+        near_flat_idx = int(np.nanargmax(t_near))
+        near_iy, near_ix = np.unravel_index(near_flat_idx, t_near.shape)
+        tnear_max_x = float(x[near_ix])
+        tnear_max_y = float(y[near_iy])
+        tnear_max_r_over_d0 = float(r_from_dense_core[near_iy, near_ix]/args.d0)
+    else:
+        near_iy = -1
+        near_ix = -1
+        tnear_max_x = math.nan
+        tnear_max_y = math.nan
+        tnear_max_r_over_d0 = math.nan
+
     y_fields = {
         name: species_y(arr, name, rho_gas, valid_gas)
         for name in TRACKED_SPECIES
     }
     y_stats = {name: species_stats(field, cell_area) for name, field in y_fields.items()}
+    y_near_stats = {
+        name: {
+            "max": finite_max(np.where(near_shell_mask, field, np.nan)),
+            "min": finite_min(np.where(near_shell_mask, field, np.nan)),
+        }
+        for name, field in y_fields.items()
+    }
 
     def at_tmax(field: np.ndarray) -> float:
         if iy < 0 or ix < 0:
@@ -583,6 +678,31 @@ def summarize_state(
         Tmax_is_dense_core=bool(iy >= 0 and ix >= 0 and dense_core_mask[iy, ix]),
         Tmax_is_interface=bool(iy >= 0 and ix >= 0 and interface_mask[iy, ix]),
         Tmax_is_gas=bool(iy >= 0 and ix >= 0 and valid_gas[iy, ix]),
+        dense_core_equiv_D_m=d05,
+        Tnear_max_K=tnear_max,
+        Tnear_p99_9_K=tnear_p99_9,
+        Tnear_p99_K=tnear_p99,
+        Tnear_mean_K=tnear_mean,
+        Tfar_median_K=tfar_median,
+        dTnear_max_K=dtnear_max,
+        dTnear_p99_9_K=dtnear_p99_9,
+        dTnear_p99_K=dtnear_p99,
+        near_cells_dT_gt_20K=int(np.count_nonzero(np.isfinite(dt_near) & (dt_near > 20.0))),
+        near_cells_dT_gt_50K=int(np.count_nonzero(np.isfinite(dt_near) & (dt_near > 50.0))),
+        near_cells_dT_gt_100K=int(np.count_nonzero(np.isfinite(dt_near) & (dt_near > 100.0))),
+        Tnear_max_x_m=tnear_max_x,
+        Tnear_max_y_m=tnear_max_y,
+        Tnear_max_r_over_D0=tnear_max_r_over_d0,
+        Ynear_HO2_max=y_near_stats["HO2"]["max"],
+        Ynear_HO2_min=y_near_stats["HO2"]["min"],
+        Ynear_H2O2_max=y_near_stats["H2O2"]["max"],
+        Ynear_H2O2_min=y_near_stats["H2O2"]["min"],
+        Ynear_OH_max=y_near_stats["OH"]["max"],
+        Ynear_OH_min=y_near_stats["OH"]["min"],
+        Ynear_O2_max=y_near_stats["O2"]["max"],
+        Ynear_O2_min=y_near_stats["O2"]["min"],
+        Ynear_NC12H26_max=y_near_stats["NC12H26"]["max"],
+        Ynear_NC12H26_min=y_near_stats["NC12H26"]["min"],
     )
     fields = {
         "alpha_liq": alpha_liq,
@@ -706,6 +826,25 @@ def plot_timeseries(summaries: list[StateSummary], out_dir: Path, dense_core_fit
         "Robust gas-temperature percentiles",
     )
     line_plot(
+        "Tnear_Tfar_vs_time.png",
+        [
+            ("Tnear p99.9", np.array([s.Tnear_p99_9_K for s in summaries])),
+            ("Tnear max", np.array([s.Tnear_max_K for s in summaries])),
+            ("Tfar median", np.array([s.Tfar_median_K for s in summaries])),
+        ],
+        "Temperature proxy [K]",
+        "Droplet-centered near-shell and far-gas temperature",
+    )
+    line_plot(
+        "dTnear_vs_time.png",
+        [
+            ("dTnear p99.9", np.array([s.dTnear_p99_9_K for s in summaries])),
+            ("dTnear max", np.array([s.dTnear_max_K for s in summaries])),
+        ],
+        "Near-shell temperature rise [K]",
+        "Droplet-centered near-shell temperature rise",
+    )
+    line_plot(
         "hot_cell_counts_vs_time.png",
         [
             (">850 K", np.array([s.gas_cells_T_gt_850K for s in summaries])),
@@ -716,6 +855,16 @@ def plot_timeseries(summaries: list[StateSummary], out_dir: Path, dense_core_fit
         ],
         "Gas-cell count",
         "Hot gas-cell counts",
+    )
+    line_plot(
+        "near_shell_hot_cell_counts_vs_time.png",
+        [
+            ("dT > 20 K", np.array([s.near_cells_dT_gt_20K for s in summaries])),
+            ("dT > 50 K", np.array([s.near_cells_dT_gt_50K for s in summaries])),
+            ("dT > 100 K", np.array([s.near_cells_dT_gt_100K for s in summaries])),
+        ],
+        "Near-shell gas-cell count",
+        "Droplet-centered near-shell hot-cell counts",
     )
     line_plot("D_over_D0_vs_time.png", [("alpha_liq > 0.5", np.array([s.D_over_D0_alpha05 for s in summaries])), ("alpha_liq > 1e-3", np.array([s.D_over_D0_alpha_lo for s in summaries]))], "D / D0", "Equivalent droplet diameter")
     line_plot("D2_over_D02_vs_time.png", [("alpha_liq > 0.5", np.array([s.D2_over_D02_alpha05 for s in summaries])), ("alpha_liq > 1e-3", np.array([s.D2_over_D02_alpha_lo for s in summaries]))], "D2 / D0^2", "Equivalent D2 regression")
@@ -808,6 +957,18 @@ def plot_timeseries(summaries: list[StateSummary], out_dir: Path, dense_core_fit
         ],
         "Gas-masked Yk p99.9",
         "Robust gas-masked species p99.9",
+    )
+    line_plot(
+        "near_shell_species_max_vs_time.png",
+        [
+            ("OH", np.array([s.Ynear_OH_max for s in summaries])),
+            ("HO2", np.array([s.Ynear_HO2_max for s in summaries])),
+            ("H2O2", np.array([s.Ynear_H2O2_max for s in summaries])),
+            ("O2", np.array([s.Ynear_O2_max for s in summaries])),
+            ("NC12H26", np.array([s.Ynear_NC12H26_max for s in summaries])),
+        ],
+        "Near-shell max Yk",
+        "Near-shell species maxima",
     )
 
 
@@ -944,6 +1105,79 @@ def first_delta_threshold(
     return {"step": None, "time_s": None, field_name: None, "threshold_K": threshold}
 
 
+def persistent_event(
+    summaries: list[StateSummary],
+    predicate,
+    persist_frames: int,
+    value_fields: tuple[str, ...],
+) -> dict[str, float | int | bool | None]:
+    persist_frames = max(1, persist_frames)
+    for start in range(0, len(summaries) - persist_frames + 1):
+        window = summaries[start : start + persist_frames]
+        if all(predicate(summary) for summary in window):
+            first = summaries[start]
+            event = {
+                "detected": True,
+                "step": first.step,
+                "time_s": first.time_s,
+                "persist_frames": persist_frames,
+            }
+            for field_name in value_fields:
+                event[field_name] = getattr(first, field_name)
+            return event
+    event = {"detected": False, "step": None, "time_s": None, "persist_frames": persist_frames}
+    for field_name in value_fields:
+        event[field_name] = None
+    return event
+
+
+def hot_ignition_condition(summary: StateSummary) -> bool:
+    hot_metric = (
+        (np.isfinite(summary.dTnear_p99_9_K) and summary.dTnear_p99_9_K >= 500.0)
+        or (np.isfinite(summary.Tnear_p99_9_K) and summary.Tnear_p99_9_K >= 1500.0)
+    )
+    return bool(hot_metric and summary.near_cells_dT_gt_100K > 0)
+
+
+def tanabe_events(summaries: list[StateSummary], persist_frames: int) -> dict[str, object]:
+    tau1_p999 = persistent_event(
+        summaries,
+        lambda s: np.isfinite(s.dTnear_p99_9_K) and s.dTnear_p99_9_K >= 20.0,
+        persist_frames,
+        ("dTnear_p99_9_K", "Tnear_p99_9_K", "Tfar_median_K"),
+    )
+    tau1_max = persistent_event(
+        summaries,
+        lambda s: np.isfinite(s.dTnear_max_K) and s.dTnear_max_K >= 20.0,
+        persist_frames,
+        ("dTnear_max_K", "Tnear_max_K", "Tfar_median_K"),
+    )
+    tau_hot = persistent_event(
+        summaries,
+        hot_ignition_condition,
+        persist_frames,
+        ("dTnear_p99_9_K", "Tnear_p99_9_K", "near_cells_dT_gt_100K"),
+    )
+    tau1_time = tau1_p999["time_s"] if tau1_p999["time_s"] is not None else tau1_max["time_s"]
+    tau2 = (
+        float(tau_hot["time_s"] - tau1_time)
+        if tau_hot["time_s"] is not None and tau1_time is not None
+        else math.nan
+    )
+    return {
+        "tau1_cool_proxy_dTnear_p99_9_gt_20K_s": tau1_p999["time_s"],
+        "tau1_cool_proxy_dTnear_max_gt_20K_s": tau1_max["time_s"],
+        "tau_hot_proxy_runaway_s": tau_hot["time_s"],
+        "tau2_proxy_s": tau2,
+        "hot_ignition": bool(tau_hot["detected"]),
+        "persist_frames": max(1, persist_frames),
+        "tau1_cool_proxy_dTnear_p99_9_event": tau1_p999,
+        "tau1_cool_proxy_dTnear_max_event": tau1_max,
+        "tau_hot_proxy_runaway_event": tau_hot,
+        "hot_ignition_definition": "persistent ((dTnear_p99.9 >= 500 K or Tnear_p99.9 >= 1500 K) and near_cells_dT_gt_100K > 0)",
+    }
+
+
 def max_dtdt(summaries: list[StateSummary]) -> float:
     best = math.nan
     for a, b in zip(summaries, summaries[1:]):
@@ -958,14 +1192,15 @@ def max_dtdt(summaries: list[StateSummary]) -> float:
 def species_normalization_warnings(summaries: list[StateSummary]) -> list[str]:
     warnings: list[str] = []
     for name in TRACKED_SPECIES:
-        max_values = np.array([getattr(s, f"Y_{name}_max") for s in summaries], dtype=np.float64)
-        min_values = np.array([getattr(s, f"Y_{name}_min") for s in summaries], dtype=np.float64)
-        max_value = finite_max(max_values)
-        min_value = finite_min(min_values)
-        if np.isfinite(max_value) and max_value > 1.0:
-            warnings.append(f"Y_{name} max exceeds 1.0: {max_value:.6e}")
-        if np.isfinite(min_value) and min_value < -1.0e-8:
-            warnings.append(f"Y_{name} min is below -1e-8: {min_value:.6e}")
+        for prefix, label in (("Y", "gas-masked"), ("Ynear", "near-shell")):
+            max_values = np.array([getattr(s, f"{prefix}_{name}_max") for s in summaries], dtype=np.float64)
+            min_values = np.array([getattr(s, f"{prefix}_{name}_min") for s in summaries], dtype=np.float64)
+            max_value = finite_max(max_values)
+            min_value = finite_min(min_values)
+            if np.isfinite(max_value) and max_value > 1.0:
+                warnings.append(f"{label} Y_{name} max exceeds 1.0: {max_value:.6e}")
+            if np.isfinite(min_value) and min_value < -1.0e-8:
+                warnings.append(f"{label} Y_{name} min is below -1e-8: {min_value:.6e}")
     return warnings
 
 
@@ -1085,6 +1320,7 @@ def main() -> None:
     absolute_820_unreliable = bool(summaries and first_induction["step"] == summaries[0].step)
     species_warnings = species_normalization_warnings(summaries)
     motion_summary = kinematic_summary(summaries, args.d0)
+    tanabe_event_summary = tanabe_events(summaries, args.persist_frames)
     summary_json = {
         "run_dir": str(args.run_dir),
         "state_count": len(summaries),
@@ -1098,9 +1334,15 @@ def main() -> None:
         "first_induction_absolute_820K_unreliable": absolute_820_unreliable,
         "first_stage_delta20_Tmax": first_stage_delta20_tmax,
         "first_stage_delta20_T99_9": first_stage_delta20_t999,
-        "total_ignition_Tmax_ge_2000K": total_ignition,
+        "internal_global_Tmax_ge_2000K_diagnostic": total_ignition,
         "max_dTmax_dt_K_s": max_dtdt(summaries),
-        "hot_ignition_by_0p15s": bool(total_ignition["time_s"] is not None and total_ignition["time_s"] <= 0.15),
+        "hot_ignition_by_0p15s_internal_global_Tmax": bool(total_ignition["time_s"] is not None and total_ignition["time_s"] <= 0.15),
+        "tanabe_droplet_centered_events": tanabe_event_summary,
+        "hot_ignition_by_0p15s": bool(
+            tanabe_event_summary["hot_ignition"]
+            and tanabe_event_summary["tau_hot_proxy_runaway_s"] is not None
+            and tanabe_event_summary["tau_hot_proxy_runaway_s"] <= 0.15
+        ),
         "dense_core_D2_fit": dense_core_fit,
         "recommended_K_label": "K_eff_dense_core, not classical K_burn, unless the fit window and R2 support a D2-law interpretation",
         "species_normalization_warnings": species_warnings,
@@ -1115,6 +1357,13 @@ def main() -> None:
             "cv_v_J_kg_K": args.cv_v,
             "cv_air_J_kg_K": args.cv_air,
             "temperature_proxy": "mass-weighted vapor/air cv temperature, gas-masked only",
+            "tanabe_event_basis": "droplet-centered near-shell gas temperature relative to far-gas median",
+            "near_shell": {
+                "gas_alpha_threshold": args.gas_alpha_thresh,
+                "rmin_over_D0": args.near_rmin_D,
+                "rmax_over_D0": args.near_rmax_D,
+                "far_rmin_over_D0": args.far_rmin_D,
+            },
         },
     }
     with (args.out_dir / "tanabe_restart_summary.json").open("w") as f:
@@ -1132,9 +1381,18 @@ def main() -> None:
         f"Absolute 820 K threshold unreliable because it fires at first state: {absolute_820_unreliable}",
         f"Baseline-corrected first-stage proxy Tmax>=initial+20 K: {first_stage_delta20_tmax}",
         f"Baseline-corrected first-stage proxy T99.9>=initial+20 K: {first_stage_delta20_t999}",
-        f"Total ignition proxy Tmax>=2000 K: {total_ignition}",
+        f"Internal global Tmax>=2000 K diagnostic: {total_ignition}",
         f"Max dTmax/dt: {summary_json['max_dTmax_dt_K_s']:.6e} K/s",
-        f"Hot ignition by 0.15 s: {summary_json['hot_ignition_by_0p15s']}",
+        f"Hot ignition by 0.15 s, Tanabe near-shell proxy: {summary_json['hot_ignition_by_0p15s']}",
+        "",
+        "Tanabe droplet-centered event proxies",
+        f"  tau1 cool proxy, dTnear p99.9 >= 20 K: {tanabe_event_summary['tau1_cool_proxy_dTnear_p99_9_gt_20K_s']}",
+        f"  tau1 cool proxy, dTnear max >= 20 K: {tanabe_event_summary['tau1_cool_proxy_dTnear_max_gt_20K_s']}",
+        f"  tau hot proxy: {tanabe_event_summary['tau_hot_proxy_runaway_s']}",
+        f"  tau2 proxy: {tanabe_event_summary['tau2_proxy_s']}",
+        f"  hot ignition: {tanabe_event_summary['hot_ignition']}",
+        f"  persist frames: {tanabe_event_summary['persist_frames']}",
+        f"  definition: {tanabe_event_summary['hot_ignition_definition']}",
         "",
         "Dense-core D2 fit",
         f"  K_eff_dense_core: {dense_core_fit['K_eff_dense_core_m2_s']}",
@@ -1163,6 +1421,37 @@ def main() -> None:
     ]
     (args.out_dir / "tanabe_restart_summary.txt").write_text("\n".join(lines) + "\n")
 
+    tau1 = tanabe_event_summary["tau1_cool_proxy_dTnear_p99_9_gt_20K_s"]
+    tau_hot = tanabe_event_summary["tau_hot_proxy_runaway_s"]
+    tau2 = tanabe_event_summary["tau2_proxy_s"]
+    if dense_core_fit.get("sufficient"):
+        evap_text = f"dense-core D2 fit available, K_eff={dense_core_fit['K_eff_dense_core_m2_s']:.6e} m2/s"
+    else:
+        evap_text = "dense-core D2 fit insufficient for a defensible K_eff"
+    first_stage_text = (
+        f"first-stage thermal response detected at {tau1:.6e} s"
+        if tau1 is not None
+        else "first-stage thermal response not detected by dTnear p99.9 criterion"
+    )
+    hot_text = (
+        f"hot ignition detected at {tau_hot:.6e} s"
+        if tanabe_event_summary["hot_ignition"] and tau_hot is not None
+        else "hot ignition not detected by near-shell runaway criterion"
+    )
+    tau2_text = (
+        f"second induction proxy measurable, tau2={tau2:.6e} s"
+        if np.isfinite(tau2)
+        else "second induction proxy not measurable"
+    )
+
+    print(f"command used: {' '.join(sys.argv)}")
+    print(f"CSV path: {args.out_dir / 'tanabe_restart_by_state.csv'}")
+    print(f"summary path: {args.out_dir / 'tanabe_restart_summary.json'}")
+    print(f"plot directory: {args.out_dir}")
+    print(f"interpretation: evaporation/regression: {evap_text}")
+    print(f"interpretation: first-stage thermal response: {first_stage_text}")
+    print(f"interpretation: hot ignition: {hot_text}")
+    print(f"interpretation: second induction: {tau2_text}")
     print(f"[done] wrote outputs to {args.out_dir}")
 
 
