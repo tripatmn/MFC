@@ -126,6 +126,48 @@ class StateSummary:
     Y_NC12H26_mean_gas: float
     Y_NC12H26_integral_gas_m2: float
     Y_NC12H26_min: float
+    dense_core_area_m2: float
+    footprint_area_m2: float
+    interface_area_m2: float
+    dense_core_centroid_x_m: float
+    dense_core_centroid_y_m: float
+    footprint_centroid_x_m: float
+    footprint_centroid_y_m: float
+    interface_centroid_x_m: float
+    interface_centroid_y_m: float
+    dense_core_alpha_weighted_centroid_x_m: float
+    dense_core_alpha_weighted_centroid_y_m: float
+    footprint_alpha_weighted_centroid_x_m: float
+    footprint_alpha_weighted_centroid_y_m: float
+    dense_core_xmin_m: float
+    dense_core_xmax_m: float
+    dense_core_ymin_m: float
+    dense_core_ymax_m: float
+    footprint_xmin_m: float
+    footprint_xmax_m: float
+    footprint_ymin_m: float
+    footprint_ymax_m: float
+    dense_core_u_mean: float
+    dense_core_v_mean: float
+    dense_core_speed_mean: float
+    dense_core_speed_max: float
+    footprint_u_mean: float
+    footprint_v_mean: float
+    footprint_speed_mean: float
+    footprint_speed_max: float
+    interface_u_mean: float
+    interface_v_mean: float
+    interface_speed_mean: float
+    interface_speed_max: float
+    gas_u_mean: float
+    gas_v_mean: float
+    gas_speed_mean: float
+    gas_speed_max: float
+    Tmax_distance_to_dense_core_centroid_m: float
+    Tmax_distance_to_footprint_centroid_m: float
+    Tmax_is_dense_core: bool
+    Tmax_is_interface: bool
+    Tmax_is_gas: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -287,6 +329,65 @@ def equivalent_diameter(alpha_liq: np.ndarray, threshold: float, cell_area: floa
     return 2.0 * math.sqrt(area / math.pi)
 
 
+def mask_area(mask: np.ndarray, cell_area: float) -> float:
+    return float(np.count_nonzero(mask) * cell_area)
+
+
+def mask_centroid(mask: np.ndarray, x_grid: np.ndarray, y_grid: np.ndarray) -> tuple[float, float]:
+    valid = mask & np.isfinite(x_grid) & np.isfinite(y_grid)
+    if not np.any(valid):
+        return math.nan, math.nan
+    return float(np.mean(x_grid[valid])), float(np.mean(y_grid[valid]))
+
+
+def weighted_centroid(
+    mask: np.ndarray,
+    weights: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+) -> tuple[float, float]:
+    valid = mask & np.isfinite(weights) & (weights > 0.0) & np.isfinite(x_grid) & np.isfinite(y_grid)
+    if not np.any(valid):
+        return math.nan, math.nan
+    total = float(np.sum(weights[valid]))
+    if total <= 0.0:
+        return math.nan, math.nan
+    return (
+        float(np.sum(weights[valid] * x_grid[valid]) / total),
+        float(np.sum(weights[valid] * y_grid[valid]) / total),
+    )
+
+
+def mask_extents(mask: np.ndarray, x_grid: np.ndarray, y_grid: np.ndarray) -> tuple[float, float, float, float]:
+    valid = mask & np.isfinite(x_grid) & np.isfinite(y_grid)
+    if not np.any(valid):
+        return math.nan, math.nan, math.nan, math.nan
+    return (
+        float(np.min(x_grid[valid])),
+        float(np.max(x_grid[valid])),
+        float(np.min(y_grid[valid])),
+        float(np.max(y_grid[valid])),
+    )
+
+
+def velocity_stats(mask: np.ndarray, u: np.ndarray, v: np.ndarray, speed: np.ndarray) -> tuple[float, float, float, float]:
+    valid = mask & np.isfinite(u) & np.isfinite(v) & np.isfinite(speed)
+    if not np.any(valid):
+        return math.nan, math.nan, math.nan, math.nan
+    return (
+        float(np.mean(u[valid])),
+        float(np.mean(v[valid])),
+        float(np.mean(speed[valid])),
+        float(np.max(speed[valid])),
+    )
+
+
+def point_distance(x0: float, y0: float, x1: float, y1: float) -> float:
+    if not all(np.isfinite(value) for value in (x0, y0, x1, y1)):
+        return math.nan
+    return float(math.hypot(x0 - x1, y0 - y1))
+
+
 def summarize_state(
     step: int,
     path: Path,
@@ -294,11 +395,21 @@ def summarize_state(
     args: argparse.Namespace,
     x: np.ndarray,
     y: np.ndarray,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
     cell_area: float,
 ) -> tuple[StateSummary, dict[str, np.ndarray]]:
     time_s = step * args.t_save
     alpha_liq = arr[VAR_ALPHA_LIQ]
     alpha_gas = arr[VAR_ALPHA_VAP] + arr[VAR_ALPHA_AIR]
+    rho_mix = arr[VAR_ALPHA_RHO_LIQ] + arr[VAR_ALPHA_RHO_VAP] + arr[VAR_ALPHA_RHO_AIR]
+    u = safe_div(arr[VAR_MOM_X], rho_mix)
+    v = safe_div(arr[VAR_MOM_Y], rho_mix)
+    velocity_valid = np.isfinite(rho_mix) & (rho_mix > 1.0e-14)
+    u[~velocity_valid] = np.nan
+    v[~velocity_valid] = np.nan
+    speed = np.sqrt(u * u + v * v)
+
     t_gas, rho_gas = gas_temperature_proxy(arr, args.cv_v, args.cv_air)
     valid_gas = (
         np.isfinite(t_gas)
@@ -306,6 +417,9 @@ def summarize_state(
         & (alpha_gas > args.alpha_gas_min)
         & (alpha_liq < args.alpha_liq_max_for_gas)
     )
+    dense_core_mask = np.isfinite(alpha_liq) & (alpha_liq > 0.5)
+    liquid_footprint_mask = np.isfinite(alpha_liq) & (alpha_liq > 1.0e-3)
+    interface_mask = np.isfinite(alpha_liq) & (alpha_liq > 1.0e-3) & (alpha_liq <= 0.5)
 
     t_masked = np.where(valid_gas, t_gas, np.nan)
     if np.any(np.isfinite(t_masked)):
@@ -331,6 +445,18 @@ def summarize_state(
 
     d05 = equivalent_diameter(alpha_liq, args.alpha_liq_threshold, cell_area)
     dlo = equivalent_diameter(alpha_liq, 1.0e-3, cell_area)
+
+    dense_core_centroid = mask_centroid(dense_core_mask, x_grid, y_grid)
+    footprint_centroid = mask_centroid(liquid_footprint_mask, x_grid, y_grid)
+    interface_centroid = mask_centroid(interface_mask, x_grid, y_grid)
+    dense_core_alpha_centroid = weighted_centroid(dense_core_mask, alpha_liq, x_grid, y_grid)
+    footprint_alpha_centroid = weighted_centroid(liquid_footprint_mask, alpha_liq, x_grid, y_grid)
+    dense_extents = mask_extents(dense_core_mask, x_grid, y_grid)
+    footprint_extents = mask_extents(liquid_footprint_mask, x_grid, y_grid)
+    dense_velocity = velocity_stats(dense_core_mask, u, v, speed)
+    footprint_velocity = velocity_stats(liquid_footprint_mask, u, v, speed)
+    interface_velocity = velocity_stats(interface_mask, u, v, speed)
+    gas_velocity = velocity_stats(valid_gas, u, v, speed)
 
     y_fields = {
         name: species_y(arr, name, rho_gas, valid_gas)
@@ -415,8 +541,55 @@ def summarize_state(
         Y_NC12H26_mean_gas=y_stats["NC12H26"]["mean"],
         Y_NC12H26_integral_gas_m2=y_stats["NC12H26"]["integral"],
         Y_NC12H26_min=y_stats["NC12H26"]["min"],
+        dense_core_area_m2=mask_area(dense_core_mask, cell_area),
+        footprint_area_m2=mask_area(liquid_footprint_mask, cell_area),
+        interface_area_m2=mask_area(interface_mask, cell_area),
+        dense_core_centroid_x_m=dense_core_centroid[0],
+        dense_core_centroid_y_m=dense_core_centroid[1],
+        footprint_centroid_x_m=footprint_centroid[0],
+        footprint_centroid_y_m=footprint_centroid[1],
+        interface_centroid_x_m=interface_centroid[0],
+        interface_centroid_y_m=interface_centroid[1],
+        dense_core_alpha_weighted_centroid_x_m=dense_core_alpha_centroid[0],
+        dense_core_alpha_weighted_centroid_y_m=dense_core_alpha_centroid[1],
+        footprint_alpha_weighted_centroid_x_m=footprint_alpha_centroid[0],
+        footprint_alpha_weighted_centroid_y_m=footprint_alpha_centroid[1],
+        dense_core_xmin_m=dense_extents[0],
+        dense_core_xmax_m=dense_extents[1],
+        dense_core_ymin_m=dense_extents[2],
+        dense_core_ymax_m=dense_extents[3],
+        footprint_xmin_m=footprint_extents[0],
+        footprint_xmax_m=footprint_extents[1],
+        footprint_ymin_m=footprint_extents[2],
+        footprint_ymax_m=footprint_extents[3],
+        dense_core_u_mean=dense_velocity[0],
+        dense_core_v_mean=dense_velocity[1],
+        dense_core_speed_mean=dense_velocity[2],
+        dense_core_speed_max=dense_velocity[3],
+        footprint_u_mean=footprint_velocity[0],
+        footprint_v_mean=footprint_velocity[1],
+        footprint_speed_mean=footprint_velocity[2],
+        footprint_speed_max=footprint_velocity[3],
+        interface_u_mean=interface_velocity[0],
+        interface_v_mean=interface_velocity[1],
+        interface_speed_mean=interface_velocity[2],
+        interface_speed_max=interface_velocity[3],
+        gas_u_mean=gas_velocity[0],
+        gas_v_mean=gas_velocity[1],
+        gas_speed_mean=gas_velocity[2],
+        gas_speed_max=gas_velocity[3],
+        Tmax_distance_to_dense_core_centroid_m=point_distance(tmax_x, tmax_y, dense_core_centroid[0], dense_core_centroid[1]),
+        Tmax_distance_to_footprint_centroid_m=point_distance(tmax_x, tmax_y, footprint_centroid[0], footprint_centroid[1]),
+        Tmax_is_dense_core=bool(iy >= 0 and ix >= 0 and dense_core_mask[iy, ix]),
+        Tmax_is_interface=bool(iy >= 0 and ix >= 0 and interface_mask[iy, ix]),
+        Tmax_is_gas=bool(iy >= 0 and ix >= 0 and valid_gas[iy, ix]),
     )
-    fields = {"alpha_liq": alpha_liq, "Tgas": t_masked, **{f"Y_{k}": v for k, v in y_fields.items()}}
+    fields = {
+        "alpha_liq": alpha_liq,
+        "Tgas": t_masked,
+        "speed": speed,
+        **{f"Y_{k}": v for k, v in y_fields.items()},
+    }
     return summary, fields
 
 
@@ -548,6 +721,71 @@ def plot_timeseries(summaries: list[StateSummary], out_dir: Path, dense_core_fit
     line_plot("D2_over_D02_vs_time.png", [("alpha_liq > 0.5", np.array([s.D2_over_D02_alpha05 for s in summaries])), ("alpha_liq > 1e-3", np.array([s.D2_over_D02_alpha_lo for s in summaries]))], "D2 / D0^2", "Equivalent D2 regression")
     plot_dense_core_fit(summaries, dense_core_fit, out_dir)
     line_plot(
+        "liquid_centroid_x_vs_time.png",
+        [
+            ("dense core", np.array([s.dense_core_centroid_x_m for s in summaries])),
+            ("footprint", np.array([s.footprint_centroid_x_m for s in summaries])),
+            ("interface", np.array([s.interface_centroid_x_m for s in summaries])),
+        ],
+        "Centroid x [m]",
+        "Liquid-region streamwise centroids",
+    )
+    line_plot(
+        "liquid_centroid_y_vs_time.png",
+        [
+            ("dense core", np.array([s.dense_core_centroid_y_m for s in summaries])),
+            ("footprint", np.array([s.footprint_centroid_y_m for s in summaries])),
+            ("interface", np.array([s.interface_centroid_y_m for s in summaries])),
+        ],
+        "Centroid y [m]",
+        "Liquid-region transverse centroids",
+    )
+    line_plot(
+        "liquid_extent_x_vs_time.png",
+        [
+            ("dense xmin", np.array([s.dense_core_xmin_m for s in summaries])),
+            ("dense xmax", np.array([s.dense_core_xmax_m for s in summaries])),
+            ("footprint xmin", np.array([s.footprint_xmin_m for s in summaries])),
+            ("footprint xmax", np.array([s.footprint_xmax_m for s in summaries])),
+        ],
+        "x extent [m]",
+        "Liquid streamwise extents",
+    )
+    line_plot(
+        "liquid_area_vs_time.png",
+        [
+            ("dense core", np.array([s.dense_core_area_m2 for s in summaries])),
+            ("footprint", np.array([s.footprint_area_m2 for s in summaries])),
+            ("interface", np.array([s.interface_area_m2 for s in summaries])),
+        ],
+        "Area [m2]",
+        "Liquid-region areas",
+    )
+    line_plot(
+        "velocity_stats_vs_time.png",
+        [
+            ("dense mean", np.array([s.dense_core_speed_mean for s in summaries])),
+            ("dense max", np.array([s.dense_core_speed_max for s in summaries])),
+            ("interface mean", np.array([s.interface_speed_mean for s in summaries])),
+            ("interface max", np.array([s.interface_speed_max for s in summaries])),
+            ("gas mean", np.array([s.gas_speed_mean for s in summaries])),
+            ("gas max", np.array([s.gas_speed_max for s in summaries])),
+        ],
+        "Speed proxy [m/s]",
+        "Velocity proxy statistics",
+    )
+    line_plot(
+        "Tmax_location_vs_time.png",
+        [
+            ("distance to dense core centroid", np.array([s.Tmax_distance_to_dense_core_centroid_m for s in summaries])),
+            ("distance to footprint centroid", np.array([s.Tmax_distance_to_footprint_centroid_m for s in summaries])),
+            ("Tmax x", np.array([s.Tmax_x_m for s in summaries])),
+            ("Tmax y", np.array([s.Tmax_y_m for s in summaries])),
+        ],
+        "Distance or coordinate [m]",
+        "Tmax location diagnostics",
+    )
+    line_plot(
         "species_max_vs_time.png",
         [
             ("OH", np.array([s.Y_OH_max for s in summaries])),
@@ -618,6 +856,62 @@ def plot_contour(field: np.ndarray, out_path: Path, title: str, cmap: str = "vir
     plt.close(fig)
 
 
+def tmax_indices(summary: StateSummary, x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
+    if not (np.isfinite(summary.Tmax_x_m) and np.isfinite(summary.Tmax_y_m)):
+        return math.nan, math.nan
+    ix = int(np.argmin(np.abs(x - summary.Tmax_x_m)))
+    iy = int(np.argmin(np.abs(y - summary.Tmax_y_m)))
+    return float(ix), float(iy)
+
+
+def plot_alpha_overlay(alpha_liq: np.ndarray, summary: StateSummary, x: np.ndarray, y: np.ndarray, out_path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(5.8, 5.0), dpi=150)
+    im = ax.imshow(alpha_liq, origin="lower", cmap="viridis", vmin=0.0, vmax=1.0, aspect="equal")
+    levels = [1.0e-3, 0.5]
+    ax.contour(alpha_liq, levels=levels, colors=["white", "red"], linewidths=[1.1, 1.3], origin="lower")
+    ix, iy = tmax_indices(summary, x, y)
+    if np.isfinite(ix) and np.isfinite(iy):
+        ax.scatter(ix, iy, marker="x", color="cyan", s=45, linewidths=1.4, label="Tmax")
+    ax.set_title(f"alpha_liq overlays step {summary.step}")
+    ax.set_xlabel("i")
+    ax.set_ylabel("j")
+    if np.isfinite(ix) and np.isfinite(iy):
+        ax.legend(loc="upper right")
+    fig.colorbar(im, ax=ax, shrink=0.82, label="alpha_liq")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+
+def plot_speed_overlay(
+    speed: np.ndarray,
+    alpha_liq: np.ndarray,
+    summary: StateSummary,
+    x: np.ndarray,
+    y: np.ndarray,
+    out_path: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(5.8, 5.0), dpi=150)
+    finite = speed[np.isfinite(speed)]
+    vmax = float(np.percentile(finite, 99.0)) if finite.size else 1.0
+    if vmax <= 0.0:
+        vmax = 1.0
+    im = ax.imshow(speed, origin="lower", cmap="plasma", vmin=0.0, vmax=vmax, aspect="equal")
+    ax.contour(alpha_liq, levels=[1.0e-3, 0.5], colors=["white", "cyan"], linewidths=[1.1, 1.3], origin="lower")
+    ix, iy = tmax_indices(summary, x, y)
+    if np.isfinite(ix) and np.isfinite(iy):
+        ax.scatter(ix, iy, marker="x", color="black", s=45, linewidths=1.4, label="Tmax")
+    ax.set_title(f"speed proxy overlays step {summary.step}")
+    ax.set_xlabel("i")
+    ax.set_ylabel("j")
+    if np.isfinite(ix) and np.isfinite(iy):
+        ax.legend(loc="upper right")
+    fig.colorbar(im, ax=ax, shrink=0.82, label="speed [m/s]")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+
 def write_csv(summaries: list[StateSummary], path: Path) -> None:
     if not summaries:
         return
@@ -675,6 +969,74 @@ def species_normalization_warnings(summaries: list[StateSummary]) -> list[str]:
     return warnings
 
 
+def displacement(first_x: float, first_y: float, last_x: float, last_y: float) -> dict[str, float]:
+    return {
+        "dx_m": float(last_x - first_x) if np.isfinite(first_x) and np.isfinite(last_x) else math.nan,
+        "dy_m": float(last_y - first_y) if np.isfinite(first_y) and np.isfinite(last_y) else math.nan,
+        "distance_m": point_distance(first_x, first_y, last_x, last_y),
+    }
+
+
+def kinematic_summary(summaries: list[StateSummary], d0: float) -> dict[str, object]:
+    if not summaries:
+        return {}
+    first = summaries[0]
+    last = summaries[-1]
+    dense_disp = displacement(
+        first.dense_core_centroid_x_m,
+        first.dense_core_centroid_y_m,
+        last.dense_core_centroid_x_m,
+        last.dense_core_centroid_y_m,
+    )
+    footprint_disp = displacement(
+        first.footprint_centroid_x_m,
+        first.footprint_centroid_y_m,
+        last.footprint_centroid_x_m,
+        last.footprint_centroid_y_m,
+    )
+    initial_footprint_xmax = first.footprint_xmax_m
+    initial_dense_xmax = first.dense_core_xmax_m
+    footprint_right_disp = np.array(
+        [s.footprint_xmax_m - initial_footprint_xmax for s in summaries],
+        dtype=np.float64,
+    )
+    dense_right_disp = np.array(
+        [s.dense_core_xmax_m - initial_dense_xmax for s in summaries],
+        dtype=np.float64,
+    )
+    max_footprint_right_disp = finite_max(footprint_right_disp)
+    max_dense_right_disp = finite_max(dense_right_disp)
+    dense_distance_over_d0 = dense_disp["distance_m"] / d0 if np.isfinite(dense_disp["distance_m"]) else math.nan
+    footprint_growth_ratio = (
+        max_footprint_right_disp / max_dense_right_disp
+        if np.isfinite(max_footprint_right_disp) and np.isfinite(max_dense_right_disp) and abs(max_dense_right_disp) > 0.0
+        else math.nan
+    )
+    tmax_counts = {
+        "dense_core": int(sum(s.Tmax_is_dense_core for s in summaries)),
+        "interface": int(sum(s.Tmax_is_interface for s in summaries)),
+        "gas": int(sum(s.Tmax_is_gas for s in summaries)),
+    }
+    majority = max(tmax_counts, key=tmax_counts.get)
+    return {
+        "dense_core_centroid_displacement": dense_disp,
+        "footprint_centroid_displacement": footprint_disp,
+        "dense_core_centroid_displacement_over_D0": dense_distance_over_d0,
+        "dense_core_moves_significantly_gt_0p1D0": bool(np.isfinite(dense_distance_over_d0) and dense_distance_over_d0 > 0.1),
+        "max_footprint_right_edge_displacement_m": max_footprint_right_disp,
+        "max_dense_core_right_edge_displacement_m": max_dense_right_disp,
+        "footprint_right_edge_growth_over_dense_core": footprint_growth_ratio,
+        "footprint_right_edge_grows_much_more_than_dense_core": bool(
+            np.isfinite(footprint_growth_ratio)
+            and footprint_growth_ratio > 2.0
+            and np.isfinite(max_footprint_right_disp)
+            and max_footprint_right_disp > 0.0
+        ),
+        "Tmax_region_counts": tmax_counts,
+        "Tmax_usual_region": majority,
+    }
+
+
 def main() -> None:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -686,6 +1048,7 @@ def main() -> None:
         raise SystemExit(f"No restart_data/lustre_<step>.dat files found under {args.run_dir}")
 
     x, y, dx, dy = make_coords(args.d0, args.domain_scale)
+    x_grid, y_grid = np.meshgrid(x, y)
     cell_area = dx * dy
     selected_steps = choose_selected_steps([step for step, _ in files], args.selected_steps)
     summaries: list[StateSummary] = []
@@ -695,12 +1058,14 @@ def main() -> None:
         arr = read_lustre_file(path)
         if arr is None:
             continue
-        summary, fields = summarize_state(step, path, arr, args, x, y, cell_area)
+        summary, fields = summarize_state(step, path, arr, args, x, y, x_grid, y_grid, cell_area)
         summaries.append(summary)
 
         if not args.skip_contours and step in selected_steps:
             plot_contour(fields["alpha_liq"], args.out_dir / f"contour_alpha_liq_{step}.png", f"alpha_liq step {step}")
             plot_contour(fields["Tgas"], args.out_dir / f"contour_Tgas_{step}.png", f"Gas T proxy step {step}", cmap="inferno")
+            plot_alpha_overlay(fields["alpha_liq"], summary, x, y, args.out_dir / f"contour_alpha_liq_overlay_{step}.png")
+            plot_speed_overlay(fields["speed"], fields["alpha_liq"], summary, x, y, args.out_dir / f"contour_speed_overlay_{step}.png")
             for name in ("OH", "HO2", "H2O2", "NC12H26"):
                 plot_contour(fields[f"Y_{name}"], args.out_dir / f"contour_Y_{name}_{step}.png", f"Y_{name} step {step}", cmap="magma")
 
@@ -719,6 +1084,7 @@ def main() -> None:
     first_stage_delta20_t999 = first_delta_threshold(summaries, "T99_9_gas_K", initial_t999, 20.0)
     absolute_820_unreliable = bool(summaries and first_induction["step"] == summaries[0].step)
     species_warnings = species_normalization_warnings(summaries)
+    motion_summary = kinematic_summary(summaries, args.d0)
     summary_json = {
         "run_dir": str(args.run_dir),
         "state_count": len(summaries),
@@ -738,6 +1104,7 @@ def main() -> None:
         "dense_core_D2_fit": dense_core_fit,
         "recommended_K_label": "K_eff_dense_core, not classical K_burn, unless the fit window and R2 support a D2-law interpretation",
         "species_normalization_warnings": species_warnings,
+        "liquid_kinematics": motion_summary,
         "assumptions": {
             "nvars": NVARS,
             "shape": [NVARS, NY_POINTS, NX_POINTS],
@@ -776,6 +1143,17 @@ def main() -> None:
         f"  window: {dense_core_fit['start_time_s']} .. {dense_core_fit['end_time_s']} s",
         f"  points: {dense_core_fit['point_count']}",
         "  Label guidance: call this K_eff unless the chosen window has strong D2-law behavior; do not overclaim K_burn.",
+        "",
+        "Liquid kinematics",
+        f"  Dense-core centroid displacement: {motion_summary.get('dense_core_centroid_displacement')}",
+        f"  Footprint centroid displacement: {motion_summary.get('footprint_centroid_displacement')}",
+        f"  Dense-core centroid displacement / D0: {motion_summary.get('dense_core_centroid_displacement_over_D0')}",
+        f"  Dense-core moves significantly (>0.1 D0): {motion_summary.get('dense_core_moves_significantly_gt_0p1D0')}",
+        f"  Max footprint right-edge displacement: {motion_summary.get('max_footprint_right_edge_displacement_m')}",
+        f"  Max dense-core right-edge displacement: {motion_summary.get('max_dense_core_right_edge_displacement_m')}",
+        f"  Footprint right edge grows much more than dense core: {motion_summary.get('footprint_right_edge_grows_much_more_than_dense_core')}",
+        f"  Tmax region counts: {motion_summary.get('Tmax_region_counts')}",
+        f"  Tmax usual region: {motion_summary.get('Tmax_usual_region')}",
         "",
         "Species normalization warnings:",
         *(f"  - {warning}" for warning in species_warnings),
