@@ -810,9 +810,12 @@ contains
 
             if (t_step == 0) dt_init = dt
 
-            if (dt < 1.e-3_wp*dt_init .and. cfl_adap_dt .and. proc_rank == 0) then
-                print *, "Delta t = ", dt
-                call s_mpi_abort("Delta t has become too small")
+            if (dt < 1.e-3_wp*dt_init .and. cfl_adap_dt) then
+                call s_dt_collapse_state_debug_report(t_step, mytime)
+                if (proc_rank == 0) then
+                    print *, "Delta t = ", dt
+                    call s_mpi_abort("Delta t has become too small")
+                end if
             end if
         end if
 

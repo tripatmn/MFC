@@ -883,6 +883,212 @@ contains
 
     end subroutine s_adaptive_dt_bubble
 
+    subroutine s_dt_collapse_state_debug_print_cell(cell_j, cell_k, cell_l, t_step, time_value, cell_dt, label)
+        integer, intent(in) :: cell_j, cell_k, cell_l, t_step
+        real(wp), intent(in) :: time_value, cell_dt
+        character(len=*), intent(in) :: label
+
+        character(len=32) :: region_label
+        integer :: fluid_id, gas_fluid_id, species_eqn
+        integer :: global_j, global_k, global_l
+        integer :: liquid_fluid_id
+        logical :: on_boundary, near_boundary
+        real(wp) :: rho, vel_sum, pres, gamma, pi_inf, qv, c, H
+        real(wp) :: vel_x, vel_y, vel_z, vel_mag
+        real(wp) :: gas_alpha, gas_mass, alpha_liq, temp_value
+        real(wp) :: fuel_rhoY, species_sum, cfl_denom, x_loc, y_loc
+        real(wp), dimension(2) :: Re
+        #:if not MFC_CASE_OPTIMIZATION and USING_AMD
+            real(wp), dimension(3) :: vel
+            real(wp), dimension(3) :: alpha
+        #:else
+            real(wp), dimension(num_vels) :: vel
+            real(wp), dimension(num_fluids) :: alpha
+        #:endif
+
+        if (cell_j < 0 .or. cell_j > m) return
+        if (cell_k < 0 .or. cell_k > n) return
+        if (cell_l < 0 .or. cell_l > p) return
+
+        if (cell_dt > tiny(cell_dt) .and. cell_dt == cell_dt) then
+            cfl_denom = cfl_target/cell_dt
+        else
+            cfl_denom = huge(1._wp)
+        end if
+
+        if (igr) then
+            call s_compute_enthalpy(q_cons_ts(1)%vf, pres, rho, gamma, pi_inf, Re, H, alpha, vel, vel_sum, qv, &
+                                    cell_j, cell_k, cell_l)
+        else
+            call s_compute_enthalpy(q_prim_vf, pres, rho, gamma, pi_inf, Re, H, alpha, vel, vel_sum, qv, &
+                                    cell_j, cell_k, cell_l)
+        end if
+        call s_compute_speed_of_sound(pres, rho, gamma, pi_inf, H, alpha, vel_sum, 0._wp, c, qv)
+
+        vel_x = 0._wp
+        vel_y = 0._wp
+        vel_z = 0._wp
+        if (num_vels >= 1) vel_x = vel(1)
+        if (num_vels >= 2) vel_y = vel(2)
+        if (num_vels >= 3) vel_z = vel(3)
+        vel_mag = sqrt(vel_x*vel_x + vel_y*vel_y + vel_z*vel_z)
+
+        liquid_fluid_id = evap_liquid_fluid_id
+        if (liquid_fluid_id < 1 .or. liquid_fluid_id > num_fluids) liquid_fluid_id = 1
+
+        alpha_liq = q_cons_ts(1)%vf(advxb + liquid_fluid_id - 1)%sf(cell_j, cell_k, cell_l)
+        gas_alpha = 0._wp
+        gas_mass = 0._wp
+        do gas_fluid_id = 1, num_fluids
+            if (gas_fluid_id /= liquid_fluid_id) then
+                gas_alpha = gas_alpha + q_cons_ts(1)%vf(advxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l)
+                gas_mass = gas_mass + q_cons_ts(1)%vf(contxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l)
+            end if
+        end do
+
+        fuel_rhoY = 0._wp
+        species_sum = 0._wp
+        if (chemistry) then
+            if (fuel_species_id > 0) then
+                species_eqn = chemxb + fuel_species_id - 1
+                if (species_eqn >= chemxb .and. species_eqn <= chemxe) then
+                    fuel_rhoY = q_cons_ts(1)%vf(species_eqn)%sf(cell_j, cell_k, cell_l)
+                end if
+            end if
+
+            do species_eqn = chemxb, chemxe
+                species_sum = species_sum + q_cons_ts(1)%vf(species_eqn)%sf(cell_j, cell_k, cell_l)
+            end do
+        end if
+
+        temp_value = -huge(1._wp)
+        if (chemistry) then
+            if (associated(q_T_sf%sf)) temp_value = q_T_sf%sf(cell_j, cell_k, cell_l)
+        end if
+
+        global_j = cell_j
+        global_k = cell_k
+        global_l = cell_l
+        if (allocated(start_idx)) then
+            if (size(start_idx) >= 1) global_j = start_idx(1) + cell_j
+            if (size(start_idx) >= 2) global_k = start_idx(2) + cell_k
+            if (size(start_idx) >= 3) global_l = start_idx(3) + cell_l
+        end if
+
+        x_loc = 0._wp
+        y_loc = 0._wp
+        if (allocated(x_cc)) x_loc = x_cc(cell_j)
+        if (allocated(y_cc)) y_loc = y_cc(cell_k)
+
+        if (alpha_liq > 0.99_wp) then
+            region_label = "liquid_dominated"
+        elseif (alpha_liq > 0.01_wp .and. alpha_liq < 0.99_wp) then
+            region_label = "interface"
+        elseif (gas_alpha > 0.9_wp .and. alpha_liq < 0.1_wp) then
+            region_label = "gas_dominant"
+        else
+            region_label = "mixed_or_other"
+        end if
+
+        on_boundary = cell_j == 0 .or. cell_j == m .or. cell_k == 0 .or. cell_k == n
+        near_boundary = cell_j <= 1 .or. cell_j >= m - 1 .or. cell_k <= 1 .or. cell_k >= n - 1
+        if (p > 0) then
+            on_boundary = on_boundary .or. cell_l == 0 .or. cell_l == p
+            near_boundary = near_boundary .or. cell_l <= 1 .or. cell_l >= p - 1
+        end if
+
+        print '(" TEMP_DT_COLLAPSE_STATE_DEBUG_CELL ", A, " rank=", I6, " t_step=", I10, " time=", ES16.8, &
+            &" cell_dt=", ES16.8, " cfl_denom=", ES16.8, " local_ijk=", 3(I8,1X), " global_ijk=", 3(I8,1X), &
+            &" x=", ES16.8, " y=", ES16.8, " on_boundary=", L1, " near_boundary=", L1, " region=", A)', &
+            trim(label), proc_rank, t_step, time_value, cell_dt, cfl_denom, cell_j, cell_k, cell_l, &
+            global_j, global_k, global_l, x_loc, y_loc, on_boundary, near_boundary, trim(region_label)
+        print '(" TEMP_DT_COLLAPSE_STATE_DEBUG_PRIM ", A, " rank=", I6, &
+            &" u=", ES16.8, " v=", ES16.8, " w=", ES16.8, " vel_mag=", ES16.8, &
+            &" pressure=", ES16.8, " temperature=", ES16.8, " rho=", ES16.8, " sound_speed=", ES16.8)', &
+            trim(label), proc_rank, vel_x, vel_y, vel_z, vel_mag, pres, temp_value, rho, c
+        do fluid_id = 1, num_fluids
+            print '(" TEMP_DT_COLLAPSE_STATE_DEBUG_FLUID ", A, " rank=", I6, " fluid=", I4, &
+                &" alpha=", ES16.8, " alpha_rho=", ES16.8)', &
+                trim(label), proc_rank, fluid_id, &
+                q_cons_ts(1)%vf(advxb + fluid_id - 1)%sf(cell_j, cell_k, cell_l), &
+                q_cons_ts(1)%vf(contxb + fluid_id - 1)%sf(cell_j, cell_k, cell_l)
+        end do
+        print '(" TEMP_DT_COLLAPSE_STATE_DEBUG_GAS_SPECIES ", A, " rank=", I6, &
+            &" gas_alpha=", ES16.8, " gas_mass=", ES16.8, &
+            &" fuel_rhoY=", ES16.8, " gas_species_sum=", ES16.8)', &
+            trim(label), proc_rank, gas_alpha, gas_mass, fuel_rhoY, species_sum
+    end subroutine s_dt_collapse_state_debug_print_cell
+
+    subroutine s_dt_collapse_state_debug_report(t_step, time_value)
+        integer, intent(in) :: t_step
+        real(wp), intent(in) :: time_value
+
+        character(len=16) :: env_value
+        integer :: env_status
+        integer :: j, k, l, id, neigh_k
+        integer :: best_j, best_k, best_l
+        integer :: owner_rank
+        logical :: found_finite
+        real(wp) :: local_min_dt, owner_min_dt
+        real(wp), dimension(2) :: owner_pair
+
+        call get_environment_variable("TEMP_DT_COLLAPSE_STATE_DEBUG", env_value, status=env_status)
+        if (env_status /= 0 .or. trim(env_value) /= "1") return
+
+        $:GPU_UPDATE(host='[max_dt]')
+        do id = 1, sys_size
+            $:GPU_UPDATE(host='[q_cons_ts(1)%vf(id)%sf,q_prim_vf(id)%sf]')
+        end do
+        if (chemistry) then
+            if (associated(q_T_sf%sf)) then
+                $:GPU_UPDATE(host='[q_T_sf%sf]')
+            end if
+        end if
+
+        found_finite = .false.
+        local_min_dt = huge(1._wp)
+        best_j = 0
+        best_k = 0
+        best_l = 0
+        do l = 0, p
+            do k = 0, n
+                do j = 0, m
+                    if (max_dt(j, k, l) == max_dt(j, k, l)) then
+                        if (.not. found_finite .or. max_dt(j, k, l) < local_min_dt) then
+                            found_finite = .true.
+                            local_min_dt = max_dt(j, k, l)
+                            best_j = j
+                            best_k = k
+                            best_l = l
+                        end if
+                    end if
+                end do
+            end do
+        end do
+
+        owner_pair = [merge(-local_min_dt, -huge(1._wp), found_finite), real(proc_rank, wp)]
+        call s_mpi_reduce_maxloc(owner_pair)
+        owner_rank = int(owner_pair(2))
+        owner_min_dt = -owner_pair(1)
+
+        if (proc_rank == 0) then
+            print '(" TEMP_DT_COLLAPSE_STATE_DEBUG_SUMMARY rank=", I6, " t_step=", I10, &
+                &" time=", ES16.8, " global_dt=", ES16.8, " owner_rank=", I8, " owner_min_dt=", ES16.8)', &
+                proc_rank, t_step, time_value, dt, owner_rank, owner_min_dt
+        end if
+
+        if (proc_rank == owner_rank .and. found_finite) then
+            call s_dt_collapse_state_debug_print_cell(best_j, best_k, best_l, t_step, time_value, local_min_dt, "OWNER")
+            do neigh_k = best_k - 1, best_k + 1
+                if (neigh_k >= 0 .and. neigh_k <= n .and. neigh_k /= best_k) then
+                    call s_dt_collapse_state_debug_print_cell(best_j, neigh_k, best_l, t_step, time_value, &
+                                                              max_dt(best_j, neigh_k, best_l), "Y_NEIGHBOR")
+                end if
+            end do
+        end if
+        call flush(output_unit)
+    end subroutine s_dt_collapse_state_debug_report
+
     !> @brief Computes the global time step size from CFL stability constraints across all cells.
     impure subroutine s_compute_dt()
 
