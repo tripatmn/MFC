@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Analyze Tanabe/SK54 MFC shared restart files directly.
 
-This first-pass analyzer reads raw restart_data/lustre_<step>.dat files as
-float64 arrays for the 128 x 128 restartable Tanabe case. It intentionally
-avoids MFC post_process output and uses gas-masked proxy diagnostics only.
+This analyzer reads raw restart_data/lustre_<step>.dat files as float64 arrays
+for Tanabe-style restartable dodecane cases. It intentionally avoids MFC
+post_process output and uses gas-masked proxy diagnostics only.
 """
 
 from __future__ import annotations
@@ -26,9 +26,6 @@ import numpy as np
 
 
 NVARS = 66
-NX_POINTS = 129
-NY_POINTS = 129
-
 VAR_ALPHA_RHO_LIQ = 0
 VAR_ALPHA_RHO_VAP = 1
 VAR_ALPHA_RHO_AIR = 2
@@ -184,6 +181,10 @@ class StateSummary:
     Tnear_max_x_m: float
     Tnear_max_y_m: float
     Tnear_max_r_over_D0: float
+    virtual_TC_x_m: float
+    virtual_TC_y_m: float
+    virtual_TC_T_K: float
+    virtual_TC_dTdt_K_s: float
     Ynear_HO2_max: float
     Ynear_HO2_min: float
     Ynear_H2O2_max: float
@@ -211,12 +212,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cv-air", type=float, default=717.5)
     parser.add_argument("--t-save", type=float, default=1.0e-3)
     parser.add_argument("--domain-scale", type=float, default=6.0)
+    parser.add_argument("--nx", type=int, default=128, help="MFC m value; restart array has nx+1 points.")
+    parser.add_argument("--ny", type=int, default=128, help="MFC n value; restart array has ny+1 points.")
     parser.add_argument("--max-states", type=int, default=None)
     parser.add_argument("--gas-alpha-thresh", type=float, default=0.95)
     parser.add_argument("--near-rmin-D", type=float, default=0.55)
     parser.add_argument("--near-rmax-D", type=float, default=2.0)
     parser.add_argument("--far-rmin-D", type=float, default=3.0)
     parser.add_argument("--persist-frames", type=int, default=2)
+    parser.add_argument("--virtual-tc-r-over-D", type=float, default=5.0)
+    parser.add_argument("--virtual-tc-angle-deg", type=float, default=0.0)
     parser.add_argument("--make-plots", action="store_true", help="Retained for compatibility; plots are made unless --skip-plots is set.")
     parser.add_argument("--skip-plots", action="store_true")
     parser.add_argument("--skip-contours", action="store_true")
@@ -240,8 +245,10 @@ def find_lustre_files(run_dir: Path) -> list[tuple[int, Path]]:
     return sorted(found)
 
 
-def read_lustre_file(path: Path) -> np.ndarray | None:
-    expected = NVARS * NY_POINTS * NX_POINTS
+def read_lustre_file(path: Path, nx: int, ny: int) -> np.ndarray | None:
+    nx_points = nx + 1
+    ny_points = ny + 1
+    expected = NVARS * ny_points * nx_points
     try:
         raw = np.fromfile(path, dtype=np.float64)
     except OSError as exc:
@@ -253,7 +260,7 @@ def read_lustre_file(path: Path) -> np.ndarray | None:
     if raw.size != expected:
         print(f"[warn] {path}: size {raw.size} != expected {expected}; using first expected values")
         raw = raw[:expected]
-    return raw.reshape((NVARS, NY_POINTS, NX_POINTS))
+    return raw.reshape((NVARS, ny_points, nx_points))
 
 
 def safe_div(num: np.ndarray, den: np.ndarray) -> np.ndarray:
@@ -263,12 +270,12 @@ def safe_div(num: np.ndarray, den: np.ndarray) -> np.ndarray:
     return out
 
 
-def make_coords(d0: float, domain_scale: float) -> tuple[np.ndarray, np.ndarray, float, float]:
+def make_coords(d0: float, domain_scale: float, nx: int, ny: int) -> tuple[np.ndarray, np.ndarray, float, float]:
     length = domain_scale * d0
-    dx = length / (NX_POINTS - 1)
-    dy = length / (NY_POINTS - 1)
-    x = np.linspace(0.0, length, NX_POINTS)
-    y = np.linspace(0.0, length, NY_POINTS)
+    dx = length / nx
+    dy = length / ny
+    x = np.linspace(0.0, length, nx + 1)
+    y = np.linspace(0.0, length, ny + 1)
     return x, y, dx, dy
 
 
@@ -546,6 +553,25 @@ def summarize_state(
         tnear_max_y = math.nan
         tnear_max_r_over_d0 = math.nan
 
+    tc_angle = math.radians(args.virtual_tc_angle_deg)
+    if np.isfinite(dense_core_centroid[0]) and np.isfinite(dense_core_centroid[1]):
+        virtual_tc_x = dense_core_centroid[0] + args.virtual_tc_r_over_D*args.d0*math.cos(tc_angle)
+        virtual_tc_y = dense_core_centroid[1] + args.virtual_tc_r_over_D*args.d0*math.sin(tc_angle)
+    else:
+        virtual_tc_x = math.nan
+        virtual_tc_y = math.nan
+    if (
+        np.isfinite(virtual_tc_x)
+        and np.isfinite(virtual_tc_y)
+        and x[0] <= virtual_tc_x <= x[-1]
+        and y[0] <= virtual_tc_y <= y[-1]
+    ):
+        tc_ix = int(np.argmin(np.abs(x - virtual_tc_x)))
+        tc_iy = int(np.argmin(np.abs(y - virtual_tc_y)))
+        virtual_tc_T = float(t_gas[tc_iy, tc_ix]) if np.isfinite(t_gas[tc_iy, tc_ix]) else math.nan
+    else:
+        virtual_tc_T = math.nan
+
     y_fields = {
         name: species_y(arr, name, rho_gas, valid_gas)
         for name in TRACKED_SPECIES
@@ -693,6 +719,10 @@ def summarize_state(
         Tnear_max_x_m=tnear_max_x,
         Tnear_max_y_m=tnear_max_y,
         Tnear_max_r_over_D0=tnear_max_r_over_d0,
+        virtual_TC_x_m=virtual_tc_x,
+        virtual_TC_y_m=virtual_tc_y,
+        virtual_TC_T_K=virtual_tc_T,
+        virtual_TC_dTdt_K_s=math.nan,
         Ynear_HO2_max=y_near_stats["HO2"]["max"],
         Ynear_HO2_min=y_near_stats["HO2"]["min"],
         Ynear_H2O2_max=y_near_stats["H2O2"]["max"],
@@ -865,6 +895,15 @@ def plot_timeseries(summaries: list[StateSummary], out_dir: Path, dense_core_fit
         ],
         "Near-shell gas-cell count",
         "Droplet-centered near-shell hot-cell counts",
+    )
+    line_plot(
+        "virtual_TC_temperature_vs_time.png",
+        [
+            ("T", np.array([s.virtual_TC_T_K for s in summaries])),
+            ("dT/dt", np.array([s.virtual_TC_dTdt_K_s for s in summaries])),
+        ],
+        "Virtual TC T [K] or dT/dt [K/s]",
+        "Virtual thermocouple history",
     )
     line_plot("D_over_D0_vs_time.png", [("alpha_liq > 0.5", np.array([s.D_over_D0_alpha05 for s in summaries])), ("alpha_liq > 1e-3", np.array([s.D_over_D0_alpha_lo for s in summaries]))], "D / D0", "Equivalent droplet diameter")
     line_plot("D2_over_D02_vs_time.png", [("alpha_liq > 0.5", np.array([s.D2_over_D02_alpha05 for s in summaries])), ("alpha_liq > 1e-3", np.array([s.D2_over_D02_alpha_lo for s in summaries]))], "D2 / D0^2", "Equivalent D2 regression")
@@ -1084,6 +1123,83 @@ def write_csv(summaries: list[StateSummary], path: Path) -> None:
             writer.writerow(asdict(summary))
 
 
+def update_virtual_tc_derivative(summaries: list[StateSummary]) -> None:
+    if len(summaries) < 2:
+        return
+    time = np.array([s.time_s for s in summaries], dtype=np.float64)
+    temp = np.array([s.virtual_TC_T_K for s in summaries], dtype=np.float64)
+    valid = np.isfinite(time) & np.isfinite(temp)
+    if np.count_nonzero(valid) < 2:
+        return
+    derivative = np.full_like(temp, np.nan)
+    derivative[valid] = np.gradient(temp[valid], time[valid])
+    for summary, value in zip(summaries, derivative):
+        summary.virtual_TC_dTdt_K_s = float(value) if np.isfinite(value) else math.nan
+
+
+def virtual_tc_events(summaries: list[StateSummary]) -> dict[str, object]:
+    if not summaries:
+        return {
+            "virtual_TC_x_m": None,
+            "virtual_TC_y_m": None,
+            "virtual_TC_inside_domain": False,
+            "tau1_TC_inflection_s": None,
+            "tau_hot_TC_inflection_s": None,
+            "max_virtual_TC_dTdt_K_s": math.nan,
+            "method": "no states",
+        }
+
+    first = summaries[0]
+    temps = np.array([s.virtual_TC_T_K for s in summaries], dtype=np.float64)
+    deriv = np.array([s.virtual_TC_dTdt_K_s for s in summaries], dtype=np.float64)
+    valid_temp = np.isfinite(temps)
+    valid_deriv = np.isfinite(deriv)
+    inside = bool(np.isfinite(first.virtual_TC_x_m) and np.isfinite(first.virtual_TC_y_m))
+    if not inside or np.count_nonzero(valid_temp & valid_deriv) < 3:
+        return {
+            "virtual_TC_x_m": first.virtual_TC_x_m,
+            "virtual_TC_y_m": first.virtual_TC_y_m,
+            "virtual_TC_inside_domain": inside,
+            "tau1_TC_inflection_s": None,
+            "tau_hot_TC_inflection_s": None,
+            "max_virtual_TC_dTdt_K_s": finite_max(deriv),
+            "method": "insufficient finite virtual thermocouple samples",
+        }
+
+    initial_temp = temps[np.flatnonzero(valid_temp)[0]]
+    max_dtdt = finite_max(deriv)
+    tau1 = None
+    tau_hot = None
+    if np.isfinite(max_dtdt) and max_dtdt > 0.0:
+        for summary in summaries:
+            if (
+                tau1 is None
+                and np.isfinite(summary.virtual_TC_T_K)
+                and np.isfinite(summary.virtual_TC_dTdt_K_s)
+                and summary.virtual_TC_T_K >= initial_temp + 5.0
+                and summary.virtual_TC_dTdt_K_s >= 0.20*max_dtdt
+            ):
+                tau1 = summary.time_s
+            if (
+                tau_hot is None
+                and np.isfinite(summary.virtual_TC_T_K)
+                and np.isfinite(summary.virtual_TC_dTdt_K_s)
+                and summary.virtual_TC_T_K >= initial_temp + 100.0
+                and summary.virtual_TC_dTdt_K_s >= 0.80*max_dtdt
+            ):
+                tau_hot = summary.time_s
+
+    return {
+        "virtual_TC_x_m": first.virtual_TC_x_m,
+        "virtual_TC_y_m": first.virtual_TC_y_m,
+        "virtual_TC_inside_domain": inside,
+        "tau1_TC_inflection_s": tau1,
+        "tau_hot_TC_inflection_s": tau_hot,
+        "max_virtual_TC_dTdt_K_s": max_dtdt,
+        "method": "heuristic dT/dt rise: tau1 uses T>=T0+5 K and dT/dt>=20% max; hot uses T>=T0+100 K and dT/dt>=80% max",
+    }
+
+
 def first_threshold(summaries: list[StateSummary], threshold: float) -> dict[str, float | int | None]:
     for summary in summaries:
         if np.isfinite(summary.Tmax_gas_K) and summary.Tmax_gas_K >= threshold:
@@ -1175,6 +1291,26 @@ def tanabe_events(summaries: list[StateSummary], persist_frames: int) -> dict[st
         "tau1_cool_proxy_dTnear_max_event": tau1_max,
         "tau_hot_proxy_runaway_event": tau_hot,
         "hot_ignition_definition": "persistent ((dTnear_p99.9 >= 500 K or Tnear_p99.9 >= 1500 K) and near_cells_dT_gt_100K > 0)",
+    }
+
+
+def ignition_size_metrics(summaries: list[StateSummary], event_time: float | None, d0: float, label: str) -> dict[str, float | int | None]:
+    if event_time is None or not summaries:
+        return {
+            f"D_at_{label}_m": None,
+            f"D_over_D0_at_{label}": None,
+            f"ignition_mass_delay_{label}": None,
+            f"step_at_{label}": None,
+        }
+
+    best = min(summaries, key=lambda summary: abs(summary.time_s - event_time))
+    D_over_D0 = best.D_over_D0_alpha05
+    mass_delay = 1.0 - D_over_D0**3 if np.isfinite(D_over_D0) else math.nan
+    return {
+        f"D_at_{label}_m": best.D_eq_alpha05_m,
+        f"D_over_D0_at_{label}": D_over_D0,
+        f"ignition_mass_delay_{label}": mass_delay,
+        f"step_at_{label}": best.step,
     }
 
 
@@ -1282,7 +1418,7 @@ def main() -> None:
     if not files:
         raise SystemExit(f"No restart_data/lustre_<step>.dat files found under {args.run_dir}")
 
-    x, y, dx, dy = make_coords(args.d0, args.domain_scale)
+    x, y, dx, dy = make_coords(args.d0, args.domain_scale, args.nx, args.ny)
     x_grid, y_grid = np.meshgrid(x, y)
     cell_area = dx * dy
     selected_steps = choose_selected_steps([step for step, _ in files], args.selected_steps)
@@ -1290,7 +1426,7 @@ def main() -> None:
 
     for step, path in files:
         print(f"[info] reading step {step}: {path}")
-        arr = read_lustre_file(path)
+        arr = read_lustre_file(path, args.nx, args.ny)
         if arr is None:
             continue
         summary, fields = summarize_state(step, path, arr, args, x, y, x_grid, y_grid, cell_area)
@@ -1305,6 +1441,7 @@ def main() -> None:
                 plot_contour(fields[f"Y_{name}"], args.out_dir / f"contour_Y_{name}_{step}.png", f"Y_{name} step {step}", cmap="magma")
 
     summaries.sort(key=lambda item: item.step)
+    update_virtual_tc_derivative(summaries)
     write_csv(summaries, args.out_dir / "tanabe_restart_by_state.csv")
     dense_core_fit = select_dense_core_k_fit(summaries)
     if not args.skip_plots:
@@ -1321,6 +1458,19 @@ def main() -> None:
     species_warnings = species_normalization_warnings(summaries)
     motion_summary = kinematic_summary(summaries, args.d0)
     tanabe_event_summary = tanabe_events(summaries, args.persist_frames)
+    virtual_tc_summary = virtual_tc_events(summaries)
+    tau1_size_metrics = ignition_size_metrics(
+        summaries,
+        tanabe_event_summary["tau1_cool_proxy_dTnear_p99_9_gt_20K_s"],
+        args.d0,
+        "tau1",
+    )
+    tau_hot_size_metrics = ignition_size_metrics(
+        summaries,
+        tanabe_event_summary["tau_hot_proxy_runaway_s"],
+        args.d0,
+        "tau_hot",
+    )
     summary_json = {
         "run_dir": str(args.run_dir),
         "state_count": len(summaries),
@@ -1338,6 +1488,11 @@ def main() -> None:
         "max_dTmax_dt_K_s": max_dtdt(summaries),
         "hot_ignition_by_0p15s_internal_global_Tmax": bool(total_ignition["time_s"] is not None and total_ignition["time_s"] <= 0.15),
         "tanabe_droplet_centered_events": tanabe_event_summary,
+        "virtual_thermocouple": virtual_tc_summary,
+        "tanabe_ignition_size_metrics": {
+            **tau1_size_metrics,
+            **tau_hot_size_metrics,
+        },
         "hot_ignition_by_0p15s": bool(
             tanabe_event_summary["hot_ignition"]
             and tanabe_event_summary["tau_hot_proxy_runaway_s"] is not None
@@ -1349,7 +1504,7 @@ def main() -> None:
         "liquid_kinematics": motion_summary,
         "assumptions": {
             "nvars": NVARS,
-            "shape": [NVARS, NY_POINTS, NX_POINTS],
+            "shape": [NVARS, args.ny + 1, args.nx + 1],
             "dtype": "float64",
             "time_s": "step * t_save",
             "t_save_s": args.t_save,
@@ -1393,6 +1548,18 @@ def main() -> None:
         f"  hot ignition: {tanabe_event_summary['hot_ignition']}",
         f"  persist frames: {tanabe_event_summary['persist_frames']}",
         f"  definition: {tanabe_event_summary['hot_ignition_definition']}",
+        f"  virtual TC x/y: {virtual_tc_summary['virtual_TC_x_m']}, {virtual_tc_summary['virtual_TC_y_m']} m",
+        f"  virtual TC inside domain: {virtual_tc_summary['virtual_TC_inside_domain']}",
+        f"  virtual TC tau1 inflection heuristic: {virtual_tc_summary['tau1_TC_inflection_s']}",
+        f"  virtual TC hot inflection heuristic: {virtual_tc_summary['tau_hot_TC_inflection_s']}",
+        f"  virtual TC max dT/dt: {virtual_tc_summary['max_virtual_TC_dTdt_K_s']}",
+        f"  virtual TC method: {virtual_tc_summary['method']}",
+        f"  D at tau1: {tau1_size_metrics['D_at_tau1_m']} m",
+        f"  D/D0 at tau1: {tau1_size_metrics['D_over_D0_at_tau1']}",
+        f"  ignition mass delay at tau1, 1-(D/D0)^3: {tau1_size_metrics['ignition_mass_delay_tau1']}",
+        f"  D at tau hot: {tau_hot_size_metrics['D_at_tau_hot_m']} m",
+        f"  D/D0 at tau hot: {tau_hot_size_metrics['D_over_D0_at_tau_hot']}",
+        f"  ignition mass delay at tau hot, 1-(D/D0)^3: {tau_hot_size_metrics['ignition_mass_delay_tau_hot']}",
         "",
         "Dense-core D2 fit",
         f"  K_eff_dense_core: {dense_core_fit['K_eff_dense_core_m2_s']}",
