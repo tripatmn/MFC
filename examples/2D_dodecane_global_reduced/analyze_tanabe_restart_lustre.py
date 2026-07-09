@@ -222,7 +222,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--persist-frames", type=int, default=2)
     parser.add_argument("--virtual-tc-r-over-D", type=float, default=5.0)
     parser.add_argument("--virtual-tc-angle-deg", type=float, default=0.0)
-    parser.add_argument("--make-plots", action="store_true", help="Retained for compatibility; plots are made unless --skip-plots is set.")
+    parser.add_argument("--event-smooth-frames", type=int, default=5)
+    parser.add_argument("--inflection-sigma", type=float, default=3.0)
+    parser.add_argument("--min-event-time", type=float, default=0.0)
+    parser.add_argument(
+        "--event-probe-signal",
+        choices=("near_p99_9", "near_max", "virtual_tc"),
+        default="near_p99_9",
+    )
+    parser.add_argument("--make-plots", action="store_true", help="Write diagnostic PNG plots.")
     parser.add_argument("--skip-plots", action="store_true")
     parser.add_argument("--skip-contours", action="store_true")
     return parser.parse_args()
@@ -1037,6 +1045,103 @@ def plot_dense_core_fit(
     plt.close(fig)
 
 
+def plot_tanabe_style_event_diagnostics(
+    summaries: list[StateSummary],
+    event_series: dict[str, np.ndarray],
+    tanabe_event_summary: dict[str, object],
+    inflection_summary: dict[str, object],
+    out_dir: Path,
+) -> None:
+    if not summaries:
+        return
+    time = event_series["time"]
+    markers = [
+        ("tau1 threshold", tanabe_event_summary.get("tau1_cool_proxy_dTnear_p99_9_gt_20K_s")),
+        ("tau1 inflection", inflection_summary.get("tau1_near_inflection_s")),
+        ("hot threshold", tanabe_event_summary.get("tau_hot_proxy_runaway_s")),
+        ("hot inflection", inflection_summary.get("tauhot_near_inflection_s")),
+    ]
+
+    def add_markers(ax) -> None:
+        for label, value in markers:
+            if value is not None and np.isfinite(value):
+                ax.axvline(float(value), linestyle="--", linewidth=1.2, alpha=0.75, label=label)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.2), dpi=150)
+    ax.plot(time, event_series["raw"], marker="o", markersize=3.2, linewidth=1.3, label="raw signal")
+    ax.plot(time, event_series["smooth"], linewidth=2.0, label="smoothed signal")
+    add_markers(ax)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Temperature proxy [K]")
+    ax.set_title("Tanabe-style temperature events")
+    ax.grid(True, alpha=0.25)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_dir / "temperature_events_vs_time.png", dpi=300)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.2), dpi=150)
+    ax.plot(time, event_series["dtdt"], linewidth=1.8, label="dT/dt")
+    ax.plot(time, event_series["d2tdt2"], linewidth=1.4, label="d2T/dt2")
+    add_markers(ax)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Derivative proxy")
+    ax.set_title("Tanabe-style temperature derivatives")
+    ax.grid(True, alpha=0.25)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_dir / "temperature_derivatives_vs_time.png", dpi=300)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.2), dpi=150)
+    ax.plot(time, [s.D_over_D0_alpha05 for s in summaries], linewidth=1.8, label="D/D0, dense core")
+    ax.plot(time, [s.D2_over_D02_alpha05 for s in summaries], linewidth=1.8, label="D2/D0^2, dense core")
+    add_markers(ax)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Normalized droplet metric")
+    ax.set_title("Dense-core droplet metrics with event markers")
+    ax.grid(True, alpha=0.25)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_dir / "D2_D_D0_with_event_markers.png", dpi=300)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.2), dpi=150)
+    for name in TRACKED_SPECIES:
+        ax.plot(time, [getattr(s, f"Y_{name}_max") for s in summaries], linewidth=1.5, label=f"{name} max")
+        ax.plot(time, [getattr(s, f"Y_{name}_min") for s in summaries], linewidth=1.0, linestyle=":", label=f"{name} min")
+    ax.axhline(1.0, color="black", linestyle="--", linewidth=1.0)
+    ax.axhline(-1.0e-8, color="black", linestyle=":", linewidth=1.0)
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Gas-masked species mass fraction")
+    ax.set_title("Species bounds versus time")
+    ax.grid(True, alpha=0.25)
+    ax.legend(fontsize=7, ncol=2)
+    fig.tight_layout()
+    fig.savefig(out_dir / "species_bounds_vs_time.png", dpi=300)
+    plt.close(fig)
+
+    tc = np.array([s.virtual_TC_T_K for s in summaries], dtype=np.float64)
+    tc_dtdt = np.array([s.virtual_TC_dTdt_K_s for s in summaries], dtype=np.float64)
+    if np.any(np.isfinite(tc)):
+        fig, ax = plt.subplots(figsize=(7.0, 4.2), dpi=150)
+        ax.plot(time, tc, linewidth=1.8, label="virtual TC T")
+        ax2 = ax.twinx()
+        ax2.plot(time, tc_dtdt, color="tab:red", linewidth=1.4, label="virtual TC dT/dt")
+        add_markers(ax)
+        ax.set_xlabel("Time [s]")
+        ax.set_ylabel("Virtual TC temperature [K]")
+        ax2.set_ylabel("Virtual TC dT/dt [K/s]")
+        ax.set_title("Virtual thermocouple trace")
+        ax.grid(True, alpha=0.25)
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines + lines2, labels + labels2, fontsize=8)
+        fig.tight_layout()
+        fig.savefig(out_dir / "virtual_TC_trace.png", dpi=300)
+        plt.close(fig)
+
+
 def plot_contour(field: np.ndarray, out_path: Path, title: str, cmap: str = "viridis") -> None:
     fig, ax = plt.subplots(figsize=(5.6, 4.8), dpi=150)
     finite = field[np.isfinite(field)]
@@ -1200,6 +1305,324 @@ def virtual_tc_events(summaries: list[StateSummary]) -> dict[str, object]:
     }
 
 
+def event_probe_values(summaries: list[StateSummary], probe_signal: str) -> tuple[np.ndarray, np.ndarray]:
+    time = np.array([summary.time_s for summary in summaries], dtype=np.float64)
+    if probe_signal == "near_max":
+        values = np.array([summary.Tnear_max_K for summary in summaries], dtype=np.float64)
+    elif probe_signal == "virtual_tc":
+        values = np.array([summary.virtual_TC_T_K for summary in summaries], dtype=np.float64)
+    else:
+        values = np.array([summary.Tnear_p99_9_K for summary in summaries], dtype=np.float64)
+    return time, values
+
+
+def smooth_signal(values: np.ndarray, frames: int) -> np.ndarray:
+    frames = max(1, int(frames))
+    if frames == 1:
+        return values.astype(np.float64, copy=True)
+    radius = frames // 2
+    out = np.full_like(values, np.nan, dtype=np.float64)
+    for i in range(values.size):
+        lo = max(0, i - radius)
+        hi = min(values.size, i + radius + 1)
+        window = values[lo:hi]
+        finite = window[np.isfinite(window)]
+        if finite.size:
+            out[i] = float(np.mean(finite))
+    return out
+
+
+def gradient_series(time: np.ndarray, values: np.ndarray) -> np.ndarray:
+    out = np.full_like(values, np.nan, dtype=np.float64)
+    finite = np.isfinite(time) & np.isfinite(values)
+    if np.count_nonzero(finite) < 2:
+        return out
+    out[finite] = np.gradient(values[finite], time[finite])
+    return out
+
+
+def finite_mad(values: np.ndarray) -> float:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return math.nan
+    median = float(np.median(finite))
+    return float(1.4826*np.median(np.abs(finite - median)))
+
+
+def first_persistent_index(mask: np.ndarray, persist_frames: int) -> int | None:
+    persist_frames = max(1, int(persist_frames))
+    for idx in range(0, mask.size - persist_frames + 1):
+        if bool(np.all(mask[idx:idx + persist_frames])):
+            return idx
+    return None
+
+
+def detect_near_inflection_events(summaries: list[StateSummary], args: argparse.Namespace) -> dict[str, object]:
+    time, raw = event_probe_values(summaries, args.event_probe_signal)
+    smooth = smooth_signal(raw, args.event_smooth_frames)
+    dtdt = gradient_series(time, smooth)
+    d2tdt2 = gradient_series(time, dtdt)
+    warnings: list[str] = []
+
+    finite = np.isfinite(time) & np.isfinite(smooth) & np.isfinite(dtdt) & np.isfinite(d2tdt2)
+    if np.count_nonzero(finite) < max(5, args.persist_frames + 2):
+        return {
+            "probe_signal": args.event_probe_signal,
+            "tau1_near_inflection_s": None,
+            "tauhot_near_inflection_s": None,
+            "tau2_near_inflection_s": None,
+            "warnings": ["insufficient finite samples for inflection detection"],
+            "event_smooth_frames": args.event_smooth_frames,
+            "inflection_sigma": args.inflection_sigma,
+            "min_event_time_s": args.min_event_time,
+        }
+
+    finite_indices = np.flatnonzero(finite)
+    baseline_count = max(3, min(10, max(3, finite_indices.size // 10)))
+    baseline_idx = finite_indices[:baseline_count]
+    baseline_slope = dtdt[baseline_idx]
+    baseline_accel = d2tdt2[baseline_idx]
+    slope_center = float(np.median(baseline_slope))
+    accel_center = float(np.median(baseline_accel))
+    slope_noise = finite_mad(baseline_slope)
+    accel_noise = finite_mad(baseline_accel)
+    if not np.isfinite(slope_noise) or slope_noise <= 0.0:
+        slope_noise = max(abs(slope_center)*0.10, 1.0e-9)
+    if not np.isfinite(accel_noise) or accel_noise <= 0.0:
+        accel_noise = max(abs(accel_center)*0.10, 1.0e-9)
+
+    slope_threshold = slope_center + args.inflection_sigma*slope_noise
+    accel_threshold = accel_center + args.inflection_sigma*accel_noise
+    initial_signal = float(smooth[finite_indices[0]])
+    eligible = finite & (time >= args.min_event_time)
+    if finite_indices.size:
+        eligible[:finite_indices[0] + 1] = False
+
+    tau1_mask = eligible & (dtdt > slope_threshold) & (d2tdt2 > accel_threshold)
+    tau1_idx = first_persistent_index(tau1_mask, args.persist_frames)
+    if tau1_idx is None:
+        warnings.append("no persistent first-stage inflection found")
+
+    max_slope = finite_max(dtdt[eligible])
+    tauhot_idx = None
+    if tau1_idx is not None and np.isfinite(max_slope) and max_slope > slope_threshold:
+        hot_slope_threshold = slope_threshold + 0.80*(max_slope - slope_threshold)
+        hot_mask = (
+            eligible
+            & (np.arange(time.size) > tau1_idx)
+            & (smooth >= initial_signal + 100.0)
+            & (dtdt >= hot_slope_threshold)
+        )
+        tauhot_idx = first_persistent_index(hot_mask, args.persist_frames)
+        if tauhot_idx is None:
+            warnings.append("no separated persistent hot/runaway inflection found")
+    elif tau1_idx is not None:
+        warnings.append("maximum slope is not sufficiently above first-stage threshold")
+
+    tau1 = float(time[tau1_idx]) if tau1_idx is not None else None
+    tauhot = float(time[tauhot_idx]) if tauhot_idx is not None else None
+    tau2 = float(tauhot - tau1) if tau1 is not None and tauhot is not None else None
+
+    return {
+        "probe_signal": args.event_probe_signal,
+        "tau1_near_inflection_s": tau1,
+        "tauhot_near_inflection_s": tauhot,
+        "tau2_near_inflection_s": tau2,
+        "tau1_index": int(tau1_idx) if tau1_idx is not None else None,
+        "tauhot_index": int(tauhot_idx) if tauhot_idx is not None else None,
+        "slope_threshold_K_s": slope_threshold,
+        "accel_threshold_K_s2": accel_threshold,
+        "max_slope_K_s": max_slope,
+        "warnings": warnings,
+        "event_smooth_frames": args.event_smooth_frames,
+        "inflection_sigma": args.inflection_sigma,
+        "min_event_time_s": args.min_event_time,
+    }
+
+
+def event_location_metrics(
+    summaries: list[StateSummary],
+    event_time: float | None,
+    args: argparse.Namespace,
+    label: str,
+    probe_signal: str = "near_p99_9",
+) -> dict[str, float | bool | int | None]:
+    prefix = f"{label}_location"
+    if event_time is None or not summaries:
+        return {
+            f"{prefix}_x_m": None,
+            f"{prefix}_y_m": None,
+            f"{prefix}_r_over_D0": None,
+            f"{prefix}_angle_deg": None,
+            f"{prefix}_near_shell": None,
+            f"{prefix}_distance_to_boundary_m": None,
+            f"{prefix}_step": None,
+        }
+
+    summary = min(summaries, key=lambda item: abs(item.time_s - event_time))
+    if probe_signal == "virtual_tc":
+        x_event = summary.virtual_TC_x_m
+        y_event = summary.virtual_TC_y_m
+    else:
+        x_event = summary.Tnear_max_x_m
+        y_event = summary.Tnear_max_y_m
+
+    cx = summary.dense_core_centroid_x_m
+    cy = summary.dense_core_centroid_y_m
+    if all(np.isfinite(value) for value in (x_event, y_event, cx, cy)):
+        dx = x_event - cx
+        dy = y_event - cy
+        radius = math.hypot(dx, dy)
+        r_over_d0 = radius / args.d0
+        angle = math.degrees(math.atan2(dy, dx))
+    else:
+        r_over_d0 = math.nan
+        angle = math.nan
+
+    domain_length = args.domain_scale * args.d0
+    if np.isfinite(x_event) and np.isfinite(y_event):
+        boundary_distance = min(x_event, domain_length - x_event, y_event, domain_length - y_event)
+    else:
+        boundary_distance = math.nan
+
+    near_shell = (
+        bool(args.near_rmin_D <= r_over_d0 <= args.near_rmax_D)
+        if np.isfinite(r_over_d0)
+        else None
+    )
+    return {
+        f"{prefix}_x_m": x_event,
+        f"{prefix}_y_m": y_event,
+        f"{prefix}_r_over_D0": r_over_d0,
+        f"{prefix}_angle_deg": angle,
+        f"{prefix}_near_shell": near_shell,
+        f"{prefix}_distance_to_boundary_m": boundary_distance,
+        f"{prefix}_step": summary.step,
+    }
+
+
+def write_event_probe_csv(
+    summaries: list[StateSummary],
+    args: argparse.Namespace,
+    path: Path,
+) -> dict[str, np.ndarray]:
+    time, raw = event_probe_values(summaries, args.event_probe_signal)
+    smooth = smooth_signal(raw, args.event_smooth_frames)
+    dtdt = gradient_series(time, smooth)
+    d2tdt2 = gradient_series(time, dtdt)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["step", "time_s", "signal_raw_K", "signal_smooth_K", "dTdt_K_s", "d2Tdt2_K_s2"],
+        )
+        writer.writeheader()
+        for summary, raw_value, smooth_value, d1, d2 in zip(summaries, raw, smooth, dtdt, d2tdt2):
+            writer.writerow({
+                "step": summary.step,
+                "time_s": summary.time_s,
+                "signal_raw_K": raw_value,
+                "signal_smooth_K": smooth_value,
+                "dTdt_K_s": d1,
+                "d2Tdt2_K_s2": d2,
+            })
+    return {"time": time, "raw": raw, "smooth": smooth, "dtdt": dtdt, "d2tdt2": d2tdt2}
+
+
+def species_validation_summary(summaries: list[StateSummary]) -> dict[str, object]:
+    species: dict[str, dict[str, float | int]] = {}
+    invalid_reasons: list[str] = []
+    minor_reasons: list[str] = []
+    for name in TRACKED_SPECIES:
+        max_values = np.array([getattr(s, f"Y_{name}_max") for s in summaries], dtype=np.float64)
+        min_values = np.array([getattr(s, f"Y_{name}_min") for s in summaries], dtype=np.float64)
+        max_value = finite_max(max_values)
+        min_value = finite_min(min_values)
+        high_count = int(np.count_nonzero(np.isfinite(max_values) & (max_values > 1.0 + 1.0e-8)))
+        low_count = int(np.count_nonzero(np.isfinite(min_values) & (min_values < -1.0e-8)))
+        species[name] = {
+            "min": min_value,
+            "max": max_value,
+            "count_max_gt_1": high_count,
+            "count_min_lt_minus_1e_minus_8": low_count,
+        }
+        if high_count:
+            invalid_reasons.append(f"Y_{name} exceeded 1.0 in {high_count} states; max={max_value:.6e}")
+        if low_count:
+            invalid_reasons.append(f"Y_{name} dropped below -1e-8 in {low_count} states; min={min_value:.6e}")
+        if not high_count and np.isfinite(max_value) and max_value > 1.0:
+            minor_reasons.append(f"Y_{name} slightly exceeded 1.0; max={max_value:.6e}")
+
+    if invalid_reasons:
+        quality = "invalid"
+        reason = "; ".join(invalid_reasons)
+    elif minor_reasons:
+        quality = "minor_warning"
+        reason = "; ".join(minor_reasons)
+    else:
+        quality = "clean"
+        reason = ""
+    return {
+        "species_validation_quality": quality,
+        "species_invalid_reason": reason,
+        "species_bounds": species,
+        "chemistry_validation_warning": (
+            "Thermal timing can be reported as a numerical diagnostic, but chemistry validation should not be claimed."
+            if quality == "invalid"
+            else ""
+        ),
+    }
+
+
+def cool_flame_shoulder_candidate(
+    summaries: list[StateSummary],
+    tau1: float | None,
+    tauhot: float | None,
+    species_quality: str,
+) -> dict[str, object]:
+    if tau1 is None or not summaries:
+        return {
+            "cool_flame_shoulder_candidate": False,
+            "start_s": None,
+            "end_s": None,
+            "duration_s": None,
+            "mean_Tnear_K": math.nan,
+            "max_Tnear_K": math.nan,
+            "mean_dTnear_K": math.nan,
+            "note": "No tau1 event was detected.",
+        }
+
+    end_time = tauhot if tauhot is not None else summaries[-1].time_s
+    window = [s for s in summaries if s.time_s >= tau1 and s.time_s <= end_time]
+    if len(window) < 3 or end_time <= tau1:
+        return {
+            "cool_flame_shoulder_candidate": False,
+            "start_s": tau1,
+            "end_s": end_time,
+            "duration_s": max(0.0, end_time - tau1),
+            "mean_Tnear_K": math.nan,
+            "max_Tnear_K": math.nan,
+            "mean_dTnear_K": math.nan,
+            "note": "Insufficient separated samples between tau1 and tauhot/end.",
+        }
+
+    tnear = np.array([s.Tnear_p99_9_K for s in window], dtype=np.float64)
+    dtnear = np.array([s.dTnear_p99_9_K for s in window], dtype=np.float64)
+    candidate = bool(np.isfinite(finite_mean(dtnear)) and finite_mean(dtnear) > 0.0)
+    note = "candidate first-stage/cool-flame-like shoulder; not confirmed cool flame"
+    if species_quality != "clean":
+        note += "; species bounds are not clean"
+    return {
+        "cool_flame_shoulder_candidate": candidate,
+        "start_s": tau1,
+        "end_s": end_time,
+        "duration_s": end_time - tau1,
+        "mean_Tnear_K": finite_mean(tnear),
+        "max_Tnear_K": finite_max(tnear),
+        "mean_dTnear_K": finite_mean(dtnear),
+        "note": note,
+    }
+
+
 def first_threshold(summaries: list[StateSummary], threshold: float) -> dict[str, float | int | None]:
     for summary in summaries:
         if np.isfinite(summary.Tmax_gas_K) and summary.Tmax_gas_K >= threshold:
@@ -1304,10 +1727,17 @@ def ignition_size_metrics(summaries: list[StateSummary], event_time: float | Non
         }
 
     best = min(summaries, key=lambda summary: abs(summary.time_s - event_time))
-    D_over_D0 = best.D_over_D0_alpha05
+    time = np.array([summary.time_s for summary in summaries], dtype=np.float64)
+    diameter = np.array([summary.D_eq_alpha05_m for summary in summaries], dtype=np.float64)
+    finite = np.isfinite(time) & np.isfinite(diameter)
+    if np.count_nonzero(finite) >= 2 and np.nanmin(time[finite]) <= event_time <= np.nanmax(time[finite]):
+        D_event = float(np.interp(event_time, time[finite], diameter[finite]))
+    else:
+        D_event = best.D_eq_alpha05_m
+    D_over_D0 = D_event / d0 if np.isfinite(D_event) else math.nan
     mass_delay = 1.0 - D_over_D0**3 if np.isfinite(D_over_D0) else math.nan
     return {
-        f"D_at_{label}_m": best.D_eq_alpha05_m,
+        f"D_at_{label}_m": D_event,
         f"D_over_D0_at_{label}": D_over_D0,
         f"ignition_mass_delay_{label}": mass_delay,
         f"step_at_{label}": best.step,
@@ -1443,9 +1873,8 @@ def main() -> None:
     summaries.sort(key=lambda item: item.step)
     update_virtual_tc_derivative(summaries)
     write_csv(summaries, args.out_dir / "tanabe_restart_by_state.csv")
+    event_series = write_event_probe_csv(summaries, args, args.out_dir / "tanabe_event_probe_timeseries.csv")
     dense_core_fit = select_dense_core_k_fit(summaries)
-    if not args.skip_plots:
-        plot_timeseries(summaries, args.out_dir, dense_core_fit)
 
     first_induction = first_threshold(summaries, 820.0)
     total_ignition = first_threshold(summaries, 2000.0)
@@ -1459,6 +1888,8 @@ def main() -> None:
     motion_summary = kinematic_summary(summaries, args.d0)
     tanabe_event_summary = tanabe_events(summaries, args.persist_frames)
     virtual_tc_summary = virtual_tc_events(summaries)
+    inflection_summary = detect_near_inflection_events(summaries, args)
+    species_validation = species_validation_summary(summaries)
     tau1_size_metrics = ignition_size_metrics(
         summaries,
         tanabe_event_summary["tau1_cool_proxy_dTnear_p99_9_gt_20K_s"],
@@ -1471,6 +1902,90 @@ def main() -> None:
         args.d0,
         "tau_hot",
     )
+    tau1_threshold_size_metrics = ignition_size_metrics(
+        summaries,
+        tanabe_event_summary["tau1_cool_proxy_dTnear_p99_9_gt_20K_s"],
+        args.d0,
+        "tau1_threshold",
+    )
+    tau_hot_threshold_size_metrics = ignition_size_metrics(
+        summaries,
+        tanabe_event_summary["tau_hot_proxy_runaway_s"],
+        args.d0,
+        "tau_hot_threshold",
+    )
+    tau1_inflection_size_metrics = ignition_size_metrics(
+        summaries,
+        inflection_summary["tau1_near_inflection_s"],
+        args.d0,
+        "tau1_near_inflection",
+    )
+    tauhot_inflection_size_metrics = ignition_size_metrics(
+        summaries,
+        inflection_summary["tauhot_near_inflection_s"],
+        args.d0,
+        "tauhot_near_inflection",
+    )
+    event_locations = {
+        **event_location_metrics(
+            summaries,
+            tanabe_event_summary["tau1_cool_proxy_dTnear_p99_9_gt_20K_s"],
+            args,
+            "tau1_threshold",
+            "near_p99_9",
+        ),
+        **event_location_metrics(
+            summaries,
+            tanabe_event_summary["tau_hot_proxy_runaway_s"],
+            args,
+            "tau_hot_threshold",
+            "near_p99_9",
+        ),
+        **event_location_metrics(
+            summaries,
+            inflection_summary["tau1_near_inflection_s"],
+            args,
+            "tau1_near_inflection",
+            args.event_probe_signal,
+        ),
+        **event_location_metrics(
+            summaries,
+            inflection_summary["tauhot_near_inflection_s"],
+            args,
+            "tauhot_near_inflection",
+            args.event_probe_signal,
+        ),
+    }
+    shoulder_summary = cool_flame_shoulder_candidate(
+        summaries,
+        inflection_summary["tau1_near_inflection_s"] or tanabe_event_summary["tau1_cool_proxy_dTnear_p99_9_gt_20K_s"],
+        inflection_summary["tauhot_near_inflection_s"] or tanabe_event_summary["tau_hot_proxy_runaway_s"],
+        species_validation["species_validation_quality"],
+    )
+    tau1_threshold = tanabe_event_summary["tau1_cool_proxy_dTnear_p99_9_gt_20K_s"]
+    tau_hot_threshold = tanabe_event_summary["tau_hot_proxy_runaway_s"]
+    tau1_inflection = inflection_summary["tau1_near_inflection_s"]
+    tauhot_inflection = inflection_summary["tauhot_near_inflection_s"]
+    tau2_inflection = inflection_summary["tau2_near_inflection_s"]
+    if species_validation["species_validation_quality"] == "invalid":
+        validation_interpretation = (
+            "Thermal timing can be reported as a numerical diagnostic, but chemistry validation should not be claimed."
+        )
+    elif tauhot_inflection is not None or tau_hot_threshold is not None:
+        validation_interpretation = "Candidate ignition validation if timing and field locations are physically coherent."
+    elif tau1_inflection is not None or tau1_threshold is not None:
+        validation_interpretation = "Droplet regression plus first-stage-like response; no complete hot ignition detected."
+    else:
+        validation_interpretation = "No Tanabe-style ignition event detected; global Tmax alone is not sufficient."
+    if args.make_plots and not args.skip_plots:
+        plot_timeseries(summaries, args.out_dir, dense_core_fit)
+        plot_tanabe_style_event_diagnostics(
+            summaries,
+            event_series,
+            tanabe_event_summary,
+            inflection_summary,
+            args.out_dir,
+        )
     summary_json = {
         "run_dir": str(args.run_dir),
         "state_count": len(summaries),
@@ -1488,11 +2003,19 @@ def main() -> None:
         "max_dTmax_dt_K_s": max_dtdt(summaries),
         "hot_ignition_by_0p15s_internal_global_Tmax": bool(total_ignition["time_s"] is not None and total_ignition["time_s"] <= 0.15),
         "tanabe_droplet_centered_events": tanabe_event_summary,
+        "tanabe_near_inflection_events": inflection_summary,
         "virtual_thermocouple": virtual_tc_summary,
         "tanabe_ignition_size_metrics": {
             **tau1_size_metrics,
             **tau_hot_size_metrics,
+            **tau1_threshold_size_metrics,
+            **tau_hot_threshold_size_metrics,
+            **tau1_inflection_size_metrics,
+            **tauhot_inflection_size_metrics,
         },
+        "tanabe_event_locations": event_locations,
+        "cool_flame_shoulder_candidate": shoulder_summary,
+        "tanabe_validation_interpretation": validation_interpretation,
         "hot_ignition_by_0p15s": bool(
             tanabe_event_summary["hot_ignition"]
             and tanabe_event_summary["tau_hot_proxy_runaway_s"] is not None
@@ -1501,6 +2024,7 @@ def main() -> None:
         "dense_core_D2_fit": dense_core_fit,
         "recommended_K_label": "K_eff_dense_core, not classical K_burn, unless the fit window and R2 support a D2-law interpretation",
         "species_normalization_warnings": species_warnings,
+        "species_validation": species_validation,
         "liquid_kinematics": motion_summary,
         "assumptions": {
             "nvars": NVARS,
@@ -1540,6 +2064,19 @@ def main() -> None:
         f"Max dTmax/dt: {summary_json['max_dTmax_dt_K_s']:.6e} K/s",
         f"Hot ignition by 0.15 s, Tanabe near-shell proxy: {summary_json['hot_ignition_by_0p15s']}",
         "",
+        "Tanabe-style ignition diagnostics:",
+        f"- tau1 threshold: {tau1_threshold}",
+        f"- tau1 inflection: {tau1_inflection}",
+        f"- tau_hot threshold: {tau_hot_threshold}",
+        f"- tau_hot inflection: {tauhot_inflection}",
+        f"- tau2: {tau2_inflection if tau2_inflection is not None else tanabe_event_summary['tau2_proxy_s']}",
+        f"- ignition mass delay at tau1: {tau1_inflection_size_metrics['ignition_mass_delay_tau1_near_inflection'] if tau1_inflection is not None else tau1_threshold_size_metrics['ignition_mass_delay_tau1_threshold']}",
+        f"- ignition mass delay at tau_hot: {tauhot_inflection_size_metrics['ignition_mass_delay_tauhot_near_inflection'] if tauhot_inflection is not None else tau_hot_threshold_size_metrics['ignition_mass_delay_tau_hot_threshold']}",
+        f"- cool-flame shoulder candidate: {shoulder_summary}",
+        f"- hot ignition: {bool(tauhot_inflection is not None or tau_hot_threshold is not None)}",
+        f"- species validation quality: {species_validation['species_validation_quality']}",
+        f"- validation interpretation: {validation_interpretation}",
+        "",
         "Tanabe droplet-centered event proxies",
         f"  tau1 cool proxy, dTnear p99.9 >= 20 K: {tanabe_event_summary['tau1_cool_proxy_dTnear_p99_9_gt_20K_s']}",
         f"  tau1 cool proxy, dTnear max >= 20 K: {tanabe_event_summary['tau1_cool_proxy_dTnear_max_gt_20K_s']}",
@@ -1560,6 +2097,11 @@ def main() -> None:
         f"  D at tau hot: {tau_hot_size_metrics['D_at_tau_hot_m']} m",
         f"  D/D0 at tau hot: {tau_hot_size_metrics['D_over_D0_at_tau_hot']}",
         f"  ignition mass delay at tau hot, 1-(D/D0)^3: {tau_hot_size_metrics['ignition_mass_delay_tau_hot']}",
+        f"  tau1 inflection: {inflection_summary['tau1_near_inflection_s']}",
+        f"  tau hot inflection: {inflection_summary['tauhot_near_inflection_s']}",
+        f"  tau2 inflection: {inflection_summary['tau2_near_inflection_s']}",
+        f"  inflection warnings: {inflection_summary['warnings']}",
+        f"  event locations: {event_locations}",
         "",
         "Dense-core D2 fit",
         f"  K_eff_dense_core: {dense_core_fit['K_eff_dense_core_m2_s']}",
@@ -1582,6 +2124,10 @@ def main() -> None:
         "",
         "Species normalization warnings:",
         *(f"  - {warning}" for warning in species_warnings),
+        f"Species validation quality: {species_validation['species_validation_quality']}",
+        f"Species invalid reason: {species_validation['species_invalid_reason']}",
+        f"Species bounds: {species_validation['species_bounds']}",
+        species_validation["chemistry_validation_warning"],
         "",
         "Temperature is a gas-only proxy; liquid-dominated cells are excluded.",
         "The alpha_liq > 1e-3 diameter is a liquid-footprint diagnostic, not the K_eff/K_burn basis.",
