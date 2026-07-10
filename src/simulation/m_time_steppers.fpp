@@ -42,6 +42,10 @@ module m_time_steppers
 
     use m_thermochem, only: num_species
 
+    use m_chemistry, only: s_compute_chemistry_gas_density
+
+    use m_variables_conversion, only: s_convert_conservative_to_primitive_variables
+
     use m_body_forces
 
     use m_derived_variables
@@ -96,6 +100,126 @@ module m_time_steppers
 !> @endcond
 
 contains
+
+    logical function s_tanabe_species_bounds_diag_active()
+        character(len=16) :: env_value
+        integer :: env_status
+
+        call get_environment_variable("TANABE_SPECIES_BOUNDS_DIAG", env_value, status=env_status)
+        s_tanabe_species_bounds_diag_active = env_status == 0 .and. trim(env_value) == "1"
+    end function s_tanabe_species_bounds_diag_active
+
+    subroutine s_tanabe_species_bounds_diag(q_cons_vf, t_step, stage_name)
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
+        integer, intent(in) :: t_step
+        character(len=*), intent(in) :: stage_name
+
+        type(scalar_field), allocatable, dimension(:) :: q_prim_diag
+        type(scalar_field) :: q_T_diag
+        real(wp) :: species_min, species_max, pres_min, pres_max
+        real(wp) :: temp_min, temp_max, gas_rho_min, gas_rho_max
+        real(wp) :: arho_min, arho_max, rho_g, species_value
+        integer :: i, j, k, l, neg_count, above_gas_count
+        integer :: first_i, first_j, first_k, first_l
+
+        if (.not. s_tanabe_species_bounds_diag_active()) return
+        if (.not. chemistry) return
+
+        @:ALLOCATE(q_prim_diag(1:sys_size))
+        do i = 1, sys_size
+            @:ALLOCATE(q_prim_diag(i)%sf(idwint(1)%beg:idwint(1)%end, &
+                idwint(2)%beg:idwint(2)%end, idwint(3)%beg:idwint(3)%end))
+            @:ACC_SETUP_SFs(q_prim_diag(i))
+        end do
+        @:ALLOCATE(q_T_diag%sf(idwint(1)%beg:idwint(1)%end, &
+            idwint(2)%beg:idwint(2)%end, idwint(3)%beg:idwint(3)%end))
+        @:ACC_SETUP_SFs(q_T_diag)
+
+        $:GPU_PARALLEL_LOOP(collapse=3)
+        do l = 0, p
+            do k = 0, n
+                do j = 0, m
+                    q_T_diag%sf(j, k, l) = dflt_T_guess
+                end do
+            end do
+        end do
+        $:END_GPU_PARALLEL_LOOP()
+
+        call s_convert_conservative_to_primitive_variables(q_cons_vf, q_T_diag, &
+                                                            q_prim_diag, idwint)
+
+#ifndef FRONTIER_UNIFIED
+        do i = contxb, contxe
+            $:GPU_UPDATE(host='[q_cons_vf(i)%sf]')
+        end do
+        do i = chemxb, chemxe
+            $:GPU_UPDATE(host='[q_cons_vf(i)%sf]')
+        end do
+        $:GPU_UPDATE(host='[q_prim_diag(E_idx)%sf,q_T_diag%sf]')
+#endif
+
+        species_min = huge(1._wp)
+        species_max = -huge(1._wp)
+        pres_min = minval(q_prim_diag(E_idx)%sf(0:m, 0:n, 0:p))
+        pres_max = maxval(q_prim_diag(E_idx)%sf(0:m, 0:n, 0:p))
+        temp_min = minval(q_T_diag%sf(0:m, 0:n, 0:p))
+        temp_max = maxval(q_T_diag%sf(0:m, 0:n, 0:p))
+        gas_rho_min = huge(1._wp)
+        gas_rho_max = -huge(1._wp)
+        arho_min = huge(1._wp)
+        arho_max = -huge(1._wp)
+        neg_count = 0
+        above_gas_count = 0
+        first_i = -1
+        first_j = -1
+        first_k = -1
+        first_l = -1
+
+        do l = 0, p
+            do k = 0, n
+                do j = 0, m
+                    call s_compute_chemistry_gas_density(q_cons_vf, j, k, l, rho_g)
+                    gas_rho_min = min(gas_rho_min, rho_g)
+                    gas_rho_max = max(gas_rho_max, rho_g)
+                    do i = contxb, contxe
+                        arho_min = min(arho_min, q_cons_vf(i)%sf(j, k, l))
+                        arho_max = max(arho_max, q_cons_vf(i)%sf(j, k, l))
+                    end do
+                    do i = chemxb, chemxe
+                        species_value = q_cons_vf(i)%sf(j, k, l)
+                        species_min = min(species_min, species_value)
+                        species_max = max(species_max, species_value)
+                        if (species_value < 0._wp) neg_count = neg_count + 1
+                        if (species_value > rho_g) above_gas_count = above_gas_count + 1
+                        if (first_i < 0 .and. (species_value < 0._wp .or. species_value > rho_g)) then
+                            first_i = i - chemxb + 1
+                            first_j = j
+                            first_k = k
+                            first_l = l
+                        end if
+                    end do
+                end do
+            end do
+        end do
+
+        print '(A," stage=",A," t_step=",I0," time=",ES13.5," rank=",I0, &
+            & " species_min=",ES13.5," species_max=",ES13.5," neg_count=",I0, &
+            & " above_gas_count=",I0," p_min=",ES13.5," p_max=",ES13.5, &
+            & " T_min=",ES13.5," T_max=",ES13.5," gas_rho_min=",ES13.5, &
+            & " gas_rho_max=",ES13.5," arho_min=",ES13.5," arho_max=",ES13.5, &
+            & " first_species=",I0," first_cell=",I0,",",I0,",",I0)', &
+            "TANABE_SPECIES_BOUNDS_DIAG", trim(stage_name), t_step, mytime, proc_rank, &
+            species_min, species_max, neg_count, above_gas_count, pres_min, pres_max, &
+            temp_min, temp_max, gas_rho_min, gas_rho_max, arho_min, arho_max, &
+            first_i, first_j, first_k, first_l
+        call flush(output_unit)
+
+        do i = 1, sys_size
+            @:DEALLOCATE(q_prim_diag(i)%sf)
+        end do
+        @:DEALLOCATE(q_prim_diag)
+        @:DEALLOCATE(q_T_diag%sf)
+    end subroutine s_tanabe_species_bounds_diag
 
     logical function s_zhang_evap_hang_diag_active(t_step)
         integer, intent(in) :: t_step
@@ -658,6 +782,7 @@ contains
             call s_zhang_evap_hang_trace(t_step, s, "RK_STAGE_BEGIN")
             call s_zhang_evap_hang_trace(t_step, s, "RHS_CALL_BEGIN")
             call s_compute_rhs(q_cons_ts(1)%vf, q_T_sf, q_prim_vf, bc_type, rhs_vf, pb_ts(1)%sf, rhs_pb, mv_ts(1)%sf, rhs_mv, t_step, time_avg, s)
+            call s_tanabe_species_bounds_diag(q_cons_ts(1)%vf, t_step, "post_rhs")
             call s_zhang_evap_hang_trace(t_step, s, "RHS_CALL_END")
 
             if (s == 1) then
@@ -773,6 +898,8 @@ contains
 
             call s_zhang_evap_hang_trace(t_step, s, "RK_STAGE_END")
         end do
+
+        call s_tanabe_species_bounds_diag(q_cons_ts(1)%vf, t_step, "post_rk")
 
         ! Adaptive dt: final stage
         if (adap_dt) call s_adaptive_dt_bubble(3)

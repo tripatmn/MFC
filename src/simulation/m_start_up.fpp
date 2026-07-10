@@ -1019,6 +1019,8 @@ contains
             save_count = t_step
         end if
 
+        call s_tanabe_species_bounds_diag(q_cons_ts(stor)%vf, t_step, "pre_write")
+
         if (bubbles_lagrange) then
             $:GPU_UPDATE(host='[lag_id, mtn_pos, mtn_posPrev, mtn_vel, intfc_rad, &
                 & intfc_vel, bub_R0, Rmax_stats, Rmin_stats, bub_dphidt, gas_p, &
