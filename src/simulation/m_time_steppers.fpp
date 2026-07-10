@@ -40,7 +40,7 @@ module m_time_steppers
 
     use m_nvtx
 
-    use m_thermochem, only: num_species
+    use m_thermochem, only: num_species, species_names
 
     use m_body_forces
 
@@ -889,14 +889,22 @@ contains
         character(len=*), intent(in) :: label
 
         character(len=32) :: region_label
-        integer :: fluid_id, gas_fluid_id, species_eqn
+        integer :: fluid_id, gas_fluid_id, species_eqn, mom_id, species_count
         integer :: global_j, global_k, global_l
         integer :: liquid_fluid_id
+        integer :: top_slot, top_pos, top_sp
         logical :: on_boundary, near_boundary
+        logical :: alpha_invalid, arho_invalid, species_invalid, energy_invalid, eos_invalid
         real(wp) :: rho, vel_sum, pres, gamma, pi_inf, qv, c, H
         real(wp) :: vel_x, vel_y, vel_z, vel_mag
         real(wp) :: gas_alpha, gas_mass, alpha_liq, temp_value
         real(wp) :: fuel_rhoY, species_sum, cfl_denom, x_loc, y_loc
+        real(wp) :: rho_cons, mom_x, mom_y, mom_z, mom_sq
+        real(wp) :: total_energy_cons, kinetic_energy_est, internal_energy_est
+        real(wp) :: alpha_sum, arho_sum, alpha_min, arho_min
+        real(wp) :: species_min, species_max, species_value, species_ratio
+        real(wp), dimension(5) :: top_species_value
+        integer, dimension(5) :: top_species_id, top_species_eqn
         real(wp), dimension(2) :: Re
         #:if not MFC_CASE_OPTIMIZATION and USING_AMD
             real(wp), dimension(3) :: vel
@@ -939,15 +947,73 @@ contains
         alpha_liq = q_cons_ts(1)%vf(advxb + liquid_fluid_id - 1)%sf(cell_j, cell_k, cell_l)
         gas_alpha = 0._wp
         gas_mass = 0._wp
+        alpha_sum = 0._wp
+        arho_sum = 0._wp
+        alpha_min = huge(1._wp)
+        arho_min = huge(1._wp)
+        alpha_invalid = .false.
+        arho_invalid = .false.
         do gas_fluid_id = 1, num_fluids
+            alpha_sum = alpha_sum + q_cons_ts(1)%vf(advxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l)
+            arho_sum = arho_sum + q_cons_ts(1)%vf(contxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l)
+            alpha_min = min(alpha_min, q_cons_ts(1)%vf(advxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l))
+            arho_min = min(arho_min, q_cons_ts(1)%vf(contxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l))
+            if (q_cons_ts(1)%vf(advxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l) /= &
+                q_cons_ts(1)%vf(advxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l) .or. &
+                abs(q_cons_ts(1)%vf(advxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l)) >= &
+                0.5_wp*huge(1._wp) .or. &
+                q_cons_ts(1)%vf(advxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l) < 0._wp .or. &
+                q_cons_ts(1)%vf(advxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l) > 1._wp) then
+                alpha_invalid = .true.
+            end if
+            if (q_cons_ts(1)%vf(contxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l) /= &
+                q_cons_ts(1)%vf(contxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l) .or. &
+                abs(q_cons_ts(1)%vf(contxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l)) >= &
+                0.5_wp*huge(1._wp) .or. &
+                q_cons_ts(1)%vf(contxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l) < 0._wp) then
+                arho_invalid = .true.
+            end if
             if (gas_fluid_id /= liquid_fluid_id) then
                 gas_alpha = gas_alpha + q_cons_ts(1)%vf(advxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l)
                 gas_mass = gas_mass + q_cons_ts(1)%vf(contxb + gas_fluid_id - 1)%sf(cell_j, cell_k, cell_l)
             end if
         end do
+        if (abs(alpha_sum - 1._wp) > 1.e-6_wp) alpha_invalid = .true.
+
+        rho_cons = arho_sum
+        mom_x = 0._wp
+        mom_y = 0._wp
+        mom_z = 0._wp
+        if (num_vels >= 1) mom_x = q_cons_ts(1)%vf(momxb)%sf(cell_j, cell_k, cell_l)
+        if (num_vels >= 2) mom_y = q_cons_ts(1)%vf(momxb + 1)%sf(cell_j, cell_k, cell_l)
+        if (num_vels >= 3) mom_z = q_cons_ts(1)%vf(momxb + 2)%sf(cell_j, cell_k, cell_l)
+        mom_sq = 0._wp
+        do mom_id = momxb, momxe
+            mom_sq = mom_sq + q_cons_ts(1)%vf(mom_id)%sf(cell_j, cell_k, cell_l)**2
+        end do
+        total_energy_cons = q_cons_ts(1)%vf(E_idx)%sf(cell_j, cell_k, cell_l)
+        if (rho_cons > 0._wp .and. rho_cons == rho_cons .and. abs(rho_cons) < 0.5_wp*huge(1._wp)) then
+            kinetic_energy_est = 0.5_wp*mom_sq/rho_cons
+        else
+            kinetic_energy_est = huge(1._wp)
+        end if
+        internal_energy_est = total_energy_cons - kinetic_energy_est
+        energy_invalid = total_energy_cons /= total_energy_cons .or. &
+                         abs(total_energy_cons) >= 0.5_wp*huge(1._wp) .or. &
+                         kinetic_energy_est /= kinetic_energy_est .or. &
+                         abs(kinetic_energy_est) >= 0.5_wp*huge(1._wp) .or. &
+                         internal_energy_est /= internal_energy_est .or. &
+                         abs(internal_energy_est) >= 0.5_wp*huge(1._wp) .or. &
+                         internal_energy_est <= 0._wp
 
         fuel_rhoY = 0._wp
         species_sum = 0._wp
+        species_min = huge(1._wp)
+        species_max = -huge(1._wp)
+        species_count = 0
+        top_species_value = -huge(1._wp)
+        top_species_id = 0
+        top_species_eqn = 0
         if (chemistry) then
             if (fuel_species_id > 0) then
                 species_eqn = chemxb + fuel_species_id - 1
@@ -957,14 +1023,53 @@ contains
             end if
 
             do species_eqn = chemxb, chemxe
-                species_sum = species_sum + q_cons_ts(1)%vf(species_eqn)%sf(cell_j, cell_k, cell_l)
+                species_value = q_cons_ts(1)%vf(species_eqn)%sf(cell_j, cell_k, cell_l)
+                species_count = species_count + 1
+                species_sum = species_sum + species_value
+                species_min = min(species_min, species_value)
+                species_max = max(species_max, species_value)
+                top_pos = 0
+                do top_slot = 1, 5
+                    if (species_value > top_species_value(top_slot) .and. top_pos == 0) top_pos = top_slot
+                end do
+                if (top_pos > 0) then
+                    do top_slot = 5, top_pos + 1, -1
+                        top_species_value(top_slot) = top_species_value(top_slot - 1)
+                        top_species_id(top_slot) = top_species_id(top_slot - 1)
+                        top_species_eqn(top_slot) = top_species_eqn(top_slot - 1)
+                    end do
+                    top_species_value(top_pos) = species_value
+                    top_species_id(top_pos) = species_eqn - chemxb + 1
+                    top_species_eqn(top_pos) = species_eqn
+                end if
             end do
         end if
+        if (species_count == 0) then
+            species_min = 0._wp
+            species_max = 0._wp
+        end if
+        if (gas_mass > 0._wp .and. gas_mass == gas_mass .and. abs(gas_mass) < 0.5_wp*huge(1._wp)) then
+            species_ratio = species_sum/gas_mass
+        elseif (species_sum > 0._wp) then
+            species_ratio = huge(1._wp)
+        else
+            species_ratio = 0._wp
+        end if
+        species_invalid = species_min /= species_min .or. species_max /= species_max .or. &
+                          abs(species_min) >= 0.5_wp*huge(1._wp) .or. &
+                          abs(species_max) >= 0.5_wp*huge(1._wp) .or. &
+                          species_min < -1.e-12_wp .or. species_ratio > 1._wp + 1.e-6_wp
 
         temp_value = -huge(1._wp)
         if (chemistry) then
             if (associated(q_T_sf%sf)) temp_value = q_T_sf%sf(cell_j, cell_k, cell_l)
         end if
+        eos_invalid = pres /= pres .or. temp_value /= temp_value .or. c /= c .or. &
+                      abs(pres) >= 0.5_wp*huge(1._wp) .or. &
+                      abs(temp_value) >= 0.5_wp*huge(1._wp) .or. &
+                      abs(c) >= 0.5_wp*huge(1._wp) .or. &
+                      pres < 0._wp .or. temp_value < 0._wp .or. c < 0._wp .or. &
+                      pres > 1.e12_wp .or. temp_value > 1.e6_wp .or. c > 1.e7_wp
 
         global_j = cell_j
         global_k = cell_k
@@ -1006,6 +1111,17 @@ contains
             &" u=", ES16.8, " v=", ES16.8, " w=", ES16.8, " vel_mag=", ES16.8, &
             &" pressure=", ES16.8, " temperature=", ES16.8, " rho=", ES16.8, " sound_speed=", ES16.8)', &
             trim(label), proc_rank, vel_x, vel_y, vel_z, vel_mag, pres, temp_value, rho, c
+        print '(" TEMP_DT_COLLAPSE_STATE_DEBUG_CONS ", A, " rank=", I6, &
+            &" rho_cons=", ES16.8, " rho_prim=", ES16.8, &
+            &" mom_x=", ES16.8, " mom_y=", ES16.8, " mom_z=", ES16.8, &
+            &" total_energy=", ES16.8, " kinetic_energy_est=", ES16.8, &
+            &" internal_energy_est=", ES16.8)', &
+            trim(label), proc_rank, rho_cons, rho, mom_x, mom_y, mom_z, total_energy_cons, &
+            kinetic_energy_est, internal_energy_est
+        print '(" TEMP_DT_COLLAPSE_STATE_DEBUG_FLUID_SUMMARY ", A, " rank=", I6, &
+            &" alpha_sum=", ES16.8, " arho_sum=", ES16.8, &
+            &" alpha_min=", ES16.8, " arho_min=", ES16.8)', &
+            trim(label), proc_rank, alpha_sum, arho_sum, alpha_min, arho_min
         do fluid_id = 1, num_fluids
             print '(" TEMP_DT_COLLAPSE_STATE_DEBUG_FLUID ", A, " rank=", I6, " fluid=", I4, &
                 &" alpha=", ES16.8, " alpha_rho=", ES16.8)', &
@@ -1015,8 +1131,27 @@ contains
         end do
         print '(" TEMP_DT_COLLAPSE_STATE_DEBUG_GAS_SPECIES ", A, " rank=", I6, &
             &" gas_alpha=", ES16.8, " gas_mass=", ES16.8, &
-            &" fuel_rhoY=", ES16.8, " gas_species_sum=", ES16.8)', &
-            trim(label), proc_rank, gas_alpha, gas_mass, fuel_rhoY, species_sum
+            &" fuel_rhoY=", ES16.8, " gas_species_sum=", ES16.8, &
+            &" species_count=", I8, " species_sum_over_gasmass=", ES16.8, &
+            &" species_min=", ES16.8, " species_max=", ES16.8)', &
+            trim(label), proc_rank, gas_alpha, gas_mass, fuel_rhoY, species_sum, species_count, &
+            species_ratio, species_min, species_max
+        if (chemistry) then
+            do top_slot = 1, 5
+                top_sp = top_species_id(top_slot)
+                if (top_sp > 0 .and. top_sp <= num_species) then
+                    print '(" TEMP_DT_COLLAPSE_STATE_DEBUG_SPECIES_TOP ", A, " rank=", I6, &
+                        &" slot=", I2, " species_id=", I8, " species_eqn=", I8, &
+                        &" species_name=", A, " rhoY=", ES16.8)', &
+                        trim(label), proc_rank, top_slot, top_sp, top_species_eqn(top_slot), &
+                        trim(species_names(top_sp)), top_species_value(top_slot)
+                end if
+            end do
+        end if
+        print '(" TEMP_DT_COLLAPSE_STATE_DEBUG_FLAGS ", A, " rank=", I6, &
+            &" alpha_invalid=", L1, " arho_invalid=", L1, " species_invalid=", L1, &
+            &" energy_invalid=", L1, " eos_invalid=", L1)', &
+            trim(label), proc_rank, alpha_invalid, arho_invalid, species_invalid, energy_invalid, eos_invalid
     end subroutine s_dt_collapse_state_debug_print_cell
 
     subroutine s_dt_collapse_state_debug_report(t_step, time_value)
