@@ -42,6 +42,8 @@ module m_time_steppers
 
     use m_thermochem, only: num_species
 
+    use m_chemistry, only: s_tanabe_species_bounds_diag_report
+
     use m_body_forces
 
     use m_derived_variables
@@ -713,6 +715,7 @@ contains
                 end do
             end do
             $:END_GPU_PARALLEL_LOOP()
+            call s_tanabe_species_bounds_diag_report(q_cons_ts(1)%vf, label="post_rk", t_step=t_step, stage=s)
             call s_zhang_evap_hang_trace(t_step, s, "RK_CONS_UPDATE_END")
 
             !Evolve pb and mv for non-polytropic qbmm

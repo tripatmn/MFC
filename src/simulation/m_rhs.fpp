@@ -1159,6 +1159,8 @@ contains
         end if
 
         call cpu_time(t_finish)
+        call s_tanabe_species_bounds_diag_report(q_cons_qp%vf, q_prim_qp%vf, q_T_sf, &
+                                                 "post_rhs", t_step, stage)
 
         if (t_step >= 2) then
             time_avg = (abs(t_finish - t_start) + (t_step - 2)*time_avg)/(t_step - 1)

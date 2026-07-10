@@ -116,6 +116,7 @@ contains
         else
             call s_read_parallel_data_files(q_cons_vf)
         end if
+        call s_tanabe_species_bounds_diag_report(q_cons_vf, label="restart_read", t_step=t_step_start, stage=0)
 
     end subroutine s_read_data_files
 

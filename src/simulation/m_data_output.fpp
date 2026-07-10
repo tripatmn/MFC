@@ -32,6 +32,8 @@ module m_data_output
 
     use m_boundary_common
 
+    use m_chemistry, only: s_tanabe_species_bounds_diag_report
+
     implicit none
 
     private; 
@@ -127,6 +129,9 @@ contains
         type(integer_field), &
             dimension(1:num_dims, -1:1), &
             intent(in) :: bc_type
+
+        call s_tanabe_species_bounds_diag_report(q_cons_vf, q_prim_vf, q_T_sf, &
+                                                 "pre_write", t_step, 0)
 
         if (.not. parallel_io) then
             call s_write_serial_data_files(q_cons_vf, q_T_sf, q_prim_vf, t_step, bc_type, beta)

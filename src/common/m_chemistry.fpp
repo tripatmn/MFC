@@ -17,7 +17,9 @@ module m_chemistry
         num_species, molecular_weights, get_temperature, get_net_production_rates, &
         gas_constant, get_mixture_molecular_weight, get_mixture_energy_mass, &
         get_mixture_specific_heat_cp_mass, get_mixture_enthalpy_mass, &
-        get_species_enthalpies_rt
+        get_species_enthalpies_rt, species_names
+
+    use m_mpi_common, only: s_mpi_reduce_maxloc
 
     #:if chemistry_transport
         use m_thermochem, only: &
@@ -116,6 +118,189 @@ contains
         end if
 
     end subroutine s_compute_chemistry_gas_density
+
+    logical function s_tanabe_species_bounds_diag_active(t_step)
+        integer, intent(in) :: t_step
+        character(len=16) :: env_value
+        integer :: env_status
+
+        call get_environment_variable("TANABE_SPECIES_BOUNDS_DIAG", env_value, status=env_status)
+        s_tanabe_species_bounds_diag_active = env_status == 0 .and. trim(env_value) == "1"
+    end function s_tanabe_species_bounds_diag_active
+
+    pure function s_tanabe_species_lower(value) result(lower_value)
+        character(len=*), intent(in) :: value
+        character(len=len(value)) :: lower_value
+        integer :: i, c
+
+        lower_value = value
+        do i = 1, len(value)
+            c = iachar(value(i:i))
+            if (c >= iachar('A') .and. c <= iachar('Z')) lower_value(i:i) = achar(c + 32)
+        end do
+    end function s_tanabe_species_lower
+
+    integer function s_tanabe_species_id(name) result(species_id)
+        character(len=*), intent(in) :: name
+        integer :: sp
+
+        species_id = 0
+        do sp = 1, num_species
+            if (trim(adjustl(s_tanabe_species_lower(species_names(sp)))) == &
+                trim(adjustl(s_tanabe_species_lower(name)))) then
+                species_id = sp
+                return
+            end if
+        end do
+    end function s_tanabe_species_id
+
+    subroutine s_tanabe_species_bounds_diag_report(q_cons_vf, q_prim_vf, q_T_sf, label, t_step, stage)
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
+        type(scalar_field), dimension(sys_size), intent(in), optional :: q_prim_vf
+        type(scalar_field), intent(in), optional :: q_T_sf
+        character(len=*), intent(in) :: label
+        integer, intent(in) :: t_step, stage
+
+        integer :: j, k, l, sp, o2_id, fuel_id, o2_j, o2_k, o2_l, fuel_j, fuel_k, fuel_l
+        integer :: gas_idx, gas_fluid_id, global_j, global_k, global_l
+        real(wp) :: gas_mass, rho_mix, rhoY_o2, rhoY_fuel, Y_o2, Y_fuel, sumY
+        real(wp) :: alpha_liq, alpha_vap, alpha_air, alpha_gas, pressure, temperature
+        real(wp) :: u_vel, v_vel, speed, x_loc, y_loc
+        real(wp) :: o2_metric_loc, fuel_metric_loc, o2_pair(2), fuel_pair(2)
+
+        if (.not. chemistry) return
+        if (.not. s_tanabe_species_bounds_diag_active(t_step)) return
+
+        do sp = 1, sys_size
+            $:GPU_UPDATE(host='[q_cons_vf(sp)%sf]')
+            if (present(q_prim_vf)) $:GPU_UPDATE(host='[q_prim_vf(sp)%sf]')
+        end do
+        if (present(q_T_sf)) $:GPU_UPDATE(host='[q_T_sf%sf]')
+
+        o2_id = s_tanabe_species_id("O2")
+        fuel_id = fuel_species_id
+        if (fuel_id < 1 .or. fuel_id > num_species) fuel_id = s_tanabe_species_id("NC12H26")
+        if (o2_id < 1 .or. fuel_id < 1) return
+
+        o2_metric_loc = -huge(1._wp)
+        fuel_metric_loc = -huge(1._wp)
+        o2_j = 0; o2_k = 0; o2_l = 0
+        fuel_j = 0; fuel_k = 0; fuel_l = 0
+
+        do l = 0, p
+            do k = 0, n
+                do j = 0, m
+                    call s_compute_chemistry_gas_density(q_cons_vf, j, k, l, gas_mass)
+                    if (gas_mass <= chem_rho_g_min .or. gas_mass /= gas_mass) cycle
+                    Y_o2 = q_cons_vf(chemxb + o2_id - 1)%sf(j, k, l)/gas_mass
+                    Y_fuel = q_cons_vf(chemxb + fuel_id - 1)%sf(j, k, l)/gas_mass
+                    if (Y_o2 == Y_o2 .and. Y_o2 > o2_metric_loc) then
+                        o2_metric_loc = Y_o2
+                        o2_j = j; o2_k = k; o2_l = l
+                    end if
+                    if (Y_fuel == Y_fuel .and. -Y_fuel > fuel_metric_loc) then
+                        fuel_metric_loc = -Y_fuel
+                        fuel_j = j; fuel_k = k; fuel_l = l
+                    end if
+                end do
+            end do
+        end do
+
+        o2_pair = [o2_metric_loc, real(proc_rank, wp)]
+        fuel_pair = [fuel_metric_loc, real(proc_rank, wp)]
+        call s_mpi_reduce_maxloc(o2_pair)
+        call s_mpi_reduce_maxloc(fuel_pair)
+
+        if (t_step > 2 .and. mod(max(t_step, 0), 500) /= 0 .and. &
+            o2_pair(1) <= 1._wp + 1.e-8_wp .and. fuel_pair(1) <= 1.e-8_wp) return
+
+        if (proc_rank == int(o2_pair(2)) .and. o2_metric_loc > -0.5_wp*huge(1._wp)) then
+            call s_tanabe_species_bounds_diag_print_one(q_cons_vf, q_prim_vf, q_T_sf, label, "O2_MAX", &
+                                                        t_step, stage, o2_j, o2_k, o2_l, o2_id, fuel_id)
+        end if
+        if (proc_rank == int(fuel_pair(2)) .and. fuel_metric_loc > -0.5_wp*huge(1._wp)) then
+            call s_tanabe_species_bounds_diag_print_one(q_cons_vf, q_prim_vf, q_T_sf, label, "FUEL_MIN", &
+                                                        t_step, stage, fuel_j, fuel_k, fuel_l, o2_id, fuel_id)
+        end if
+
+    contains
+
+        subroutine s_tanabe_species_bounds_diag_print_one(qc, qp, qT, diag_label, target, &
+                                                          diag_step, diag_stage, jj, kk, ll, oid, fid)
+            type(scalar_field), dimension(sys_size), intent(in) :: qc
+            type(scalar_field), dimension(sys_size), intent(in), optional :: qp
+            type(scalar_field), intent(in), optional :: qT
+            character(len=*), intent(in) :: diag_label, target
+            integer, intent(in) :: diag_step, diag_stage, jj, kk, ll, oid, fid
+
+            alpha_liq = 0._wp; alpha_vap = 0._wp; alpha_air = 0._wp
+            if (num_fluids >= 1) alpha_liq = qc(advxb)%sf(jj, kk, ll)
+            if (num_fluids >= 2) alpha_vap = qc(advxb + 1)%sf(jj, kk, ll)
+            if (num_fluids >= 3) alpha_air = qc(advxb + 2)%sf(jj, kk, ll)
+
+            alpha_gas = 0._wp; gas_mass = 0._wp
+            do gas_idx = 1, chem_gas_num_fluids
+                gas_fluid_id = chem_gas_fluid_ids(gas_idx)
+                if (gas_fluid_id >= 1 .and. gas_fluid_id <= num_fluids) then
+                    alpha_gas = alpha_gas + qc(advxb + gas_fluid_id - 1)%sf(jj, kk, ll)
+                    gas_mass = gas_mass + qc(contxb + gas_fluid_id - 1)%sf(jj, kk, ll)
+                end if
+            end do
+            if (chem_gas_num_fluids <= 0 .and. chem_gas_fluid_id >= 1 .and. chem_gas_fluid_id <= num_fluids) then
+                alpha_gas = qc(advxb + chem_gas_fluid_id - 1)%sf(jj, kk, ll)
+                gas_mass = qc(contxb + chem_gas_fluid_id - 1)%sf(jj, kk, ll)
+            end if
+
+            rho_mix = 0._wp
+            do gas_idx = 1, num_fluids
+                rho_mix = rho_mix + qc(contxb + gas_idx - 1)%sf(jj, kk, ll)
+            end do
+            rhoY_o2 = qc(chemxb + oid - 1)%sf(jj, kk, ll)
+            rhoY_fuel = qc(chemxb + fid - 1)%sf(jj, kk, ll)
+            sumY = 0._wp
+            do sp = 1, num_species
+                sumY = sumY + qc(chemxb + sp - 1)%sf(jj, kk, ll)/max(gas_mass, chem_rho_g_min)
+            end do
+            Y_o2 = rhoY_o2/max(gas_mass, chem_rho_g_min)
+            Y_fuel = rhoY_fuel/max(gas_mass, chem_rho_g_min)
+
+            pressure = 0._wp; temperature = 0._wp; u_vel = 0._wp; v_vel = 0._wp
+            if (present(qp)) then
+                pressure = qp(E_idx)%sf(jj, kk, ll)
+                if (num_vels >= 1) u_vel = qp(momxb)%sf(jj, kk, ll)
+                if (num_vels >= 2) v_vel = qp(momxb + 1)%sf(jj, kk, ll)
+            else if (rho_mix > sgm_eps) then
+                if (num_vels >= 1) u_vel = qc(momxb)%sf(jj, kk, ll)/rho_mix
+                if (num_vels >= 2) v_vel = qc(momxb + 1)%sf(jj, kk, ll)/rho_mix
+            end if
+            if (present(qT)) temperature = qT%sf(jj, kk, ll)
+            speed = sqrt(u_vel*u_vel + v_vel*v_vel)
+
+            global_j = jj; global_k = kk; global_l = ll
+            if (allocated(start_idx)) then
+                if (size(start_idx) >= 1) global_j = start_idx(1) + jj
+                if (size(start_idx) >= 2) global_k = start_idx(2) + kk
+                if (size(start_idx) >= 3) global_l = start_idx(3) + ll
+            end if
+            x_loc = 0._wp; y_loc = 0._wp
+            if (allocated(x_cc)) x_loc = x_cc(jj)
+            if (allocated(y_cc)) y_loc = y_cc(kk)
+
+            print '(" TANABE_SPECIES_BOUNDS_DIAG target=", A, " label=", A, " rank=", I6, &
+                &" t_step=", I10, " stage=", I4, " local_ijk=", 3(I8,1X), &
+                &" global_ijk=", 3(I8,1X), " x=", ES14.6, " y=", ES14.6, &
+                &" alpha_liq=", ES14.6, " alpha_vap=", ES14.6, " alpha_air=", ES14.6, &
+                &" alpha_gas=", ES14.6, " gas_mass=", ES14.6, " rho_mix=", ES14.6, &
+                &" T=", ES14.6, " p=", ES14.6, " u=", ES14.6, " v=", ES14.6, &
+                &" speed=", ES14.6, " Y_O2=", ES14.6, " Y_NC12H26=", ES14.6, &
+                &" sumY=", ES14.6, " rhoY_O2=", ES14.6, " rhoY_NC12H26=", ES14.6)', &
+                trim(target), trim(diag_label), proc_rank, diag_step, diag_stage, &
+                jj, kk, ll, global_j, global_k, global_l, x_loc, y_loc, &
+                alpha_liq, alpha_vap, alpha_air, alpha_gas, gas_mass, rho_mix, &
+                temperature, pressure, u_vel, v_vel, speed, Y_o2, Y_fuel, sumY, rhoY_o2, rhoY_fuel
+            call flush(output_unit)
+        end subroutine s_tanabe_species_bounds_diag_print_one
+    end subroutine s_tanabe_species_bounds_diag_report
 
     !> @brief Computes mixture viscosities for left and right states and inverts them for use as reciprocal Reynolds numbers.
     subroutine compute_viscosity_and_inversion(T_L, Ys_L, T_R, Ys_R, Re_L, Re_R)
