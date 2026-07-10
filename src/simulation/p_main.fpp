@@ -68,8 +68,6 @@ program p_main
         finaltime = t_step_stop*dt
     end if
 
-    call s_tanabe_species_bounds_diag(q_cons_ts(1)%vf, t_step, "restart_read")
-
     call nvtxEndRange ! INIT
 
     call nvtxStartRange("SIMULATION-TIME-MARCH")
