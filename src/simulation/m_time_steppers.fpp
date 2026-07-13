@@ -131,6 +131,7 @@ contains
                 idwint(2)%beg:idwint(2)%end, idwint(3)%beg:idwint(3)%end))
             @:ACC_SETUP_SFs(q_prim_diag(i))
         end do
+        $:GPU_ENTER_DATA(create='[q_T_diag]')
         @:ALLOCATE(q_T_diag%sf(idwint(1)%beg:idwint(1)%end, &
             idwint(2)%beg:idwint(2)%end, idwint(3)%beg:idwint(3)%end))
         @:ACC_SETUP_SFs(q_T_diag)
@@ -219,6 +220,7 @@ contains
         end do
         @:DEALLOCATE(q_prim_diag)
         @:DEALLOCATE(q_T_diag%sf)
+        $:GPU_EXIT_DATA(delete='[q_T_diag]')
     end subroutine s_tanabe_species_bounds_diag
 
     logical function s_zhang_evap_hang_diag_active(t_step)
