@@ -677,7 +677,7 @@ contains
             real(wp) :: Ys_T(1:num_species)
         #:endif
         real(wp), dimension(2) :: Re_K
-        real(wp) :: rho_K, gamma_K, pi_inf_K, qv_K, dyn_pres_K, rho_g
+        real(wp) :: rho_K, gamma_K, pi_inf_K, qv_K, dyn_pres_K, rho_g, alpha_g
         real(wp) :: Y_sum, mix_mol_weight, T_chem
 
         real(wp) :: vftmp, nbub_sc
@@ -713,7 +713,7 @@ contains
             end if
         end if
 
-        $:GPU_PARALLEL_LOOP(collapse=3, private='[alpha_K, alpha_rho_K, Re_K, nRtmp, rho_K, gamma_K, pi_inf_K,qv_K, dyn_pres_K, rho_g, Y_sum, rhoYks, Ys_T, gas_idx, fluid_id, B, pres, vftmp, nbub_sc, G_K, T, mix_mol_weight, T_chem, pres_mag, Ga, B2, m2, S, W, dW, E, D, f, dGa_dW, dp_dW, df_dW, iter ]')
+        $:GPU_PARALLEL_LOOP(collapse=3, private='[alpha_K, alpha_rho_K, Re_K, nRtmp, rho_K, gamma_K, pi_inf_K,qv_K, dyn_pres_K, rho_g, alpha_g, Y_sum, rhoYks, Ys_T, gas_idx, fluid_id, B, pres, vftmp, nbub_sc, G_K, T, mix_mol_weight, T_chem, pres_mag, Ga, B2, m2, S, W, dW, E, D, f, dGa_dW, dp_dW, df_dW, iter ]')
         do l = ibounds(3)%beg, ibounds(3)%end
             do k = ibounds(2)%beg, ibounds(2)%end
                 do j = ibounds(1)%beg, ibounds(1)%end
@@ -924,7 +924,16 @@ contains
                                 end do
 
                                 call get_mixture_molecular_weight(Ys_T, mix_mol_weight)
-                                T_chem = pres*mix_mol_weight/(gas_constant*rho_g)
+                                alpha_g = 0._wp
+                                if (chem_gas_num_fluids <= 0) then
+                                    alpha_g = alpha_K(chem_gas_fluid_id)
+                                else
+                                    $:GPU_LOOP(parallelism='[seq]')
+                                    do gas_idx = 1, chem_gas_num_fluids
+                                        alpha_g = alpha_g + alpha_K(chem_gas_fluid_ids(gas_idx))
+                                    end do
+                                end if
+                                T_chem = alpha_g*pres*mix_mol_weight/(gas_constant*rho_g)
                                 if ((mix_mol_weight == mix_mol_weight) .and. &
                                     (abs(mix_mol_weight) <= huge(mix_mol_weight)) .and. &
                                     (mix_mol_weight > 0._wp) .and. &
