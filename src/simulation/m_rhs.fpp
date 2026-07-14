@@ -56,6 +56,8 @@ module m_rhs
 
     use m_chemistry
 
+    use m_thermochem, only: num_species
+
     use m_igr
 
     use m_pressure_relaxation
@@ -64,7 +66,15 @@ module m_rhs
 
     private; public :: s_initialize_rhs_module, &
  s_compute_rhs, &
- s_finalize_rhs_module
+ s_finalize_rhs_module, &
+ s_tanabe_rhs_diag_disable, &
+ s_tanabe_rhs_diag_get
+
+    logical :: tanabe_rhs_diag_on = .false.
+    logical :: tanabe_rhs_diag_valid = .false.
+    integer :: tanabe_rhs_diag_t_step = -1
+    integer :: tanabe_rhs_diag_stage = -1
+    real(wp), allocatable :: tanabe_rhs_diag_snap(:, :, :, :, :)
 
     !! This variable contains the WENO-reconstructed values of the cell-average
     !! conservative variables, which are located in q_cons_vf, at cell-interior
@@ -169,6 +179,77 @@ module m_rhs
     $:GPU_DECLARE(create='[nbub]')
 
 contains
+
+    subroutine s_tanabe_rhs_diag_initialize()
+        character(len=16) :: env_value
+        integer :: env_status
+
+        call get_environment_variable("TANABE_SPECIES_BOUNDS_DIAG", env_value, status=env_status)
+        tanabe_rhs_diag_on = chemistry .and. env_status == 0 .and. trim(env_value) == "1"
+        if (tanabe_rhs_diag_on) then
+            allocate (tanabe_rhs_diag_snap(6, num_species, 0:m, 0:n, 0:p))
+        end if
+    end subroutine s_tanabe_rhs_diag_initialize
+
+    subroutine s_tanabe_rhs_diag_begin(t_step, stage)
+        integer, intent(in) :: t_step, stage
+
+        if (.not. tanabe_rhs_diag_on) return
+        tanabe_rhs_diag_t_step = t_step
+        tanabe_rhs_diag_stage = stage
+        tanabe_rhs_diag_valid = .false.
+    end subroutine s_tanabe_rhs_diag_begin
+
+    subroutine s_tanabe_rhs_diag_capture(rhs_vf, slot)
+        type(scalar_field), dimension(sys_size), intent(in) :: rhs_vf
+        integer, intent(in) :: slot
+
+        integer :: i
+
+        if (.not. tanabe_rhs_diag_on) return
+        do i = chemxb, chemxe
+            $:GPU_UPDATE(host='[rhs_vf(i)%sf]')
+            tanabe_rhs_diag_snap(slot, i - chemxb + 1, :, :, :) = &
+                real(rhs_vf(i)%sf(0:m, 0:n, 0:p), kind=wp)
+        end do
+        if (slot == 6) tanabe_rhs_diag_valid = .true.
+    end subroutine s_tanabe_rhs_diag_capture
+
+    subroutine s_tanabe_rhs_diag_get(t_step, stage, species_id, j, k, l, &
+                                     flux_transport, chemistry_source, evaporation_source, &
+                                     other_source, total_rhs, available)
+        integer, intent(in) :: t_step, stage, species_id, j, k, l
+        real(wp), intent(out) :: flux_transport, chemistry_source
+        real(wp), intent(out) :: evaporation_source, other_source, total_rhs
+        logical, intent(out) :: available
+
+        available = tanabe_rhs_diag_on .and. tanabe_rhs_diag_valid .and. &
+                    tanabe_rhs_diag_t_step == t_step .and. tanabe_rhs_diag_stage == stage
+        flux_transport = 0._wp
+        chemistry_source = 0._wp
+        evaporation_source = 0._wp
+        other_source = 0._wp
+        total_rhs = 0._wp
+        if (.not. available) return
+
+        flux_transport = tanabe_rhs_diag_snap(1, species_id, j, k, l)
+        chemistry_source = tanabe_rhs_diag_snap(3, species_id, j, k, l) - &
+                           tanabe_rhs_diag_snap(2, species_id, j, k, l)
+        evaporation_source = tanabe_rhs_diag_snap(5, species_id, j, k, l) - &
+                             tanabe_rhs_diag_snap(4, species_id, j, k, l)
+        other_source = tanabe_rhs_diag_snap(2, species_id, j, k, l) - &
+                       tanabe_rhs_diag_snap(1, species_id, j, k, l) + &
+                       tanabe_rhs_diag_snap(4, species_id, j, k, l) - &
+                       tanabe_rhs_diag_snap(3, species_id, j, k, l) + &
+                       tanabe_rhs_diag_snap(6, species_id, j, k, l) - &
+                       tanabe_rhs_diag_snap(5, species_id, j, k, l)
+        total_rhs = tanabe_rhs_diag_snap(6, species_id, j, k, l)
+    end subroutine s_tanabe_rhs_diag_get
+
+    subroutine s_tanabe_rhs_diag_disable()
+        tanabe_rhs_diag_on = .false.
+        tanabe_rhs_diag_valid = .false.
+    end subroutine s_tanabe_rhs_diag_disable
 
     logical function s_zhang_evap_hang_diag_active(t_step)
         integer, intent(in) :: t_step
@@ -653,6 +734,8 @@ contains
             @:ALLOCATE(nbub(0:m, 0:n, 0:p))
         end if
 
+        call s_tanabe_rhs_diag_initialize()
+
     end subroutine s_initialize_rhs_module
 
     !> @brief Computes the right-hand side of the semi-discrete governing equations for a single time stage.
@@ -682,6 +765,8 @@ contains
         call s_zhang_evap_hang_trace(t_step, stage, "S_COMPUTE_RHS_BEGIN")
 
         call cpu_time(t_start)
+
+        call s_tanabe_rhs_diag_begin(t_step, stage)
 
         if (.not. igr .or. dummy) then
             ! Association/Population of Working Variables
@@ -1054,6 +1139,8 @@ contains
             $:END_GPU_PARALLEL_LOOP()
         end if
 
+        call s_tanabe_rhs_diag_capture(rhs_vf, 1)
+
         ! Additional Physics and Source Temrs
         ! Additions for acoustic_source
         if (acoustic_source) then
@@ -1094,6 +1181,8 @@ contains
             end if
         end if
 
+        call s_tanabe_rhs_diag_capture(rhs_vf, 2)
+
         if (chemistry .and. chem_params%reactions) then
             call s_zhang_evap_hang_trace(t_step, stage, "RHS_CHEM_REACTIONS_BEGIN")
             call nvtxStartRange("RHS-CHEM-REACTIONS")
@@ -1101,6 +1190,8 @@ contains
             call nvtxEndRange
             call s_zhang_evap_hang_trace(t_step, stage, "RHS_CHEM_REACTIONS_END")
         end if
+
+        call s_tanabe_rhs_diag_capture(rhs_vf, 3)
 
         if (chemistry .and. user_species_source) then
             if (user_species_id >= 1 .and. user_species_id <= (chemxe - chemxb + 1)) then
@@ -1116,6 +1207,8 @@ contains
                 $:END_GPU_PARALLEL_LOOP()
             end if
         end if
+
+        call s_tanabe_rhs_diag_capture(rhs_vf, 4)
 
         if (chemistry .and. evap_species_source) then
             if (fuel_species_id >= 1 .and. fuel_species_id <= (chemxe - chemxb + 1) .and. &
@@ -1136,7 +1229,11 @@ contains
             end if
         end if
 
+        call s_tanabe_rhs_diag_capture(rhs_vf, 5)
+
         if (cont_damage) call s_compute_damage_state(q_cons_qp%vf, rhs_vf)
+
+        call s_tanabe_rhs_diag_capture(rhs_vf, 6)
 
         ! END: Additional pphysics and source terms
 
@@ -2096,6 +2193,8 @@ contains
         integer :: i, j, l
 
         call s_finalize_pressure_relaxation_module
+
+        if (allocated(tanabe_rhs_diag_snap)) deallocate (tanabe_rhs_diag_snap)
 
         if (.not. igr) then
             do j = cont_idx%beg, cont_idx%end

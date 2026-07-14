@@ -40,7 +40,7 @@ module m_time_steppers
 
     use m_nvtx
 
-    use m_thermochem, only: num_species
+    use m_thermochem, only: num_species, species_names
 
     use m_chemistry, only: s_compute_chemistry_gas_density
 
@@ -85,6 +85,9 @@ module m_time_steppers
     integer :: stor !< storage index
     real(wp), allocatable, dimension(:, :) :: rk_coef
     integer, private :: num_probe_ts
+    logical, private :: tanabe_species_bounds_diag_done = .false.
+    real(wp), allocatable, private :: tanabe_pre_rhs_species(:, :, :, :)
+    real(wp), allocatable, private :: tanabe_post_rhs_species(:, :, :, :)
 
     $:GPU_DECLARE(create='[q_cons_ts,q_prim_vf,q_T_sf,m_dot_evap,rhs_vf,q_prim_ts1,q_prim_ts2,rhs_mv,rhs_pb,max_dt,rk_coef,stor,bc_type]')
 
@@ -106,24 +109,180 @@ contains
         integer :: env_status
 
         call get_environment_variable("TANABE_SPECIES_BOUNDS_DIAG", env_value, status=env_status)
-        s_tanabe_species_bounds_diag_active = env_status == 0 .and. trim(env_value) == "1"
+        s_tanabe_species_bounds_diag_active = env_status == 0 .and. trim(env_value) == "1" .and. &
+                                              .not. tanabe_species_bounds_diag_done
     end function s_tanabe_species_bounds_diag_active
 
-    subroutine s_tanabe_species_bounds_diag(q_cons_vf, t_step, stage_name)
+    subroutine s_tanabe_species_bounds_diag(q_cons_vf, t_step, stage_name, rk_stage, q_store_vf, rk_coeffs)
         type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
         integer, intent(in) :: t_step
         character(len=*), intent(in) :: stage_name
+        integer, intent(in), optional :: rk_stage
+        type(scalar_field), dimension(sys_size), intent(in), optional :: q_store_vf
+        real(wp), dimension(4), intent(in), optional :: rk_coeffs
 
         type(scalar_field), allocatable, dimension(:) :: q_prim_diag
         type(scalar_field) :: q_T_diag
-        real(wp) :: species_min, species_max, pres_min, pres_max
-        real(wp) :: temp_min, temp_max, gas_rho_min, gas_rho_max
-        real(wp) :: arho_min, arho_max, rho_g, species_value
-        integer :: i, j, k, l, neg_count, above_gas_count
-        integer :: first_i, first_j, first_k, first_l
+        real(wp) :: rho_g, species_value, local_key, global_key, candidate_key
+        real(wp) :: before_value, post_rhs_value, after_value, alpha_g
+        real(wp) :: pressure, temperature, rhs_scale, rk_blend_update
+        real(wp) :: flux_transport_rhs, chemistry_rhs, evaporation_rhs, other_rhs, total_rhs
+        real(wp) :: flux_transport_update, chemistry_update, evaporation_update, other_update
+        real(wp) :: total_rhs_update, unaccounted_update, stored_value
+        integer :: i, j, k, l, species_id, stage_id, fluid_id
+        integer :: first_i, first_j, first_k, first_l, first_species
+        integer :: global_i, global_j, global_k, global_l
+        integer :: global_offset(3), num_procs_dir, num_cells_dir
+        real(wp) :: proc_coord_max
+        logical :: contribution_available
+        character(len=16) :: violation_kind
 
         if (.not. s_tanabe_species_bounds_diag_active()) return
         if (.not. chemistry) return
+
+        stage_id = 0
+        if (present(rk_stage)) stage_id = rk_stage
+
+#ifndef FRONTIER_UNIFIED
+        do i = contxb, contxe
+            $:GPU_UPDATE(host='[q_cons_vf(i)%sf]')
+        end do
+        do i = chemxb, chemxe
+            $:GPU_UPDATE(host='[q_cons_vf(i)%sf]')
+        end do
+#endif
+
+        if (.not. allocated(tanabe_pre_rhs_species)) then
+            allocate (tanabe_pre_rhs_species(num_species, 0:m, 0:n, 0:p))
+            allocate (tanabe_post_rhs_species(num_species, 0:m, 0:n, 0:p))
+            do i = 1, num_species
+                tanabe_pre_rhs_species(i, :, :, :) = &
+                    real(q_cons_vf(chemxb + i - 1)%sf(0:m, 0:n, 0:p), kind=wp)
+                tanabe_post_rhs_species(i, :, :, :) = tanabe_pre_rhs_species(i, :, :, :)
+            end do
+        end if
+
+        if (trim(stage_name) == "pre_rhs") then
+            do i = 1, num_species
+                tanabe_pre_rhs_species(i, :, :, :) = &
+                    real(q_cons_vf(chemxb + i - 1)%sf(0:m, 0:n, 0:p), kind=wp)
+                tanabe_post_rhs_species(i, :, :, :) = tanabe_pre_rhs_species(i, :, :, :)
+            end do
+        elseif (trim(stage_name) == "post_rhs") then
+            do i = 1, num_species
+                tanabe_post_rhs_species(i, :, :, :) = &
+                    real(q_cons_vf(chemxb + i - 1)%sf(0:m, 0:n, 0:p), kind=wp)
+            end do
+        end if
+
+        global_offset = 0
+        if (allocated(start_idx)) then
+            global_offset(1:num_dims) = start_idx(1:num_dims)
+        elseif (num_procs > 1) then
+            do i = 1, num_dims
+                call s_mpi_allreduce_max(real(proc_coords(i), wp), proc_coord_max)
+                num_procs_dir = nint(proc_coord_max) + 1
+                if (i == 1) num_cells_dir = m_glb + 1
+                if (i == 2) num_cells_dir = n_glb + 1
+                if (i == 3) num_cells_dir = p_glb + 1
+                global_offset(i) = (num_cells_dir/num_procs_dir)*proc_coords(i) + &
+                                   min(proc_coords(i), mod(num_cells_dir, num_procs_dir))
+            end do
+        end if
+
+        local_key = huge(1._wp)
+        first_i = -1
+        first_j = -1
+        first_k = -1
+        first_l = -1
+        first_species = -1
+        do l = 0, p
+            global_l = global_offset(3) + l
+            do k = 0, n
+                global_k = global_offset(2) + k
+                do j = 0, m
+                    global_j = global_offset(1) + j
+                    call s_compute_chemistry_gas_density(q_cons_vf, j, k, l, rho_g)
+                    do i = chemxb, chemxe
+                        species_value = real(q_cons_vf(i)%sf(j, k, l), kind=wp)
+                        if (species_value < 0._wp .or. species_value > rho_g) then
+                            species_id = i - chemxb + 1
+                            candidate_key = real(species_id - 1 + num_species*(global_j + &
+                                (m_glb + 1)*(global_k + (n_glb + 1)*global_l)), kind=wp)
+                            if (candidate_key < local_key) then
+                                local_key = candidate_key
+                                first_i = j
+                                first_j = k
+                                first_k = l
+                                first_l = global_j
+                                first_species = species_id
+                            end if
+                        end if
+                    end do
+                end do
+            end do
+        end do
+
+        if (num_procs == 1) then
+            global_key = local_key
+        else
+            call s_mpi_allreduce_min(local_key, global_key)
+        end if
+        if (global_key > 0.5_wp*huge(1._wp)) return
+
+        tanabe_species_bounds_diag_done = .true.
+        contribution_available = .false.
+        flux_transport_rhs = 0._wp
+        chemistry_rhs = 0._wp
+        evaporation_rhs = 0._wp
+        other_rhs = 0._wp
+        total_rhs = 0._wp
+        if (abs(local_key - global_key) <= 0.5_wp) then
+            call s_tanabe_rhs_diag_get(t_step, stage_id, first_species, first_i, first_j, first_k, &
+                                       flux_transport_rhs, chemistry_rhs, evaporation_rhs, &
+                                       other_rhs, total_rhs, contribution_available)
+        end if
+        call s_tanabe_rhs_diag_disable()
+        if (abs(local_key - global_key) > 0.5_wp) return
+
+        j = first_i
+        k = first_j
+        l = first_k
+        species_id = first_species
+        global_i = first_l
+        global_j = global_offset(2) + k
+        global_k = global_offset(3) + l
+        before_value = tanabe_pre_rhs_species(species_id, j, k, l)
+        post_rhs_value = tanabe_post_rhs_species(species_id, j, k, l)
+        after_value = real(q_cons_vf(chemxb + species_id - 1)%sf(j, k, l), kind=wp)
+        call s_compute_chemistry_gas_density(q_cons_vf, j, k, l, rho_g)
+        if (after_value < 0._wp) then
+            violation_kind = "negative"
+        else
+            violation_kind = "exceeds_gas_mass"
+        end if
+
+        rhs_scale = 0._wp
+        rk_blend_update = 0._wp
+        if (present(rk_coeffs) .and. present(q_store_vf)) then
+#ifndef FRONTIER_UNIFIED
+            $:GPU_UPDATE(host='[q_store_vf(chemxb + species_id - 1)%sf]')
+#endif
+            stored_value = real(q_store_vf(chemxb + species_id - 1)%sf(j, k, l), kind=wp)
+            rk_blend_update = (rk_coeffs(1)*before_value + rk_coeffs(2)*stored_value)/ &
+                              rk_coeffs(4) - before_value
+            if (igr) then
+                rhs_scale = rk_coeffs(3)/rk_coeffs(4)
+            else
+                rhs_scale = dt*rk_coeffs(3)/rk_coeffs(4)
+            end if
+        end if
+        flux_transport_update = rhs_scale*flux_transport_rhs
+        chemistry_update = rhs_scale*chemistry_rhs
+        evaporation_update = rhs_scale*evaporation_rhs
+        other_update = rhs_scale*other_rhs
+        total_rhs_update = rhs_scale*total_rhs
+        unaccounted_update = after_value - before_value - rk_blend_update - total_rhs_update
 
         @:ALLOCATE(q_prim_diag(1:sys_size))
         do i = 1, sys_size
@@ -150,69 +309,42 @@ contains
                                                             q_prim_diag, idwint)
 
 #ifndef FRONTIER_UNIFIED
-        do i = contxb, contxe
-            $:GPU_UPDATE(host='[q_cons_vf(i)%sf]')
-        end do
-        do i = chemxb, chemxe
+        do i = advxb, advxe
             $:GPU_UPDATE(host='[q_cons_vf(i)%sf]')
         end do
         $:GPU_UPDATE(host='[q_prim_diag(E_idx)%sf,q_T_diag%sf]')
 #endif
 
-        species_min = huge(1._wp)
-        species_max = -huge(1._wp)
-        pres_min = minval(q_prim_diag(E_idx)%sf(0:m, 0:n, 0:p))
-        pres_max = maxval(q_prim_diag(E_idx)%sf(0:m, 0:n, 0:p))
-        temp_min = minval(q_T_diag%sf(0:m, 0:n, 0:p))
-        temp_max = maxval(q_T_diag%sf(0:m, 0:n, 0:p))
-        gas_rho_min = huge(1._wp)
-        gas_rho_max = -huge(1._wp)
-        arho_min = huge(1._wp)
-        arho_max = -huge(1._wp)
-        neg_count = 0
-        above_gas_count = 0
-        first_i = -1
-        first_j = -1
-        first_k = -1
-        first_l = -1
-
-        do l = 0, p
-            do k = 0, n
-                do j = 0, m
-                    call s_compute_chemistry_gas_density(q_cons_vf, j, k, l, rho_g)
-                    gas_rho_min = min(gas_rho_min, rho_g)
-                    gas_rho_max = max(gas_rho_max, rho_g)
-                    do i = contxb, contxe
-                        arho_min = min(arho_min, q_cons_vf(i)%sf(j, k, l))
-                        arho_max = max(arho_max, q_cons_vf(i)%sf(j, k, l))
-                    end do
-                    do i = chemxb, chemxe
-                        species_value = q_cons_vf(i)%sf(j, k, l)
-                        species_min = min(species_min, species_value)
-                        species_max = max(species_max, species_value)
-                        if (species_value < 0._wp) neg_count = neg_count + 1
-                        if (species_value > rho_g) above_gas_count = above_gas_count + 1
-                        if (first_i < 0 .and. (species_value < 0._wp .or. species_value > rho_g)) then
-                            first_i = i - chemxb + 1
-                            first_j = j
-                            first_k = k
-                            first_l = l
-                        end if
-                    end do
-                end do
+        pressure = real(q_prim_diag(E_idx)%sf(j, k, l), kind=wp)
+        temperature = real(q_T_diag%sf(j, k, l), kind=wp)
+        alpha_g = 0._wp
+        if (chem_gas_num_fluids <= 0) then
+            fluid_id = chem_gas_fluid_id
+            alpha_g = real(q_cons_vf(advxb + fluid_id - 1)%sf(j, k, l), kind=wp)
+        else
+            do i = 1, chem_gas_num_fluids
+                fluid_id = chem_gas_fluid_ids(i)
+                alpha_g = alpha_g + real(q_cons_vf(advxb + fluid_id - 1)%sf(j, k, l), kind=wp)
             end do
-        end do
+        end if
 
-        print '(A," stage=",A," t_step=",I0," time=",ES13.5," rank=",I0, &
-            & " species_min=",ES13.5," species_max=",ES13.5," neg_count=",I0, &
-            & " above_gas_count=",I0," p_min=",ES13.5," p_max=",ES13.5, &
-            & " T_min=",ES13.5," T_max=",ES13.5," gas_rho_min=",ES13.5, &
-            & " gas_rho_max=",ES13.5," arho_min=",ES13.5," arho_max=",ES13.5, &
-            & " first_species=",I0," first_cell=",I0,",",I0,",",I0)', &
-            "TANABE_SPECIES_BOUNDS_DIAG", trim(stage_name), t_step, mytime, proc_rank, &
-            species_min, species_max, neg_count, above_gas_count, pres_min, pres_max, &
-            temp_min, temp_max, gas_rho_min, gas_rho_max, arho_min, arho_max, &
-            first_i, first_j, first_k, first_l
+        print '(A," first_global_violation=1 stage=",A," t_step=",I0," rk_stage=",I0, &
+            & " rank=",I0," global_cell=",I0,",",I0,",",I0," local_cell=",I0,",",I0,",",I0, &
+            & " species_id=",I0," species_name=",A," pre_rhs=",ES16.8," post_rhs=",ES16.8, &
+            & " after_update=",ES16.8," gas_mass=",ES16.8," violation=",A, &
+            & " alpha_g=",ES16.8," pressure=",ES16.8," temperature=",ES16.8, &
+            & " flux_transport_rhs=",ES16.8," chemistry_rhs=",ES16.8, &
+            & " evaporation_rhs=",ES16.8," other_rhs=",ES16.8," total_rhs=",ES16.8, &
+            & " rk_blend_update=",ES16.8," flux_transport_update=",ES16.8, &
+            & " chemistry_update=",ES16.8," evaporation_update=",ES16.8, &
+            & " other_update=",ES16.8," unaccounted_update=",ES16.8, &
+            & " contributions_available=",L1)', &
+            "TANABE_SPECIES_BOUNDS_DIAG", trim(stage_name), t_step, stage_id, proc_rank, &
+            global_i, global_j, global_k, j, k, l, species_id, trim(species_names(species_id)), &
+            before_value, post_rhs_value, after_value, rho_g, trim(violation_kind), alpha_g, &
+            pressure, temperature, flux_transport_rhs, chemistry_rhs, evaporation_rhs, &
+            other_rhs, total_rhs, rk_blend_update, flux_transport_update, chemistry_update, &
+            evaporation_update, other_update, unaccounted_update, contribution_available
         call flush(output_unit)
 
         do i = 1, sys_size
@@ -783,8 +915,9 @@ contains
         do s = 1, nstage
             call s_zhang_evap_hang_trace(t_step, s, "RK_STAGE_BEGIN")
             call s_zhang_evap_hang_trace(t_step, s, "RHS_CALL_BEGIN")
+            call s_tanabe_species_bounds_diag(q_cons_ts(1)%vf, t_step, "pre_rhs", s)
             call s_compute_rhs(q_cons_ts(1)%vf, q_T_sf, q_prim_vf, bc_type, rhs_vf, pb_ts(1)%sf, rhs_pb, mv_ts(1)%sf, rhs_mv, t_step, time_avg, s)
-            call s_tanabe_species_bounds_diag(q_cons_ts(1)%vf, t_step, "post_rhs")
+            call s_tanabe_species_bounds_diag(q_cons_ts(1)%vf, t_step, "post_rhs", s)
             call s_zhang_evap_hang_trace(t_step, s, "RHS_CALL_END")
 
             if (s == 1) then
@@ -898,10 +1031,10 @@ contains
                 end if
             end if
 
+            call s_tanabe_species_bounds_diag(q_cons_ts(1)%vf, t_step, "post_rk", s, &
+                                              q_cons_ts(stor)%vf, rk_coef(s, :))
             call s_zhang_evap_hang_trace(t_step, s, "RK_STAGE_END")
         end do
-
-        call s_tanabe_species_bounds_diag(q_cons_ts(1)%vf, t_step, "post_rk")
 
         ! Adaptive dt: final stage
         if (adap_dt) call s_adaptive_dt_bubble(3)
@@ -1351,6 +1484,9 @@ contains
         if (relax) then
             @:DEALLOCATE(m_dot_evap%sf)
         end if
+
+        if (allocated(tanabe_pre_rhs_species)) deallocate (tanabe_pre_rhs_species)
+        if (allocated(tanabe_post_rhs_species)) deallocate (tanabe_post_rhs_species)
 
         ! Writing the footer of and closing the run-time information file
         if (proc_rank == 0 .and. run_time_info) then
