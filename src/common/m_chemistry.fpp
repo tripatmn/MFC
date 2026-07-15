@@ -488,13 +488,16 @@ contains
     end subroutine s_print_reaction_heat_cell_diag
 
     !> @brief Adds chemical reaction source terms to the species transport RHS using net production rates.
-    subroutine s_compute_chemistry_reaction_flux(rhs_vf, q_cons_qp, q_T_sf, q_prim_qp, bounds, t_step, stage)
+    subroutine s_compute_chemistry_reaction_flux(rhs_vf, q_cons_qp, q_T_sf, q_prim_qp, bounds, &
+                                                 t_step, stage, q_cons_store, rk_coeffs)
 
         type(scalar_field), dimension(sys_size), intent(inout) :: rhs_vf
         type(scalar_field), intent(inout) :: q_T_sf
         type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_qp, q_prim_qp
         type(int_bounds_info), dimension(1:3), intent(in) :: bounds
         integer, intent(in) :: t_step, stage
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons_store
+        real(wp), dimension(4), intent(in) :: rk_coeffs
 
         integer :: x, y, z
         integer :: eqn, gas_idx, fluid_id
@@ -503,6 +506,7 @@ contains
         real(wp) :: h_k, e_k, qdot_h_cell, qdot_e_cell, qdot_h_limited, qdot_e_limited
         real(wp) :: heat_weight, heat_weight_denom
         real(wp) :: heat_limit_frac, gas_internal_energy_density, heat_added, max_heat, heat_scale
+        real(wp) :: availability_scale, stage_base, stage_rhs_scale
         real(wp) :: diag_qdot_h_pos, diag_qdot_h_neg, diag_qdot_e_pos, diag_qdot_e_neg
         real(wp) :: diag_raw_qdot_h_pos, diag_raw_qdot_h_neg, diag_raw_qdot_e_pos, diag_raw_qdot_e_neg
         real(wp) :: diag_src_c12h26, diag_src_o2, diag_src_co2, diag_src_h2o
@@ -560,7 +564,7 @@ contains
         diag_p_max = 0._wp
 
         $:GPU_PARALLEL_LOOP(collapse=3, &
-            private='[Ys, omega, omega_m_species, h_rt, eqn, gas_idx, fluid_id, T, T_raw, rho, rho_g, rhoYk, raw_Y, Y_sum, omega_m, omega_m_limited, omega_finite, h_k, e_k, qdot_h_cell, qdot_e_cell, qdot_h_limited, qdot_e_limited, heat_weight, heat_weight_denom, gas_internal_energy_density, heat_added, max_heat, heat_scale]', &
+            private='[Ys, omega, omega_m_species, h_rt, eqn, gas_idx, fluid_id, T, T_raw, rho, rho_g, rhoYk, raw_Y, Y_sum, omega_m, omega_m_limited, omega_finite, h_k, e_k, qdot_h_cell, qdot_e_cell, qdot_h_limited, qdot_e_limited, heat_weight, heat_weight_denom, gas_internal_energy_density, heat_added, max_heat, heat_scale, availability_scale, stage_base, stage_rhs_scale]', &
             reduction='[[diag_qdot_h_pos, diag_qdot_h_neg, diag_qdot_e_pos, diag_qdot_e_neg, diag_raw_qdot_h_pos, diag_raw_qdot_h_neg, diag_raw_qdot_e_pos, diag_raw_qdot_e_neg, diag_src_c12h26, diag_src_o2, diag_src_co2, diag_src_h2o, diag_raw_src_c12h26, diag_raw_src_o2, diag_raw_src_co2, diag_raw_src_h2o, diag_heat_applied, diag_raw_heat_applied, diag_partial_heat_applied, diag_partial_heat_skipped, diag_limited_cell_count, diag_scale_sum_limited, diag_T_clamp_count], [diag_T_max, diag_p_max, diag_max_raw_qdot_h], [diag_scale_min]]', &
             reductionOp='[+, MAX, MIN]', copyin='[bounds]')
         do z = bounds(3)%beg, bounds(3)%end
@@ -656,6 +660,38 @@ contains
 
                     end do
 
+#ifdef MFC_SIMULATION
+                    if (igr) then
+                        stage_rhs_scale = rk_coeffs(3)/rk_coeffs(4)
+                    else
+                        stage_rhs_scale = dt*rk_coeffs(3)/rk_coeffs(4)
+                    end if
+#else
+                    stage_rhs_scale = 0._wp
+#endif
+                    availability_scale = 1._wp
+                    if (stage_rhs_scale > 0._wp) then
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = chemxb, chemxe
+                            omega_m = omega_m_species(eqn - chemxb + 1)
+                            if (omega_m < 0._wp) then
+                                stage_base = rk_coeffs(1)*q_cons_qp(eqn)%sf(x, y, z)/rk_coeffs(4) + &
+                                             stage_rhs_scale*rhs_vf(eqn)%sf(x, y, z)
+                                if (rk_coeffs(2) /= 0._wp) then
+                                    stage_base = stage_base + rk_coeffs(2)*q_cons_store(eqn)%sf(x, y, z)/rk_coeffs(4)
+                                end if
+                                if (s_is_finite_wp(stage_base)) then
+                                    availability_scale = min(availability_scale, &
+                                        (1._wp - 10._wp*epsilon(1._wp))*max(0._wp, stage_base)/ &
+                                        (-stage_rhs_scale*omega_m))
+                                else
+                                    availability_scale = 0._wp
+                                end if
+                            end if
+                        end do
+                    end if
+                    availability_scale = min(1._wp, max(0._wp, availability_scale))
+
                     heat_scale = 1._wp
                     if (limit_heat_active .and. qdot_h_cell > 0._wp .and. s_is_finite_wp(qdot_h_cell)) then
                         gas_internal_energy_density = 0._wp
@@ -687,6 +723,7 @@ contains
                         end if
                     end if
 
+                    heat_scale = min(heat_scale, availability_scale)
                     qdot_h_limited = heat_scale*qdot_h_cell
                     qdot_e_limited = heat_scale*qdot_e_cell
 

@@ -739,7 +739,8 @@ contains
     end subroutine s_initialize_rhs_module
 
     !> @brief Computes the right-hand side of the semi-discrete governing equations for a single time stage.
-    impure subroutine s_compute_rhs(q_cons_vf, q_T_sf, q_prim_vf, bc_type, rhs_vf, pb_in, rhs_pb, mv_in, rhs_mv, t_step, time_avg, stage)
+    impure subroutine s_compute_rhs(q_cons_vf, q_T_sf, q_prim_vf, bc_type, rhs_vf, pb_in, rhs_pb, &
+                                    mv_in, rhs_mv, t_step, time_avg, stage, q_cons_store_vf, rk_coeffs)
 
         type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
         type(scalar_field), intent(inout) :: q_T_sf
@@ -753,6 +754,8 @@ contains
         integer, intent(in) :: t_step
         real(wp), intent(inout) :: time_avg
         integer, intent(in) :: stage
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons_store_vf
+        real(wp), dimension(4), intent(in) :: rk_coeffs
 
         real(wp) :: t_start, t_finish
         integer :: id
@@ -1186,7 +1189,8 @@ contains
         if (chemistry .and. chem_params%reactions) then
             call s_zhang_evap_hang_trace(t_step, stage, "RHS_CHEM_REACTIONS_BEGIN")
             call nvtxStartRange("RHS-CHEM-REACTIONS")
-            call s_compute_chemistry_reaction_flux(rhs_vf, q_cons_qp%vf, q_T_sf, q_prim_qp%vf, idwint, t_step, stage)
+            call s_compute_chemistry_reaction_flux(rhs_vf, q_cons_qp%vf, q_T_sf, q_prim_qp%vf, &
+                                                   idwint, t_step, stage, q_cons_store_vf, rk_coeffs)
             call nvtxEndRange
             call s_zhang_evap_hang_trace(t_step, stage, "RHS_CHEM_REACTIONS_END")
         end if

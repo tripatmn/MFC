@@ -916,7 +916,8 @@ contains
             call s_zhang_evap_hang_trace(t_step, s, "RK_STAGE_BEGIN")
             call s_zhang_evap_hang_trace(t_step, s, "RHS_CALL_BEGIN")
             call s_tanabe_species_bounds_diag(q_cons_ts(1)%vf, t_step, "pre_rhs", s)
-            call s_compute_rhs(q_cons_ts(1)%vf, q_T_sf, q_prim_vf, bc_type, rhs_vf, pb_ts(1)%sf, rhs_pb, mv_ts(1)%sf, rhs_mv, t_step, time_avg, s)
+            call s_compute_rhs(q_cons_ts(1)%vf, q_T_sf, q_prim_vf, bc_type, rhs_vf, pb_ts(1)%sf, rhs_pb, &
+                               mv_ts(1)%sf, rhs_mv, t_step, time_avg, s, q_cons_ts(stor)%vf, rk_coef(s, :))
             call s_tanabe_species_bounds_diag(q_cons_ts(1)%vf, t_step, "post_rhs", s)
             call s_zhang_evap_hang_trace(t_step, s, "RHS_CALL_END")
 
