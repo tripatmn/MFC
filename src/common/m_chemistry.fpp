@@ -489,7 +489,7 @@ contains
 
     !> @brief Adds chemical reaction source terms to the species transport RHS using net production rates.
     subroutine s_compute_chemistry_reaction_flux(rhs_vf, q_cons_qp, q_T_sf, q_prim_qp, bounds, &
-                                                 t_step, stage, q_cons_store, rk_coeffs)
+                                                 t_step, stage, q_cons_store, rk_a, rk_b, rk_c, rk_d)
 
         type(scalar_field), dimension(sys_size), intent(inout) :: rhs_vf
         type(scalar_field), intent(inout) :: q_T_sf
@@ -497,7 +497,7 @@ contains
         type(int_bounds_info), dimension(1:3), intent(in) :: bounds
         integer, intent(in) :: t_step, stage
         type(scalar_field), dimension(sys_size), intent(in) :: q_cons_store
-        real(wp), dimension(4), intent(in) :: rk_coeffs
+        real(wp), intent(in) :: rk_a, rk_b, rk_c, rk_d
 
         integer :: x, y, z
         integer :: eqn, gas_idx, fluid_id
@@ -662,9 +662,9 @@ contains
 
 #ifdef MFC_SIMULATION
                     if (igr) then
-                        stage_rhs_scale = rk_coeffs(3)/rk_coeffs(4)
+                        stage_rhs_scale = rk_c/rk_d
                     else
-                        stage_rhs_scale = dt*rk_coeffs(3)/rk_coeffs(4)
+                        stage_rhs_scale = dt*rk_c/rk_d
                     end if
 #else
                     stage_rhs_scale = 0._wp
@@ -675,10 +675,10 @@ contains
                         do eqn = chemxb, chemxe
                             omega_m = omega_m_species(eqn - chemxb + 1)
                             if (omega_m < 0._wp) then
-                                stage_base = rk_coeffs(1)*q_cons_qp(eqn)%sf(x, y, z)/rk_coeffs(4) + &
+                                stage_base = rk_a*q_cons_qp(eqn)%sf(x, y, z)/rk_d + &
                                              stage_rhs_scale*rhs_vf(eqn)%sf(x, y, z)
-                                if (rk_coeffs(2) /= 0._wp) then
-                                    stage_base = stage_base + rk_coeffs(2)*q_cons_store(eqn)%sf(x, y, z)/rk_coeffs(4)
+                                if (rk_b /= 0._wp) then
+                                    stage_base = stage_base + rk_b*q_cons_store(eqn)%sf(x, y, z)/rk_d
                                 end if
                                 if (s_is_finite_wp(stage_base)) then
                                     availability_scale = min(availability_scale, &
