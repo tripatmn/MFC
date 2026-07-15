@@ -646,6 +646,7 @@ contains
         integer :: i, j, k, l, q, s !< Generic loop iterator
         real(wp) :: start, finish
         integer :: dest
+        logical :: alpha_origin_first_found
 
         call cpu_time(start)
         call nvtxStartRange("TIMESTEP")
@@ -656,6 +657,8 @@ contains
 
         do s = 1, nstage
             call s_zhang_evap_hang_trace(t_step, s, "RK_STAGE_BEGIN")
+            call s_alpha_origin_checkpoint(q_cons_ts(1)%vf, t_step, s, &
+                                           "RK_STAGE_ENTRY", "owned")
             call s_zhang_evap_hang_trace(t_step, s, "RHS_CALL_BEGIN")
             call s_compute_rhs(q_cons_ts(1)%vf, q_T_sf, q_prim_vf, bc_type, rhs_vf, pb_ts(1)%sf, rhs_pb, mv_ts(1)%sf, rhs_mv, t_step, time_avg, s)
             call s_zhang_evap_hang_trace(t_step, s, "RHS_CALL_END")
@@ -687,6 +690,9 @@ contains
             end if
 
             if (bubbles_lagrange .and. .not. adap_dt) call s_update_lagrange_tdv_rk(stage=s)
+            call s_alpha_origin_capture_rk_cause(q_cons_ts(1)%vf, q_cons_ts(stor)%vf, rhs_vf, &
+                                                 t_step, s, rk_coef(s, 1), rk_coef(s, 2), &
+                                                 rk_coef(s, 3), rk_coef(s, 4), dt)
             call s_zhang_evap_hang_trace(t_step, s, "RK_CONS_UPDATE_BEGIN")
             $:GPU_PARALLEL_LOOP(collapse=4)
             do i = 1, sys_size
@@ -714,6 +720,13 @@ contains
             end do
             $:END_GPU_PARALLEL_LOOP()
             call s_zhang_evap_hang_trace(t_step, s, "RK_CONS_UPDATE_END")
+            alpha_origin_first_found = .false.
+            call s_alpha_origin_checkpoint(q_cons_ts(1)%vf, t_step, s, &
+                                           "POST_RK_CONS_UPDATE", "owned", &
+                                           alpha_origin_first_found)
+            if (alpha_origin_first_found) then
+                call s_alpha_origin_print_rk_cause(q_cons_ts(1)%vf, t_step, s)
+            end if
 
             !Evolve pb and mv for non-polytropic qbmm
             if (qbmm .and. (.not. polytropic)) then
