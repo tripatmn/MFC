@@ -27,6 +27,7 @@ module m_chemistry
     #:endif
 
     use m_global_parameters
+    use m_mpi_common, only: s_mpi_abort, s_mpi_allreduce_integer_sum, s_mpi_allreduce_max
     implicit none
 
     #:if USING_AMD
@@ -488,13 +489,18 @@ contains
     end subroutine s_print_reaction_heat_cell_diag
 
     !> @brief Adds chemical reaction source terms to the species transport RHS using net production rates.
-    subroutine s_compute_chemistry_reaction_flux(rhs_vf, q_cons_qp, q_T_sf, q_prim_qp, bounds, t_step, stage)
+    subroutine s_compute_chemistry_reaction_flux(rhs_vf, q_cons_qp, q_T_sf, q_prim_qp, bounds, t_step, stage, &
+                                                 q_rk_stored, rk_a, rk_b, rk_c, rk_d, rk_dt, &
+                                                 coupled_source_limit_active)
 
         type(scalar_field), dimension(sys_size), intent(inout) :: rhs_vf
         type(scalar_field), intent(inout) :: q_T_sf
         type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_qp, q_prim_qp
+        type(scalar_field), dimension(sys_size), intent(in) :: q_rk_stored
         type(int_bounds_info), dimension(1:3), intent(in) :: bounds
         integer, intent(in) :: t_step, stage
+        real(wp), intent(in) :: rk_a, rk_b, rk_c, rk_d, rk_dt
+        logical, intent(in) :: coupled_source_limit_active
 
         integer :: x, y, z
         integer :: eqn, gas_idx, fluid_id
@@ -503,6 +509,8 @@ contains
         real(wp) :: h_k, e_k, qdot_h_cell, qdot_e_cell, qdot_h_limited, qdot_e_limited
         real(wp) :: heat_weight, heat_weight_denom
         real(wp) :: heat_limit_frac, gas_internal_energy_density, heat_added, max_heat, heat_scale
+        real(wp) :: chem_theta, theta_candidate, available_rhoY, consuming_source, stage_dt
+        real(wp) :: chemistry_scale
         real(wp) :: diag_qdot_h_pos, diag_qdot_h_neg, diag_qdot_e_pos, diag_qdot_e_neg
         real(wp) :: diag_raw_qdot_h_pos, diag_raw_qdot_h_neg, diag_raw_qdot_e_pos, diag_raw_qdot_e_neg
         real(wp) :: diag_src_c12h26, diag_src_o2, diag_src_co2, diag_src_h2o
@@ -560,7 +568,7 @@ contains
         diag_p_max = 0._wp
 
         $:GPU_PARALLEL_LOOP(collapse=3, &
-            private='[Ys, omega, omega_m_species, h_rt, eqn, gas_idx, fluid_id, T, T_raw, rho, rho_g, rhoYk, raw_Y, Y_sum, omega_m, omega_m_limited, omega_finite, h_k, e_k, qdot_h_cell, qdot_e_cell, qdot_h_limited, qdot_e_limited, heat_weight, heat_weight_denom, gas_internal_energy_density, heat_added, max_heat, heat_scale]', &
+            private='[Ys, omega, omega_m_species, h_rt, eqn, gas_idx, fluid_id, T, T_raw, rho, rho_g, rhoYk, raw_Y, Y_sum, omega_m, omega_m_limited, omega_finite, h_k, e_k, qdot_h_cell, qdot_e_cell, qdot_h_limited, qdot_e_limited, heat_weight, heat_weight_denom, gas_internal_energy_density, heat_added, max_heat, heat_scale, chem_theta, theta_candidate, available_rhoY, consuming_source, stage_dt, chemistry_scale]', &
             reduction='[[diag_qdot_h_pos, diag_qdot_h_neg, diag_qdot_e_pos, diag_qdot_e_neg, diag_raw_qdot_h_pos, diag_raw_qdot_h_neg, diag_raw_qdot_e_pos, diag_raw_qdot_e_neg, diag_src_c12h26, diag_src_o2, diag_src_co2, diag_src_h2o, diag_raw_src_c12h26, diag_raw_src_o2, diag_raw_src_co2, diag_raw_src_h2o, diag_heat_applied, diag_raw_heat_applied, diag_partial_heat_applied, diag_partial_heat_skipped, diag_limited_cell_count, diag_scale_sum_limited, diag_T_clamp_count], [diag_T_max, diag_p_max, diag_max_raw_qdot_h], [diag_scale_min]]', &
             reductionOp='[+, MAX, MIN]', copyin='[bounds]')
         do z = bounds(3)%beg, bounds(3)%end
@@ -687,13 +695,32 @@ contains
                         end if
                     end if
 
-                    qdot_h_limited = heat_scale*qdot_h_cell
-                    qdot_e_limited = heat_scale*qdot_e_cell
+                    stage_dt = 0._wp
+                    if (rk_d /= 0._wp) stage_dt = rk_c*rk_dt/rk_d
+                    chem_theta = 1._wp
+                    if (coupled_source_limit_active .and. stage_dt > 0._wp) then
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = chemxb, chemxe
+                            consuming_source = heat_scale*omega_m_species(eqn - chemxb + 1)
+                            if (consuming_source < 0._wp) then
+                                available_rhoY = (rk_a*q_cons_qp(eqn)%sf(x, y, z) + &
+                                                  rk_b*q_rk_stored(eqn)%sf(x, y, z) + &
+                                                  rk_c*rk_dt*rhs_vf(eqn)%sf(x, y, z))/rk_d
+                                theta_candidate = available_rhoY/(-stage_dt*consuming_source)
+                                theta_candidate = min(1._wp, max(0._wp, theta_candidate))
+                                chem_theta = min(chem_theta, theta_candidate)
+                            end if
+                        end do
+                    end if
+
+                    chemistry_scale = heat_scale*chem_theta
+                    qdot_h_limited = chemistry_scale*qdot_h_cell
+                    qdot_e_limited = chemistry_scale*qdot_e_cell
 
                     $:GPU_LOOP(parallelism='[seq]')
                     do eqn = chemxb, chemxe
                         omega_m = omega_m_species(eqn - chemxb + 1)
-                        omega_m_limited = heat_scale*omega_m
+                        omega_m_limited = chemistry_scale*omega_m
                         rhs_vf(eqn)%sf(x, y, z) = rhs_vf(eqn)%sf(x, y, z) + omega_m_limited
 
                         if (heat_diag_active) then
@@ -835,11 +862,12 @@ contains
     end subroutine s_compute_chemistry_reaction_flux
 
     !> @brief Computes species mass diffusion fluxes at cell interfaces using mixture-averaged diffusivities.
-    subroutine s_compute_chemistry_diffusion_flux(idir, q_prim_qp, flux_src_vf, irx, iry, irz)
+    subroutine s_compute_chemistry_diffusion_flux(idir, q_prim_qp, flux_src_vf, irx, iry, irz, t_step, stage)
 
         type(scalar_field), dimension(sys_size), intent(in) :: q_prim_qp
         type(scalar_field), dimension(sys_size), intent(inout) :: flux_src_vf
         type(int_bounds_info), intent(in) :: irx, iry, irz
+        integer, intent(in), optional :: t_step, stage
 
         integer, intent(in) :: idir
         #:if chemistry_transport
@@ -857,6 +885,8 @@ contains
 
         real(wp) :: Mass_Diffu_Energy
         real(wp) :: MW_L, MW_R, MW_cell, Rgas_L, Rgas_R, T_L, T_R, P_L, P_R, rho_L, rho_R, rho_cell, rho_Vic
+        real(wp) :: rho_old_L, rho_old_R, T_old_L, T_old_R
+        real(wp) :: rho_g_intrinsic_L, rho_g_intrinsic_R, alpha_face
         real(wp) :: lambda_L, lambda_R, lambda_Cell, dT_dxi, grid_spacing
         real(wp) :: Cp_L, Cp_R
         real(wp) :: diffusivity_L, diffusivity_R, diffusivity_cell
@@ -864,8 +894,37 @@ contains
 
         integer :: x, y, z, i, n, eqn
         integer, dimension(3) :: offsets
+        logical :: model3_gas_density_fix_enabled, model3_intrinsic_alpha_fix_enabled
+        logical :: corrected_property_invalid, intrinsic_face_inactive, intrinsic_flux_invalid
+        logical :: intrinsic_inactive_due_alpha_g, intrinsic_inactive_due_alpha_liq
+        character(len=32) :: env_value
+        integer :: env_status
+        integer :: js_idx, max_abs_J_idx, max_abs_h_idx, neg_J_count
+        real(wp) :: sumY_L, sumY_R, sumY_cell, alpha_g_L, alpha_g_R, rho_g_L, rho_g_R
+        real(wp) :: alpha_liq_L, alpha_liq_R, rho_total_L, rho_total_R
+        real(wp) :: J_sum, J_min, J_max, J_max_abs, J_O2, J_fuel, D_min, D_max
+        real(wp) :: J_unweighted_min, J_unweighted_max, J_unweighted_max_abs
+        real(wp) :: J_weighted_min, J_weighted_max, J_weighted_max_abs
+        real(wp) :: h_min, h_max, h_max_abs, thermal_term
+        real(wp) :: unweighted_energy_flux
+        real(wp) :: local_max_species_flux, local_max_energy_flux, global_max_species_flux, global_max_energy_flux
+        integer :: local_face_count, local_active_face_count, local_inactive_face_count
+        integer :: local_inactive_alpha_g_count, local_inactive_alpha_liq_count
+        integer :: global_face_count, global_active_face_count, global_inactive_face_count
+        integer :: global_inactive_alpha_g_count, global_inactive_alpha_liq_count
+        real(wp), parameter :: model3_diff_alpha_min = 1.0e-4_wp
+        real(wp), parameter :: model3_diff_alpha_liq_max = 0.99_wp
 
         isc1 = irx; isc2 = iry; isc3 = irz
+
+        model3_gas_density_fix_enabled = .false.
+        model3_intrinsic_alpha_fix_enabled = .false.
+        env_value = ""
+        call get_environment_variable("TEMP_CHEM_DIFFUSION_MODEL3_GAS_DENSITY_FIX", env_value, status=env_status)
+        model3_gas_density_fix_enabled = env_status == 0 .and. trim(env_value) == "1"
+        env_value = ""
+        call get_environment_variable("TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_FIX", env_value, status=env_status)
+        model3_intrinsic_alpha_fix_enabled = env_status == 0 .and. trim(env_value) == "1" .and. model_eqns == 3
 
         $:GPU_UPDATE(device='[isc1,isc2,isc3]')
 
@@ -877,11 +936,18 @@ contains
             ! Model 1: Mixture-Average Transport
             if (chem_params%transport_model == 1) then
                 ! Note: Added 'i' and 'eqn' to private list.
-                $:GPU_PARALLEL_LOOP(collapse=3,  private='[x,y,z,i,eqn,Ys_L, Ys_R, Ys_cell, Xs_L, Xs_R, mass_diffusivities_mixavg1, mass_diffusivities_mixavg2, mass_diffusivities_mixavg_Cell, h_l, h_r, Xs_cell, h_k, dXk_dxi,Mass_Diffu_Flux, Mass_Diffu_Energy, MW_L, MW_R, MW_cell, Rgas_L, Rgas_R, T_L, T_R, P_L, P_R, rho_L, rho_R, rho_cell, rho_Vic, lambda_L, lambda_R, lambda_Cell, dT_dxi, grid_spacing]', copyin='[offsets]')
+                local_face_count = 0
+                local_active_face_count = 0
+                local_inactive_face_count = 0
+                local_inactive_alpha_g_count = 0
+                local_inactive_alpha_liq_count = 0
+                local_max_species_flux = 0._wp
+                local_max_energy_flux = 0._wp
+                $:GPU_PARALLEL_LOOP(collapse=3,  private='[x,y,z,i,eqn,Ys_L, Ys_R, Ys_cell, Xs_L, Xs_R, mass_diffusivities_mixavg1, mass_diffusivities_mixavg2, mass_diffusivities_mixavg_Cell, h_l, h_r, Xs_cell, h_k, dXk_dxi,Mass_Diffu_Flux, Mass_Diffu_Energy, MW_L, MW_R, MW_cell, Rgas_L, Rgas_R, T_L, T_R, P_L, P_R, rho_L, rho_R, rho_cell, rho_Vic, rho_old_L, rho_old_R, T_old_L, T_old_R, rho_g_intrinsic_L, rho_g_intrinsic_R, alpha_face, lambda_L, lambda_R, lambda_Cell, dT_dxi, grid_spacing, js_idx, max_abs_J_idx, max_abs_h_idx, neg_J_count, sumY_L, sumY_R, sumY_cell, alpha_g_L, alpha_g_R, rho_g_L, rho_g_R, alpha_liq_L, alpha_liq_R, rho_total_L, rho_total_R, J_sum, J_min, J_max, J_max_abs, J_O2, J_fuel, J_unweighted_min, J_unweighted_max, J_unweighted_max_abs, J_weighted_min, J_weighted_max, J_weighted_max_abs, D_min, D_max, h_min, h_max, h_max_abs, thermal_term, unweighted_energy_flux, intrinsic_face_inactive, intrinsic_inactive_due_alpha_g, intrinsic_inactive_due_alpha_liq, intrinsic_flux_invalid, corrected_property_invalid]', reduction='[[local_face_count, local_active_face_count, local_inactive_face_count, local_inactive_alpha_g_count, local_inactive_alpha_liq_count], [local_max_species_flux, local_max_energy_flux]]', reductionOp='[+, MAX]', copy='[local_face_count, local_active_face_count, local_inactive_face_count, local_inactive_alpha_g_count, local_inactive_alpha_liq_count, local_max_species_flux, local_max_energy_flux]', copyin='[offsets]')
                 do z = isc3%beg, isc3%end
                     do y = isc2%beg, isc2%end
                         do x = isc1%beg, isc1%end
-                            ! Calculate grid spacing using direction-based indexing
+	                            ! Calculate grid spacing using direction-based indexing
                             select case (idir)
                             case (1)
                                 grid_spacing = x_cc(x + 1) - x_cc(x)
@@ -889,15 +955,20 @@ contains
                                 grid_spacing = y_cc(y + 1) - y_cc(y)
                             case (3)
                                 grid_spacing = z_cc(z + 1) - z_cc(z)
-                            end select
+	                            end select
 
-                            ! Extract species mass fractions
-                            $:GPU_LOOP(parallelism='[seq]')
-                            do i = chemxb, chemxe
-                                Ys_L(i - chemxb + 1) = q_prim_qp(i)%sf(x, y, z)
-                                Ys_R(i - chemxb + 1) = q_prim_qp(i)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
-                                Ys_cell(i - chemxb + 1) = 0.5_wp*(Ys_L(i - chemxb + 1) + Ys_R(i - chemxb + 1))
-                            end do
+	                            ! Extract species mass fractions
+	                            sumY_L = 0._wp
+	                            sumY_R = 0._wp
+	                            $:GPU_LOOP(parallelism='[seq]')
+	                            do i = chemxb, chemxe
+	                                Ys_L(i - chemxb + 1) = q_prim_qp(i)%sf(x, y, z)
+	                                Ys_R(i - chemxb + 1) = q_prim_qp(i)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+	                                Ys_cell(i - chemxb + 1) = 0.5_wp*(Ys_L(i - chemxb + 1) + Ys_R(i - chemxb + 1))
+	                                sumY_L = sumY_L + Ys_L(i - chemxb + 1)
+	                                sumY_R = sumY_R + Ys_R(i - chemxb + 1)
+	                            end do
+	                            sumY_cell = 0.5_wp*(sumY_L + sumY_R)
 
                             ! Calculate molecular weights and mole fractions
                             call get_mixture_molecular_weight(Ys_L, MW_L)
@@ -914,24 +985,163 @@ contains
                             P_L = q_prim_qp(E_idx)%sf(x, y, z)
                             P_R = q_prim_qp(E_idx)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
 
-                            rho_L = q_prim_qp(1)%sf(x, y, z)
-                            rho_R = q_prim_qp(1)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+	                            rho_old_L = q_prim_qp(1)%sf(x, y, z)
+	                            rho_old_R = q_prim_qp(1)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
 
-                            T_L = P_L/rho_L/Rgas_L
-                            T_R = P_R/rho_R/Rgas_R
+	                            alpha_g_L = 0._wp; alpha_g_R = 0._wp; rho_g_L = 0._wp; rho_g_R = 0._wp
+	                            rho_total_L = 0._wp; rho_total_R = 0._wp
+	                            do i = 1, num_fluids
+	                                rho_total_L = rho_total_L + q_prim_qp(contxb + i - 1)%sf(x, y, z)
+	                                rho_total_R = rho_total_R + q_prim_qp(contxb + i - 1)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+	                            end do
+	                            alpha_liq_L = q_prim_qp(advxb)%sf(x, y, z)
+	                            alpha_liq_R = q_prim_qp(advxb)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+	                            if (chem_gas_num_fluids <= 0) then
+	                                alpha_g_L = q_prim_qp(advxb + chem_gas_fluid_id - 1)%sf(x, y, z)
+	                                alpha_g_R = q_prim_qp(advxb + chem_gas_fluid_id - 1)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+	                                rho_g_L = q_prim_qp(contxb + chem_gas_fluid_id - 1)%sf(x, y, z)
+	                                rho_g_R = q_prim_qp(contxb + chem_gas_fluid_id - 1)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+	                            else
+	                                do i = 1, chem_gas_num_fluids
+	                                    alpha_g_L = alpha_g_L + q_prim_qp(advxb + chem_gas_fluid_ids(i) - 1)%sf(x, y, z)
+	                                    alpha_g_R = alpha_g_R + q_prim_qp(advxb + chem_gas_fluid_ids(i) - 1)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+	                                    rho_g_L = rho_g_L + q_prim_qp(contxb + chem_gas_fluid_ids(i) - 1)%sf(x, y, z)
+	                                    rho_g_R = rho_g_R + q_prim_qp(contxb + chem_gas_fluid_ids(i) - 1)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+	                                end do
+	                            end if
+
+	                            rho_g_intrinsic_L = 0._wp
+	                            rho_g_intrinsic_R = 0._wp
+	                            alpha_face = 1._wp
+	                            intrinsic_face_inactive = .false.
+	                            intrinsic_inactive_due_alpha_g = .false.
+	                            intrinsic_inactive_due_alpha_liq = .false.
+	                            if (model3_intrinsic_alpha_fix_enabled) then
+	                                local_face_count = local_face_count + 1
+	                                intrinsic_inactive_due_alpha_g = alpha_g_L /= alpha_g_L .or. alpha_g_R /= alpha_g_R .or. &
+	                                                               alpha_g_L < model3_diff_alpha_min .or. alpha_g_R < model3_diff_alpha_min
+	                                intrinsic_inactive_due_alpha_liq = alpha_liq_L /= alpha_liq_L .or. alpha_liq_R /= alpha_liq_R .or. &
+	                                                                 alpha_liq_L > model3_diff_alpha_liq_max .or. &
+	                                                                 alpha_liq_R > model3_diff_alpha_liq_max
+	                                intrinsic_face_inactive = intrinsic_inactive_due_alpha_g .or. intrinsic_inactive_due_alpha_liq
+	                                if (alpha_g_L > 0._wp) rho_g_intrinsic_L = rho_g_L/alpha_g_L
+	                                if (alpha_g_R > 0._wp) rho_g_intrinsic_R = rho_g_R/alpha_g_R
+	                                if (intrinsic_face_inactive) then
+	                                    local_inactive_face_count = local_inactive_face_count + 1
+	                                    if (intrinsic_inactive_due_alpha_g) local_inactive_alpha_g_count = local_inactive_alpha_g_count + 1
+	                                    if (intrinsic_inactive_due_alpha_liq) local_inactive_alpha_liq_count = local_inactive_alpha_liq_count + 1
+	                                    flux_src_vf(E_idx)%sf(x, y, z) = 0._wp
+	                                    $:GPU_LOOP(parallelism='[seq]')
+	                                    do eqn = chemxb, chemxe
+	                                        flux_src_vf(eqn)%sf(x, y, z) = 0._wp
+	                                    end do
+	                                    cycle
+	                                end if
+	                                corrected_property_invalid = .false.
+	                                if (rho_g_L /= rho_g_L .or. rho_g_R /= rho_g_R .or. rho_g_L <= 0._wp .or. rho_g_R <= 0._wp) &
+	                                    corrected_property_invalid = .true.
+	                                if (rho_g_intrinsic_L /= rho_g_intrinsic_L .or. rho_g_intrinsic_R /= rho_g_intrinsic_R .or. &
+	                                    rho_g_intrinsic_L <= 0._wp .or. rho_g_intrinsic_R <= 0._wp) corrected_property_invalid = .true.
+	                                if (corrected_property_invalid) then
+	                                    write (output_unit, '(&
+	                                        &"TEMP_CHEM_DIFFUSION_MODEL3_GAS_DENSITY_FIX_INVALID rank=",I0,&
+	                                        &" direction=",I0," face_xyz=",3(I0,1X),&
+	                                        &" reason=density alpha_g_L=",ES16.8," alpha_g_R=",ES16.8,&
+	                                        &" rho_g_stored_L=",ES16.8," rho_g_stored_R=",ES16.8,&
+	                                        &" rho_g_intrinsic_L=",ES16.8," rho_g_intrinsic_R=",ES16.8)') &
+	                                        proc_rank, idir, x, y, z, alpha_g_L, alpha_g_R, rho_g_L, rho_g_R, &
+	                                        rho_g_intrinsic_L, rho_g_intrinsic_R
+	                                    call flush(output_unit)
+	                                    call s_mpi_abort("TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_FIX invalid gas density")
+	                                end if
+	                                local_active_face_count = local_active_face_count + 1
+	                                alpha_face = min(alpha_g_L, alpha_g_R)
+	                                rho_L = rho_g_intrinsic_L
+	                                rho_R = rho_g_intrinsic_R
+	                            else if (model3_gas_density_fix_enabled .and. model_eqns == 3) then
+	                                rho_L = rho_g_L
+	                                rho_R = rho_g_R
+	                            else
+	                                rho_L = rho_old_L
+	                                rho_R = rho_old_R
+	                            end if
+	                            T_old_L = P_L/rho_old_L/Rgas_L
+	                            T_old_R = P_R/rho_old_R/Rgas_R
+	                            T_L = P_L/rho_L/Rgas_L
+	                            T_R = P_R/rho_R/Rgas_R
+	                            if ((model3_gas_density_fix_enabled .and. model_eqns == 3) .or. model3_intrinsic_alpha_fix_enabled) then
+	                                corrected_property_invalid = .false.
+	                                if (rho_L /= rho_L .or. rho_R /= rho_R .or. rho_L <= 0._wp .or. rho_R <= 0._wp) &
+	                                    corrected_property_invalid = .true.
+	                                if (T_L /= T_L .or. T_R /= T_R .or. T_L <= 1.e-6_wp .or. T_R <= 1.e-6_wp .or. &
+	                                    T_L > 1.e8_wp .or. T_R > 1.e8_wp) corrected_property_invalid = .true.
+	                                if (model3_intrinsic_alpha_fix_enabled .and. (T_L /= T_L .or. T_R /= T_R)) &
+	                                    corrected_property_invalid = .true.
+	                                if (corrected_property_invalid) then
+	                                    write (output_unit, '(&
+	                                        &"TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_INVALID rank=",I0,&
+	                                        &" direction=",I0," face_xyz=",3(I0,1X),&
+	                                        &" rho_old_L=",ES16.8," rho_old_R=",ES16.8,&
+	                                        &" rho_g_L=",ES16.8," rho_g_R=",ES16.8,&
+	                                        &" P_L=",ES16.8," P_R=",ES16.8,&
+	                                        &" T_old_L=",ES16.8," T_old_R=",ES16.8,&
+	                                        &" T_corr_L=",ES16.8," T_corr_R=",ES16.8)') &
+	                                        proc_rank, idir, x, y, z, rho_old_L, rho_old_R, rho_g_L, rho_g_R, &
+	                                        P_L, P_R, T_old_L, T_old_R, T_L, T_R
+	                                    call flush(output_unit)
+		                                    call s_mpi_abort("TEMP_CHEM_DIFFUSION_MODEL3_GAS_DENSITY_FIX invalid corrected density/temperature")
+	                                end if
+	                            end if
 
                             rho_cell = 0.5_wp*(rho_L + rho_R)
                             dT_dxi = (T_R - T_L)/grid_spacing
 
                             ! Get transport properties
-                            call get_species_mass_diffusivities_mixavg(P_L, T_L, Ys_L, mass_diffusivities_mixavg1)
-                            call get_species_mass_diffusivities_mixavg(P_R, T_R, Ys_R, mass_diffusivities_mixavg2)
+	                            call get_species_mass_diffusivities_mixavg(P_L, T_L, Ys_L, mass_diffusivities_mixavg1)
+	                            call get_species_mass_diffusivities_mixavg(P_R, T_R, Ys_R, mass_diffusivities_mixavg2)
 
                             call get_mixture_thermal_conductivity_mixavg(T_L, Ys_L, lambda_L)
                             call get_mixture_thermal_conductivity_mixavg(T_R, Ys_R, lambda_R)
 
-                            call get_species_enthalpies_rt(T_L, h_l)
-                            call get_species_enthalpies_rt(T_R, h_r)
+	                            call get_species_enthalpies_rt(T_L, h_l)
+	                            call get_species_enthalpies_rt(T_R, h_r)
+
+	                            if ((model3_gas_density_fix_enabled .and. model_eqns == 3) .or. model3_intrinsic_alpha_fix_enabled) then
+	                                corrected_property_invalid = .false.
+	                                if (lambda_L /= lambda_L .or. lambda_R /= lambda_R .or. lambda_L < 0._wp .or. lambda_R < 0._wp) &
+	                                    corrected_property_invalid = .true.
+	                                $:GPU_LOOP(parallelism='[seq]')
+	                                do i = 1, num_species
+	                                    if (mass_diffusivities_mixavg1(i) /= mass_diffusivities_mixavg1(i) .or. &
+	                                        mass_diffusivities_mixavg2(i) /= mass_diffusivities_mixavg2(i) .or. &
+	                                        mass_diffusivities_mixavg1(i) < 0._wp .or. mass_diffusivities_mixavg2(i) < 0._wp .or. &
+	                                        h_l(i) /= h_l(i) .or. h_r(i) /= h_r(i)) corrected_property_invalid = .true.
+	                                end do
+	                                if (corrected_property_invalid) then
+	                                    write (output_unit, '(&
+		                                        &"TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_INVALID_PROPERTY rank=",I0,&
+	                                        &" direction=",I0," face_xyz=",3(I0,1X),&
+	                                        &" P_L=",ES16.8," P_R=",ES16.8,&
+	                                        &" rho_old_L=",ES16.8," rho_old_R=",ES16.8,&
+	                                        &" rho_g_L=",ES16.8," rho_g_R=",ES16.8,&
+	                                        &" rho_total_L=",ES16.8," rho_total_R=",ES16.8,&
+	                                        &" alpha_g_L=",ES16.8," alpha_g_R=",ES16.8,&
+	                                        &" alpha_liq_L=",ES16.8," alpha_liq_R=",ES16.8,&
+	                                        &" p_over_rho_g_L=",ES16.8," p_over_rho_g_R=",ES16.8,&
+	                                        &" MW_L=",ES16.8," MW_R=",ES16.8,&
+	                                        &" Rgas_L=",ES16.8," Rgas_R=",ES16.8,&
+	                                        &" T_old_L=",ES16.8," T_old_R=",ES16.8,&
+	                                        &" T_corr_L=",ES16.8," T_corr_R=",ES16.8,&
+	                                        &" sumY_L=",ES16.8," sumY_R=",ES16.8,&
+	                                        &" lambda_L=",ES16.8," lambda_R=",ES16.8)') &
+	                                        proc_rank, idir, x, y, z, P_L, P_R, rho_old_L, rho_old_R, rho_g_L, rho_g_R, &
+	                                        rho_total_L, rho_total_R, alpha_g_L, alpha_g_R, alpha_liq_L, alpha_liq_R, &
+	                                        P_L/rho_g_L, P_R/rho_g_R, MW_L, MW_R, Rgas_L, Rgas_R, &
+	                                        T_old_L, T_old_R, T_L, T_R, sumY_L, sumY_R, lambda_L, lambda_R
+	                                    call flush(output_unit)
+		                                    call s_mpi_abort("TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_FIX invalid corrected transport/enthalpy property")
+	                                end if
+	                            end if
 
                             ! Calculate species properties and gradients
                             $:GPU_LOOP(parallelism='[seq]')
@@ -948,53 +1158,185 @@ contains
                                 dXk_dxi(i - chemxb + 1) = (Xs_R(i - chemxb + 1) - Xs_L(i - chemxb + 1))/grid_spacing
                             end do
 
-                            ! Calculate mixture-averaged diffusivities
-                            $:GPU_LOOP(parallelism='[seq]')
-                            do i = chemxb, chemxe
-                                mass_diffusivities_mixavg_Cell(i - chemxb + 1) = &
-                                    (mass_diffusivities_mixavg2(i - chemxb + 1) + mass_diffusivities_mixavg1(i - chemxb + 1))/2.0_wp
-                            end do
+	                            ! Calculate mixture-averaged diffusivities
+	                            D_min = huge(1._wp)
+	                            D_max = -huge(1._wp)
+	                            $:GPU_LOOP(parallelism='[seq]')
+	                            do i = chemxb, chemxe
+	                                mass_diffusivities_mixavg_Cell(i - chemxb + 1) = &
+	                                    (mass_diffusivities_mixavg2(i - chemxb + 1) + mass_diffusivities_mixavg1(i - chemxb + 1))/2.0_wp
+	                                D_min = min(D_min, mass_diffusivities_mixavg_Cell(i - chemxb + 1))
+	                                D_max = max(D_max, mass_diffusivities_mixavg_Cell(i - chemxb + 1))
+	                            end do
 
                             lambda_Cell = 0.5_wp*(lambda_R + lambda_L)
 
                             ! Calculate mass diffusion fluxes
-                            rho_Vic = 0.0_wp
-                            Mass_Diffu_Energy = 0.0_wp
+	                            rho_Vic = 0.0_wp
+	                            Mass_Diffu_Energy = 0.0_wp
+	                            J_sum = 0._wp; J_min = huge(1._wp); J_max = -huge(1._wp); J_max_abs = -1._wp
+	                            J_O2 = 0._wp; J_fuel = 0._wp; max_abs_J_idx = -1; neg_J_count = 0
 
-                            $:GPU_LOOP(parallelism='[seq]')
-                            do eqn = chemxb, chemxe
+	                            $:GPU_LOOP(parallelism='[seq]')
+	                            do eqn = chemxb, chemxe
                                 #:if USING_AMD
                                     Mass_Diffu_Flux(eqn - chemxb + 1) = rho_cell*mass_diffusivities_mixavg_Cell(eqn - chemxb + 1)* &
                                                                         molecular_weights_nonparameter(eqn - chemxb + 1)/MW_cell*dXk_dxi(eqn - chemxb + 1)
                                 #:else
                                     Mass_Diffu_Flux(eqn - chemxb + 1) = rho_cell*mass_diffusivities_mixavg_Cell(eqn - chemxb + 1)* &
                                                                         molecular_weights(eqn - chemxb + 1)/MW_cell*dXk_dxi(eqn - chemxb + 1)
-                                #:endif
-                                rho_Vic = rho_Vic + Mass_Diffu_Flux(eqn - chemxb + 1)
-                                Mass_Diffu_Energy = Mass_Diffu_Energy + h_k(eqn - chemxb + 1)*Mass_Diffu_Flux(eqn - chemxb + 1)
-                            end do
+	                                #:endif
+	                                rho_Vic = rho_Vic + Mass_Diffu_Flux(eqn - chemxb + 1)
+	                                Mass_Diffu_Energy = Mass_Diffu_Energy + h_k(eqn - chemxb + 1)*Mass_Diffu_Flux(eqn - chemxb + 1)
+	                                J_sum = J_sum + Mass_Diffu_Flux(eqn - chemxb + 1)
+	                                J_min = min(J_min, Mass_Diffu_Flux(eqn - chemxb + 1))
+	                                J_max = max(J_max, Mass_Diffu_Flux(eqn - chemxb + 1))
+	                                if (abs(Mass_Diffu_Flux(eqn - chemxb + 1)) > J_max_abs) then
+	                                    J_max_abs = abs(Mass_Diffu_Flux(eqn - chemxb + 1))
+	                                    max_abs_J_idx = eqn - chemxb + 1
+	                                end if
+	                                if (Mass_Diffu_Flux(eqn - chemxb + 1) < 0._wp) neg_J_count = neg_J_count + 1
+	                                if (eqn - chemxb + 1 == 10) J_O2 = Mass_Diffu_Flux(eqn - chemxb + 1)
+	                                if (eqn - chemxb + 1 == fuel_species_id) J_fuel = Mass_Diffu_Flux(eqn - chemxb + 1)
+	                            end do
 
-                            ! Apply corrections for mass conservation
-                            $:GPU_LOOP(parallelism='[seq]')
-                            do eqn = chemxb, chemxe
-                                Mass_Diffu_Energy = Mass_Diffu_Energy - h_k(eqn - chemxb + 1)*Ys_cell(eqn - chemxb + 1)*rho_Vic
-                                Mass_Diffu_Flux(eqn - chemxb + 1) = Mass_Diffu_Flux(eqn - chemxb + 1) - rho_Vic*Ys_cell(eqn - chemxb + 1)
-                            end do
+	                            ! Apply corrections for mass conservation
+	                            $:GPU_LOOP(parallelism='[seq]')
+	                            do eqn = chemxb, chemxe
+	                                Mass_Diffu_Energy = Mass_Diffu_Energy - h_k(eqn - chemxb + 1)*Ys_cell(eqn - chemxb + 1)*rho_Vic
+	                                Mass_Diffu_Flux(eqn - chemxb + 1) = Mass_Diffu_Flux(eqn - chemxb + 1) - rho_Vic*Ys_cell(eqn - chemxb + 1)
+	                            end do
+	                            J_sum = 0._wp; J_min = huge(1._wp); J_max = -huge(1._wp); J_max_abs = -1._wp
+	                            J_O2 = 0._wp; J_fuel = 0._wp; max_abs_J_idx = -1; neg_J_count = 0
+	                            h_min = huge(1._wp); h_max = -huge(1._wp); h_max_abs = -1._wp; max_abs_h_idx = -1
+	                            $:GPU_LOOP(parallelism='[seq]')
+	                            do eqn = chemxb, chemxe
+	                                js_idx = eqn - chemxb + 1
+	                                J_sum = J_sum + Mass_Diffu_Flux(js_idx)
+	                                J_min = min(J_min, Mass_Diffu_Flux(js_idx))
+	                                J_max = max(J_max, Mass_Diffu_Flux(js_idx))
+	                                if (abs(Mass_Diffu_Flux(js_idx)) > J_max_abs) then
+	                                    J_max_abs = abs(Mass_Diffu_Flux(js_idx))
+	                                    max_abs_J_idx = js_idx
+	                                end if
+	                                if (Mass_Diffu_Flux(js_idx) < 0._wp) neg_J_count = neg_J_count + 1
+	                                if (js_idx == 10) J_O2 = Mass_Diffu_Flux(js_idx)
+	                                if (js_idx == fuel_species_id) J_fuel = Mass_Diffu_Flux(js_idx)
+	                                h_min = min(h_min, h_k(js_idx))
+	                                h_max = max(h_max, h_k(js_idx))
+	                                if (abs(h_k(js_idx)) > h_max_abs) then
+	                                    h_max_abs = abs(h_k(js_idx))
+	                                    max_abs_h_idx = js_idx
+	                                end if
+	                            end do
 
-                            ! Add thermal conduction contribution
-                            Mass_Diffu_Energy = lambda_Cell*dT_dxi + Mass_Diffu_Energy
+	                            J_unweighted_min = J_min
+	                            J_unweighted_max = J_max
+	                            J_unweighted_max_abs = J_max_abs
 
-                            ! Update flux arrays
-                            flux_src_vf(E_idx)%sf(x, y, z) = flux_src_vf(E_idx)%sf(x, y, z) - Mass_Diffu_Energy
+	                            ! Add thermal conduction contribution
+	                            thermal_term = lambda_Cell*dT_dxi
+	                            Mass_Diffu_Energy = lambda_Cell*dT_dxi + Mass_Diffu_Energy
+	                            unweighted_energy_flux = Mass_Diffu_Energy
 
-                            $:GPU_LOOP(parallelism='[seq]')
-                            do eqn = chemxb, chemxe
-                                flux_src_vf(eqn)%sf(x, y, z) = flux_src_vf(eqn)%sf(x, y, z) - Mass_Diffu_Flux(eqn - chemxb + 1)
-                            end do
-                        end do
+	                            if (model3_intrinsic_alpha_fix_enabled) then
+	                                $:GPU_LOOP(parallelism='[seq]')
+	                                do eqn = chemxb, chemxe
+	                                    Mass_Diffu_Flux(eqn - chemxb + 1) = alpha_face*Mass_Diffu_Flux(eqn - chemxb + 1)
+	                                end do
+	                                Mass_Diffu_Energy = alpha_face*Mass_Diffu_Energy
+	                                thermal_term = alpha_face*thermal_term
+	                                J_sum = 0._wp; J_min = huge(1._wp); J_max = -huge(1._wp); J_max_abs = -1._wp
+	                                J_O2 = 0._wp; J_fuel = 0._wp; max_abs_J_idx = -1; neg_J_count = 0
+	                                intrinsic_flux_invalid = .false.
+	                                $:GPU_LOOP(parallelism='[seq]')
+	                                do eqn = chemxb, chemxe
+	                                    js_idx = eqn - chemxb + 1
+	                                    J_sum = J_sum + Mass_Diffu_Flux(js_idx)
+	                                    J_min = min(J_min, Mass_Diffu_Flux(js_idx))
+	                                    J_max = max(J_max, Mass_Diffu_Flux(js_idx))
+	                                    if (abs(Mass_Diffu_Flux(js_idx)) > J_max_abs) then
+	                                        J_max_abs = abs(Mass_Diffu_Flux(js_idx))
+	                                        max_abs_J_idx = js_idx
+	                                    end if
+	                                    if (Mass_Diffu_Flux(js_idx) < 0._wp) neg_J_count = neg_J_count + 1
+	                                    if (js_idx == 10) J_O2 = Mass_Diffu_Flux(js_idx)
+	                                    if (js_idx == fuel_species_id) J_fuel = Mass_Diffu_Flux(js_idx)
+	                                    if (Mass_Diffu_Flux(js_idx) /= Mass_Diffu_Flux(js_idx)) intrinsic_flux_invalid = .true.
+	                                end do
+	                                J_weighted_min = J_min
+	                                J_weighted_max = J_max
+	                                J_weighted_max_abs = J_max_abs
+	                                if (Mass_Diffu_Energy /= Mass_Diffu_Energy) intrinsic_flux_invalid = .true.
+	                                if (intrinsic_flux_invalid) then
+	                                    write (output_unit, '(&
+	                                        &"TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_INVALID rank=",I0,&
+	                                        &" direction=",I0," face_xyz=",3(I0,1X),&
+	                                        &" reason=flux alpha_face=",ES16.8,&
+	                                        &" J_unweighted_min=",ES16.8," J_unweighted_max=",ES16.8,&
+	                                        &" J_weighted_min=",ES16.8," J_weighted_max=",ES16.8,&
+	                                        &" energy_unweighted=",ES16.8," energy_weighted=",ES16.8)') &
+	                                        proc_rank, idir, x, y, z, alpha_face, J_unweighted_min, J_unweighted_max, &
+	                                        J_weighted_min, J_weighted_max, unweighted_energy_flux, Mass_Diffu_Energy
+	                                    call flush(output_unit)
+	                                    call s_mpi_abort("TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_FIX invalid final flux")
+	                                end if
+	                                local_max_species_flux = max(local_max_species_flux, J_weighted_max_abs)
+	                                local_max_energy_flux = max(local_max_energy_flux, abs(Mass_Diffu_Energy))
+	                            else
+	                                J_weighted_min = J_min
+	                                J_weighted_max = J_max
+	                                J_weighted_max_abs = J_max_abs
+	                            end if
+
+	                            ! Update flux arrays
+	                            flux_src_vf(E_idx)%sf(x, y, z) = flux_src_vf(E_idx)%sf(x, y, z) - Mass_Diffu_Energy
+
+	                            $:GPU_LOOP(parallelism='[seq]')
+	                            do eqn = chemxb, chemxe
+	                                flux_src_vf(eqn)%sf(x, y, z) = flux_src_vf(eqn)%sf(x, y, z) - Mass_Diffu_Flux(eqn - chemxb + 1)
+	                            end do
+	                        end do
                     end do
                 end do
                 $:END_GPU_PARALLEL_LOOP()
+
+	                if (model3_intrinsic_alpha_fix_enabled) then
+	                    if (num_procs > 1) then
+	                        call s_mpi_allreduce_integer_sum(local_face_count, global_face_count)
+	                        call s_mpi_allreduce_integer_sum(local_active_face_count, global_active_face_count)
+	                        call s_mpi_allreduce_integer_sum(local_inactive_face_count, global_inactive_face_count)
+	                        call s_mpi_allreduce_integer_sum(local_inactive_alpha_g_count, global_inactive_alpha_g_count)
+	                        call s_mpi_allreduce_integer_sum(local_inactive_alpha_liq_count, global_inactive_alpha_liq_count)
+	                        call s_mpi_allreduce_max(local_max_species_flux, global_max_species_flux)
+	                        call s_mpi_allreduce_max(local_max_energy_flux, global_max_energy_flux)
+	                    else
+	                        global_face_count = local_face_count
+	                        global_active_face_count = local_active_face_count
+	                        global_inactive_face_count = local_inactive_face_count
+	                        global_inactive_alpha_g_count = local_inactive_alpha_g_count
+	                        global_inactive_alpha_liq_count = local_inactive_alpha_liq_count
+	                        global_max_species_flux = local_max_species_flux
+	                        global_max_energy_flux = local_max_energy_flux
+	                    end if
+                    if (proc_rank == 0 .and. present(t_step) .and. present(stage)) then
+                        if (t_step <= 5 .or. mod(t_step, 100) == 0) then
+                            write (output_unit, '(&
+	                                &"TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_SUMMARY t_step=",I0,&
+	                                &" stage=",I0," direction=",I0,&
+	                                &" global_faces=",I0," active_faces=",I0," inactive_faces=",I0,&
+	                                &" inactive_alpha_g_faces=",I0," inactive_alpha_liq_faces=",I0,&
+	                                &" inactive_fraction=",ES16.8,&
+	                                &" max_weighted_species_flux=",ES16.8,&
+	                                &" max_weighted_energy_flux=",ES16.8)') &
+	                                t_step, stage, idir, global_face_count, global_active_face_count, global_inactive_face_count, &
+	                                global_inactive_alpha_g_count, global_inactive_alpha_liq_count, &
+	                                real(global_inactive_face_count, wp)/max(real(global_face_count, wp), 1._wp), &
+	                                global_max_species_flux, global_max_energy_flux
+                            call flush(output_unit)
+                        end if
+                    end if
+                end if
 
                 ! Model 2: Unity Lewis Number
             else if (chem_params%transport_model == 2) then

@@ -801,8 +801,6 @@ contains
 
         integer :: i
 
-        call s_zhang_evap_hang_trace(t_step, 0, "TIMESTEP_BEGIN")
-
         if (cfl_dt) then
             if (cfl_const_dt .and. t_step == 0) call s_compute_dt()
 
@@ -856,9 +854,7 @@ contains
         end if
 
         if (relax) then
-            call s_zhang_evap_hang_trace(t_step, 0, "RESET_M_DOT_EVAP_BEGIN")
             call s_reset_m_dot_evap()
-            call s_zhang_evap_hang_trace(t_step, 0, "RESET_M_DOT_EVAP_END")
         end if
 
         if (probe_wrt) then
@@ -871,24 +867,15 @@ contains
 
         ! Total-variation-diminishing (TVD) Runge-Kutta (RK) time-steppers
         if (any(time_stepper == (/1, 2, 3/))) then
-            call s_zhang_evap_hang_trace(t_step, 0, "TVD_RK_CALL_BEGIN")
             call s_tvd_rk(t_step, time_avg, time_stepper)
-            call s_zhang_evap_hang_trace(t_step, 0, "TVD_RK_CALL_END")
-            call s_zhang_evap_hang_field_diag(q_cons_ts(1)%vf, q_prim_vf, t_step, 0, "AFTER_TVD_RK")
         end if
 
         if (relax) then
-            call s_zhang_evap_hang_trace(t_step, 0, "PHASE_CHANGE_RELAX_BEGIN")
             call s_infinite_relaxation_k(q_cons_ts(1)%vf, m_dot_evap, dt, t_step, 0)
-            call s_zhang_evap_hang_trace(t_step, 0, "PHASE_CHANGE_RELAX_END")
-            call s_zhang_evap_hang_field_diag(q_cons_ts(1)%vf, q_prim_vf, t_step, 0, "AFTER_PHASE_CHANGE")
-            call s_zhang_evap_hang_trace(t_step, 0, "EVAP_TO_FUEL_SPECIES_BEGIN")
-            call s_apply_evap_to_fuel_species(q_cons_ts(1)%vf, dt)
-            call s_zhang_evap_hang_trace(t_step, 0, "EVAP_TO_FUEL_SPECIES_END")
+            call s_apply_evap_to_fuel_species(q_cons_ts(1)%vf, dt, t_step, 0)
         end if
 
         ! Time-stepping loop controls
-        call s_zhang_evap_hang_trace(t_step, 0, "TIMESTEP_END_BEFORE_INCREMENT")
         t_step = t_step + 1
 
     end subroutine s_perform_time_step
@@ -966,12 +953,8 @@ contains
 
         integer :: save_count
 
-        call s_zhang_evap_hang_trace(t_step, 0, "SAVE_DATA_BEGIN")
-
         if (down_sample) then
-            call s_zhang_evap_hang_trace(t_step, 0, "SAVE_DATA_DOWNSAMPLE_BUFFERS_BEGIN")
             call s_populate_variables_buffers(bc_type, q_cons_ts(1)%vf)
-            call s_zhang_evap_hang_trace(t_step, 0, "SAVE_DATA_DOWNSAMPLE_BUFFERS_END")
         end if
 
         stor = 1
@@ -994,7 +977,6 @@ contains
 
         call cpu_time(start)
         call nvtxStartRange("SAVE-DATA")
-        call s_zhang_evap_hang_trace(t_step, 0, "SAVE_DATA_NAN_SCAN_BEGIN")
         do i = 1, sys_size
 #ifndef FRONTIER_UNIFIED
             $:GPU_UPDATE(host='[q_cons_ts(stor)%vf(i)%sf]')
@@ -1010,7 +992,6 @@ contains
                 end do
             end do
         end do
-        call s_zhang_evap_hang_trace(t_step, 0, "SAVE_DATA_NAN_SCAN_END")
 
         if (qbmm .and. .not. polytropic) then
             $:GPU_UPDATE(host='[pb_ts(1)%sf]')
@@ -1039,9 +1020,7 @@ contains
             call s_write_restart_lag_bubbles(save_count) !parallel
             if (lag_params%write_bubbles_stats) call s_write_lag_bubble_stats()
         else
-            call s_zhang_evap_hang_trace(t_step, 0, "WRITE_DATA_FILES_BEGIN")
             call s_write_data_files(q_cons_ts(stor)%vf, q_T_sf, q_prim_vf, save_count, bc_type)
-            call s_zhang_evap_hang_trace(t_step, 0, "WRITE_DATA_FILES_END")
         end if
 
         call nvtxEndRange
@@ -1057,8 +1036,6 @@ contains
         else
             io_time_avg = (abs(finish - start) + io_time_avg*(nt - 1))/nt
         end if
-
-        call s_zhang_evap_hang_trace(t_step, 0, "SAVE_DATA_END")
 
     end subroutine s_save_data
 

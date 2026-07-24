@@ -81,6 +81,7 @@ module m_time_steppers
     integer :: stor !< storage index
     real(wp), allocatable, dimension(:, :) :: rk_coef
     integer, private :: num_probe_ts
+    logical :: phase_change_fuel_mass_coupling_fix_enabled = .false.
 
     $:GPU_DECLARE(create='[q_cons_ts,q_prim_vf,q_T_sf,m_dot_evap,rhs_vf,q_prim_ts1,q_prim_ts2,rhs_mv,rhs_pb,max_dt,rk_coef,stor,bc_type]')
 
@@ -97,113 +98,6 @@ module m_time_steppers
 
 contains
 
-    logical function s_zhang_evap_hang_diag_active(t_step)
-        integer, intent(in) :: t_step
-
-        character(len=16) :: env_value
-        integer :: env_status
-
-        call get_environment_variable("TEMP_ZHANG_EVAP_HANG_DIAG", env_value, status=env_status)
-        s_zhang_evap_hang_diag_active = env_status == 0 .and. trim(env_value) == "1" &
-                                        .and. t_step >= 9100 .and. t_step <= 9120
-    end function s_zhang_evap_hang_diag_active
-
-    subroutine s_zhang_evap_hang_trace(t_step, stage, label)
-        integer, intent(in) :: t_step, stage
-        character(len=*), intent(in) :: label
-
-        if (.not. s_zhang_evap_hang_diag_active(t_step)) return
-
-        print '(" TEMP_ZHANG_EVAP_HANG_DIAG rank=", I6, " t_step=", I8, " stage=", I4, " ", A)', &
-            proc_rank, t_step, stage, trim(label)
-        call flush(output_unit)
-    end subroutine s_zhang_evap_hang_trace
-
-    subroutine s_zhang_evap_hang_field_diag(q_cons_vf, q_prim_vf, t_step, stage, label)
-        type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
-        type(scalar_field), dimension(sys_size), intent(in) :: q_prim_vf
-        integer, intent(in) :: t_step, stage
-        character(len=*), intent(in) :: label
-
-        real(wp) :: pres_min, pres_max
-        real(wp) :: alpha_min, alpha_max
-        real(wp) :: liq_arho_min, liq_arho_max
-        real(wp) :: vap_arho_min, vap_arho_max
-        real(wp) :: gas_rho_min, gas_rho_max
-        real(wp) :: mdot_min, mdot_max
-        real(wp), allocatable, dimension(:, :, :) :: gas_rho
-        integer :: i, invalid_count
-
-        if (.not. s_zhang_evap_hang_diag_active(t_step)) return
-
-#ifndef FRONTIER_UNIFIED
-        $:GPU_UPDATE(host='[q_prim_vf(E_idx)%sf]')
-        do i = contxb, contxe
-            $:GPU_UPDATE(host='[q_cons_vf(i)%sf]')
-        end do
-        do i = advxb, advxe
-            $:GPU_UPDATE(host='[q_cons_vf(i)%sf]')
-        end do
-        if (relax) then
-            $:GPU_UPDATE(host='[m_dot_evap%sf]')
-        end if
-#endif
-
-        pres_min = minval(q_prim_vf(E_idx)%sf(0:m, 0:n, 0:p))
-        pres_max = maxval(q_prim_vf(E_idx)%sf(0:m, 0:n, 0:p))
-
-        alpha_min = huge(1._wp)
-        alpha_max = -huge(1._wp)
-        do i = advxb, advxe
-            alpha_min = min(alpha_min, minval(q_cons_vf(i)%sf(0:m, 0:n, 0:p)))
-            alpha_max = max(alpha_max, maxval(q_cons_vf(i)%sf(0:m, 0:n, 0:p)))
-        end do
-
-        liq_arho_min = minval(q_cons_vf(contxb)%sf(0:m, 0:n, 0:p))
-        liq_arho_max = maxval(q_cons_vf(contxb)%sf(0:m, 0:n, 0:p))
-        if (num_fluids >= 2) then
-            vap_arho_min = minval(q_cons_vf(contxb + 1)%sf(0:m, 0:n, 0:p))
-            vap_arho_max = maxval(q_cons_vf(contxb + 1)%sf(0:m, 0:n, 0:p))
-        else
-            vap_arho_min = 0._wp
-            vap_arho_max = 0._wp
-        end if
-
-        allocate(gas_rho(0:m, 0:n, 0:p))
-        gas_rho = 0._wp
-        if (num_fluids >= 2) gas_rho = gas_rho + q_cons_vf(contxb + 1)%sf(0:m, 0:n, 0:p)
-        if (num_fluids >= 3) gas_rho = gas_rho + q_cons_vf(contxb + 2)%sf(0:m, 0:n, 0:p)
-        gas_rho_min = minval(gas_rho)
-        gas_rho_max = maxval(gas_rho)
-        deallocate(gas_rho)
-
-        if (relax) then
-            mdot_min = minval(m_dot_evap%sf(0:m, 0:n, 0:p))
-            mdot_max = maxval(m_dot_evap%sf(0:m, 0:n, 0:p))
-        else
-            mdot_min = 0._wp
-            mdot_max = 0._wp
-        end if
-
-        invalid_count = 0
-        do i = 1, sys_size
-            invalid_count = invalid_count + count(q_cons_vf(i)%sf(0:m, 0:n, 0:p) /= q_cons_vf(i)%sf(0:m, 0:n, 0:p))
-            invalid_count = invalid_count + count(abs(q_cons_vf(i)%sf(0:m, 0:n, 0:p)) > huge(1._wp))
-        end do
-
-        print '(" TEMP_ZHANG_EVAP_HANG_DIAG_FIELDS rank=", I6, " t_step=", I8, " stage=", I4, " ", A, &
-            & " p_min=", ES16.8, " p_max=", ES16.8, &
-            & " alpha_min=", ES16.8, " alpha_max=", ES16.8, &
-            & " liq_arho_min=", ES16.8, " liq_arho_max=", ES16.8, &
-            & " vap_arho_min=", ES16.8, " vap_arho_max=", ES16.8, &
-            & " gas_rho_min=", ES16.8, " gas_rho_max=", ES16.8, &
-            & " mdot_min=", ES16.8, " mdot_max=", ES16.8, " invalid_count=", I10)', &
-            proc_rank, t_step, stage, trim(label), pres_min, pres_max, alpha_min, alpha_max, &
-            liq_arho_min, liq_arho_max, vap_arho_min, vap_arho_max, gas_rho_min, gas_rho_max, &
-            mdot_min, mdot_max, invalid_count
-        call flush(output_unit)
-    end subroutine s_zhang_evap_hang_field_diag
-
     !> The computation of parameters, the allocation of memory,
         !!      the association of pointers and/or the execution of any
         !!      other procedures that are necessary to setup the module.
@@ -217,6 +111,8 @@ contains
 #endif
 #endif
         integer :: i, j !< Generic loop iterators
+        character(len=16) :: env_value
+        integer :: env_status
 
         ! Setting number of time-stages for selected time-stepping scheme
         if (time_stepper == 1) then
@@ -224,6 +120,10 @@ contains
         elseif (any(time_stepper == (/2, 3/))) then
             num_ts = 2
         end if
+
+        env_value = ""
+        call get_environment_variable("TEMP_PHASE_CHANGE_FUEL_MASS_COUPLING_FIX", env_value, status=env_status)
+        phase_change_fuel_mass_coupling_fix_enabled = env_status == 0 .and. trim(env_value) == "1"
 
         if (probe_wrt) then
             num_probe_ts = 2
@@ -646,34 +546,25 @@ contains
         integer :: i, j, k, l, q, s !< Generic loop iterator
         real(wp) :: start, finish
         integer :: dest
-        logical :: alpha_origin_first_found
 
         call cpu_time(start)
         call nvtxStartRange("TIMESTEP")
-        call s_zhang_evap_hang_trace(t_step, 0, "TVD_RK_BEGIN")
 
         ! Adaptive dt: initial stage
         if (adap_dt) call s_adaptive_dt_bubble(1)
 
         do s = 1, nstage
-            call s_zhang_evap_hang_trace(t_step, s, "RK_STAGE_BEGIN")
-            call s_alpha_origin_checkpoint(q_cons_ts(1)%vf, t_step, s, &
-                                           "RK_STAGE_ENTRY", "owned")
-            call s_zhang_evap_hang_trace(t_step, s, "RHS_CALL_BEGIN")
-            call s_compute_rhs(q_cons_ts(1)%vf, q_T_sf, q_prim_vf, bc_type, rhs_vf, pb_ts(1)%sf, rhs_pb, mv_ts(1)%sf, rhs_mv, t_step, time_avg, s)
-            call s_zhang_evap_hang_trace(t_step, s, "RHS_CALL_END")
+            call s_compute_rhs(q_cons_ts(1)%vf, q_T_sf, q_prim_vf, bc_type, rhs_vf, pb_ts(1)%sf, rhs_pb, mv_ts(1)%sf, rhs_mv, &
+                               t_step, time_avg, s, q_cons_ts(stor)%vf, rk_coef(s, 1), rk_coef(s, 2), &
+                               rk_coef(s, 3), rk_coef(s, 4), dt)
 
             if (s == 1) then
                 if (run_time_info) then
                     if (igr .or. dummy) then
-                        call s_zhang_evap_hang_trace(t_step, s, "RUN_TIME_INFO_WRITE_BEGIN_CONS")
                         call s_write_run_time_information(q_cons_ts(1)%vf, t_step)
-                        call s_zhang_evap_hang_trace(t_step, s, "RUN_TIME_INFO_WRITE_END_CONS")
                     end if
                     if (.not. igr .or. dummy) then
-                        call s_zhang_evap_hang_trace(t_step, s, "RUN_TIME_INFO_WRITE_BEGIN_PRIM")
                         call s_write_run_time_information(q_prim_vf, t_step)
-                        call s_zhang_evap_hang_trace(t_step, s, "RUN_TIME_INFO_WRITE_END_PRIM")
                     end if
                 end if
 
@@ -690,10 +581,6 @@ contains
             end if
 
             if (bubbles_lagrange .and. .not. adap_dt) call s_update_lagrange_tdv_rk(stage=s)
-            call s_alpha_origin_capture_rk_cause(q_cons_ts(1)%vf, q_cons_ts(stor)%vf, rhs_vf, &
-                                                 t_step, s, rk_coef(s, 1), rk_coef(s, 2), &
-                                                 rk_coef(s, 3), rk_coef(s, 4), dt)
-            call s_zhang_evap_hang_trace(t_step, s, "RK_CONS_UPDATE_BEGIN")
             $:GPU_PARALLEL_LOOP(collapse=4)
             do i = 1, sys_size
                 do l = 0, p
@@ -719,14 +606,6 @@ contains
                 end do
             end do
             $:END_GPU_PARALLEL_LOOP()
-            call s_zhang_evap_hang_trace(t_step, s, "RK_CONS_UPDATE_END")
-            alpha_origin_first_found = .false.
-            call s_alpha_origin_checkpoint(q_cons_ts(1)%vf, t_step, s, &
-                                           "POST_RK_CONS_UPDATE", "owned", &
-                                           alpha_origin_first_found)
-            if (alpha_origin_first_found) then
-                call s_alpha_origin_print_rk_cause(q_cons_ts(1)%vf, t_step, s)
-            end if
 
             !Evolve pb and mv for non-polytropic qbmm
             if (qbmm .and. (.not. polytropic)) then
@@ -763,9 +642,7 @@ contains
             if (grid_geometry == 3) call s_apply_fourier_filter(q_cons_ts(1)%vf)
 
             if (model_eqns == 3 .and. (.not. relax)) then
-                call s_zhang_evap_hang_trace(t_step, s, "PRESSURE_RELAX_BEGIN")
                 call s_pressure_relaxation_procedure(q_cons_ts(1)%vf)
-                call s_zhang_evap_hang_trace(t_step, s, "PRESSURE_RELAX_END")
             end if
 
             if (adv_n) call s_comp_alpha_from_n(q_cons_ts(1)%vf)
@@ -784,13 +661,11 @@ contains
                 end if
             end if
 
-            call s_zhang_evap_hang_trace(t_step, s, "RK_STAGE_END")
         end do
 
         ! Adaptive dt: final stage
         if (adap_dt) call s_adaptive_dt_bubble(3)
 
-        call s_zhang_evap_hang_trace(t_step, 0, "TVD_RK_END")
         call nvtxEndRange
         call cpu_time(finish)
 
@@ -820,9 +695,10 @@ contains
         $:END_GPU_PARALLEL_LOOP()
     end subroutine s_reset_m_dot_evap
 
-    subroutine s_apply_evap_to_fuel_species(q_cons_vf, ldt)
+    subroutine s_apply_evap_to_fuel_species(q_cons_vf, ldt, t_step, stage)
         type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
         real(wp), intent(in) :: ldt
+        integer, optional, intent(in) :: t_step, stage
         integer :: fuel_species_eqn
         integer :: i, j, k, l
         real(wp) :: alpha_liq, gas_alpha, gas_mass
@@ -830,6 +706,7 @@ contains
         if (.not. relax) return
         if (.not. chemistry) return
         if (.not. evap_species_source) return
+        if (phase_change_fuel_mass_coupling_fix_enabled) return
         if (fuel_species_id < 1 .or. fuel_species_id > (chemxe - chemxb + 1)) return
 
         fuel_species_eqn = chemxb + fuel_species_id - 1

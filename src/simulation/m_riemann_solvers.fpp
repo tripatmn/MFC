@@ -103,6 +103,48 @@ module m_riemann_solvers
     real(wp), allocatable, dimension(:, :) :: Res_gs
     $:GPU_DECLARE(create='[Res_gs]')
 
+    logical :: hllc_model3_species_flux_fix_enabled = .false.
+    $:GPU_DECLARE(create='[hllc_model3_species_flux_fix_enabled]')
+    logical :: hllc_model3_species_face_normalize_enabled = .false.
+    integer :: hllc_model3_species_face_nonfinite = 0
+    integer :: hllc_model3_species_face_degenerate = 0
+    integer :: hllc_model3_species_face_bounds = 0
+    integer :: hllc_model3_species_face_debug_found = 0
+    integer :: hllc_model3_species_face_debug_j = -999999
+    integer :: hllc_model3_species_face_debug_k = -999999
+    integer :: hllc_model3_species_face_debug_l = -999999
+    integer :: hllc_model3_species_face_debug_side = 0
+    integer :: hllc_model3_species_face_debug_neg_L = 0
+    integer :: hllc_model3_species_face_debug_neg_R = 0
+    real(wp) :: hllc_model3_species_face_debug_sumY_raw = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_minY_raw = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_maxY_raw = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_alpha_g_L = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_alpha_g_R = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_alpha_l_L = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_alpha_l_R = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_rhog_L = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_rhog_R = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_rho_L = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_rho_R = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_pres_L = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_pres_R = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_sumrhoY_L = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_sumrhoY_R = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_minrhoY_L = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_minrhoY_R = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_maxrhoY_L = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_maxrhoY_R = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_Yfuel_L = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_Yfuel_R = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_rhoYfuel_L = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_rhoYfuel_R = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_YO2_L = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_YO2_R = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_rhoYO2_L = 0._wp
+    real(wp) :: hllc_model3_species_face_debug_rhoYO2_R = 0._wp
+    $:GPU_DECLARE(create='[hllc_model3_species_face_normalize_enabled,hllc_model3_species_face_nonfinite,hllc_model3_species_face_degenerate,hllc_model3_species_face_bounds,hllc_model3_species_face_debug_found,hllc_model3_species_face_debug_j,hllc_model3_species_face_debug_k,hllc_model3_species_face_debug_l,hllc_model3_species_face_debug_side,hllc_model3_species_face_debug_neg_L,hllc_model3_species_face_debug_neg_R,hllc_model3_species_face_debug_sumY_raw,hllc_model3_species_face_debug_minY_raw,hllc_model3_species_face_debug_maxY_raw,hllc_model3_species_face_debug_alpha_g_L,hllc_model3_species_face_debug_alpha_g_R,hllc_model3_species_face_debug_alpha_l_L,hllc_model3_species_face_debug_alpha_l_R,hllc_model3_species_face_debug_rhog_L,hllc_model3_species_face_debug_rhog_R,hllc_model3_species_face_debug_rho_L,hllc_model3_species_face_debug_rho_R,hllc_model3_species_face_debug_pres_L,hllc_model3_species_face_debug_pres_R,hllc_model3_species_face_debug_sumrhoY_L,hllc_model3_species_face_debug_sumrhoY_R,hllc_model3_species_face_debug_minrhoY_L,hllc_model3_species_face_debug_minrhoY_R,hllc_model3_species_face_debug_maxrhoY_L,hllc_model3_species_face_debug_maxrhoY_R,hllc_model3_species_face_debug_Yfuel_L,hllc_model3_species_face_debug_Yfuel_R,hllc_model3_species_face_debug_rhoYfuel_L,hllc_model3_species_face_debug_rhoYfuel_R,hllc_model3_species_face_debug_YO2_L,hllc_model3_species_face_debug_YO2_R,hllc_model3_species_face_debug_rhoYO2_L,hllc_model3_species_face_debug_rhoYO2_R]')
+
 contains
 
     !> Dispatch to the subroutines that are utilized to compute the
@@ -2059,8 +2101,21 @@ contains
         real(wp) :: pres_SL, pres_SR, Ms_L, Ms_R
         real(wp) :: flux_ene_e
         real(wp) :: zcoef, pcorr !< low Mach number correction
+        real(wp) :: gas_flux, gas_mass_L, gas_mass_R, gas_alpha_L, gas_alpha_R
+        real(wp) :: liquid_alpha_L, liquid_alpha_R
+        real(wp) :: Y_face, sumY_raw, minY_raw, maxY_raw, normalization_factor
+        real(wp) :: sumY_L, sumY_R, minY_L, minY_R, maxY_L, maxY_R
+        real(wp) :: Y_fuel_L, Y_fuel_R, Y_O2_L, Y_O2_R
 
-        integer :: Re_max, i, j, k, l, q !< Generic loop iterators
+        integer :: Re_max, i, j, k, l, q, gas_idx, fluid_id, negY_L, negY_R, selected_side !< Generic loop iterators
+
+        if (hllc_model3_species_face_normalize_enabled) then
+            hllc_model3_species_face_nonfinite = 0
+            hllc_model3_species_face_degenerate = 0
+            hllc_model3_species_face_bounds = 0
+            hllc_model3_species_face_debug_found = 0
+            $:GPU_UPDATE(device='[hllc_model3_species_face_nonfinite,hllc_model3_species_face_degenerate,hllc_model3_species_face_bounds,hllc_model3_species_face_debug_found]')
+        end if
 
         ! Populating the buffers of the left and right Riemann problem
         ! states variables, based on the choice of boundary conditions
@@ -2087,7 +2142,7 @@ contains
                 ! 6-EQUATION MODEL WITH HLLC
                 if (model_eqns == 3) then
                     !ME3
-                    $:GPU_PARALLEL_LOOP(collapse=3, private='[i,j,k,l, q, vel_L, vel_R, Re_L, Re_R, alpha_L, alpha_R, Ys_L, Ys_R, Xs_L, Xs_R, Gamma_iL, Gamma_iR, Cp_iL, Cp_iR, Yi_avg, Phi_avg, h_iL, h_iR, h_avg_2, tau_e_L, tau_e_R, flux_ene_e, xi_field_L, xi_field_R, pcorr, zcoef, rho_L, rho_R, pres_L, pres_R, E_L, E_R, H_L, H_R, Cp_avg, Cv_avg, T_avg, eps, c_sum_Yi_Phi, T_L, T_R, Y_L, Y_R, MW_L, MW_R, R_gas_L, R_gas_R, Cp_L, Cp_R, Cv_L, Cv_R, Gamm_L, Gamm_R, gamma_L, gamma_R, pi_inf_L, pi_inf_R, qv_L, qv_R, qv_avg, c_L, c_R, G_L, G_R, rho_avg, H_avg, c_avg, gamma_avg, ptilde_L, ptilde_R, vel_L_rms, vel_R_rms, vel_avg_rms, vel_L_tmp, vel_R_tmp, Ms_L, Ms_R, pres_SL, pres_SR, alpha_L_sum, alpha_R_sum, rho_Star, E_Star, p_Star, p_K_Star, vel_K_star, s_L, s_R, s_M, s_P, s_S, xi_M, xi_P, xi_L, xi_R, xi_MP, xi_PP]')
+                    $:GPU_PARALLEL_LOOP(collapse=3, private='[i,j,k,l, q, vel_L, vel_R, Re_L, Re_R, alpha_L, alpha_R, Ys_L, Ys_R, Xs_L, Xs_R, Gamma_iL, Gamma_iR, Cp_iL, Cp_iR, Yi_avg, Phi_avg, h_iL, h_iR, h_avg_2, tau_e_L, tau_e_R, flux_ene_e, xi_field_L, xi_field_R, pcorr, zcoef, rho_L, rho_R, pres_L, pres_R, E_L, E_R, H_L, H_R, Cp_avg, Cv_avg, T_avg, eps, c_sum_Yi_Phi, T_L, T_R, Y_L, Y_R, MW_L, MW_R, R_gas_L, R_gas_R, Cp_L, Cp_R, Cv_L, Cv_R, Gamm_L, Gamm_R, gamma_L, gamma_R, pi_inf_L, qv_L, qv_R, qv_avg, c_L, c_R, G_L, G_R, rho_avg, H_avg, c_avg, gamma_avg, ptilde_L, ptilde_R, vel_L_rms, vel_R_rms, vel_avg_rms, vel_L_tmp, vel_R_tmp, Ms_L, Ms_R, pres_SL, pres_SR, alpha_L_sum, alpha_R_sum, rho_Star, E_Star, p_Star, p_K_Star, vel_K_star, s_L, s_R, s_M, s_P, s_S, xi_M, xi_P, xi_L, xi_R, xi_MP, xi_PP, gas_idx, fluid_id, gas_flux, gas_mass_L, gas_mass_R, gas_alpha_L, gas_alpha_R, liquid_alpha_L, liquid_alpha_R, Y_face, sumY_raw, minY_raw, maxY_raw, normalization_factor, sumY_L, sumY_R, minY_L, minY_R, maxY_L, maxY_R, Y_fuel_L, Y_fuel_R, Y_O2_L, Y_O2_R, negY_L, negY_R, selected_side]')
                     do l = is3%beg, is3%end
                         do k = is2%beg, is2%end
                             do j = is1%beg, is1%end
@@ -2355,6 +2410,167 @@ contains
                                         xi_M*qL_prim_rs${XYZ}$_vf(j, k, l, i)*(vel_L(dir_idx(1)) + s_M*(xi_L - 1._wp)) + &
                                         xi_P*qR_prim_rs${XYZ}$_vf(j + 1, k, l, i)*(vel_R(dir_idx(1)) + s_P*(xi_R - 1._wp))
                                 end do
+
+                                if (chemistry .and. hllc_model3_species_flux_fix_enabled) then
+                                    gas_flux = 0._wp
+                                    if (num_fluids == 1) then
+                                        gas_flux = flux_rs${XYZ}$_vf(j, k, l, contxe)
+                                    elseif (chem_gas_num_fluids <= 0) then
+                                        fluid_id = chem_gas_fluid_id
+                                        if (fluid_id >= 1 .and. fluid_id <= num_fluids) then
+                                            gas_flux = flux_rs${XYZ}$_vf(j, k, l, contxb + fluid_id - 1)
+                                        end if
+                                    else
+                                        $:GPU_LOOP(parallelism='[seq]')
+                                        do gas_idx = 1, chem_gas_num_fluids
+                                            fluid_id = chem_gas_fluid_ids(gas_idx)
+                                            if (fluid_id >= 1 .and. fluid_id <= num_fluids) then
+                                                gas_flux = gas_flux + flux_rs${XYZ}$_vf(j, k, l, contxb + fluid_id - 1)
+                                            end if
+                                        end do
+                                    end if
+
+                                    normalization_factor = 1._wp
+                                    if (hllc_model3_species_face_normalize_enabled) then
+                                        sumY_raw = 0._wp
+                                        minY_raw = huge(1._wp)
+                                        maxY_raw = -huge(1._wp)
+                                        sumY_L = 0._wp
+                                        sumY_R = 0._wp
+                                        minY_L = huge(1._wp)
+                                        minY_R = huge(1._wp)
+                                        maxY_L = -huge(1._wp)
+                                        maxY_R = -huge(1._wp)
+                                        negY_L = 0
+                                        negY_R = 0
+                                        gas_mass_L = 0._wp
+                                        gas_mass_R = 0._wp
+                                        gas_alpha_L = 0._wp
+                                        gas_alpha_R = 0._wp
+                                        if (num_fluids == 1) then
+                                            gas_mass_L = rho_L
+                                            gas_mass_R = rho_R
+                                            gas_alpha_L = 1._wp
+                                            gas_alpha_R = 1._wp
+                                        elseif (chem_gas_num_fluids <= 0) then
+                                            fluid_id = chem_gas_fluid_id
+                                            if (fluid_id >= 1 .and. fluid_id <= num_fluids) then
+                                                gas_mass_L = qL_prim_rs${XYZ}$_vf(j, k, l, contxb + fluid_id - 1)
+                                                gas_mass_R = qR_prim_rs${XYZ}$_vf(j + 1, k, l, contxb + fluid_id - 1)
+                                                gas_alpha_L = qL_prim_rs${XYZ}$_vf(j, k, l, advxb + fluid_id - 1)
+                                                gas_alpha_R = qR_prim_rs${XYZ}$_vf(j + 1, k, l, advxb + fluid_id - 1)
+                                            end if
+                                        else
+                                            $:GPU_LOOP(parallelism='[seq]')
+                                            do gas_idx = 1, chem_gas_num_fluids
+                                                fluid_id = chem_gas_fluid_ids(gas_idx)
+                                                if (fluid_id >= 1 .and. fluid_id <= num_fluids) then
+                                                    gas_mass_L = gas_mass_L + qL_prim_rs${XYZ}$_vf(j, k, l, contxb + fluid_id - 1)
+                                                    gas_mass_R = gas_mass_R + qR_prim_rs${XYZ}$_vf(j + 1, k, l, contxb + fluid_id - 1)
+                                                    gas_alpha_L = gas_alpha_L + qL_prim_rs${XYZ}$_vf(j, k, l, advxb + fluid_id - 1)
+                                                    gas_alpha_R = gas_alpha_R + qR_prim_rs${XYZ}$_vf(j + 1, k, l, advxb + fluid_id - 1)
+                                                end if
+                                            end do
+                                        end if
+                                        liquid_alpha_L = qL_prim_rs${XYZ}$_vf(j, k, l, advxb)
+                                        liquid_alpha_R = qR_prim_rs${XYZ}$_vf(j + 1, k, l, advxb)
+                                        Y_fuel_L = 0._wp
+                                        Y_fuel_R = 0._wp
+                                        Y_O2_L = 0._wp
+                                        Y_O2_R = 0._wp
+                                        $:GPU_LOOP(parallelism='[seq]')
+                                        do i = chemxb, chemxe
+                                            Y_L = qL_prim_rs${XYZ}$_vf(j, k, l, i)
+                                            Y_R = qR_prim_rs${XYZ}$_vf(j + 1, k, l, i)
+                                            Y_face = xi_M*qL_prim_rs${XYZ}$_vf(j, k, l, i) + &
+                                                     xi_P*qR_prim_rs${XYZ}$_vf(j + 1, k, l, i)
+                                            sumY_raw = sumY_raw + Y_face
+                                            minY_raw = min(minY_raw, Y_face)
+                                            maxY_raw = max(maxY_raw, Y_face)
+                                            sumY_L = sumY_L + Y_L
+                                            sumY_R = sumY_R + Y_R
+                                            minY_L = min(minY_L, Y_L)
+                                            minY_R = min(minY_R, Y_R)
+                                            maxY_L = max(maxY_L, Y_L)
+                                            maxY_R = max(maxY_R, Y_R)
+                                            if (Y_L < 0._wp) negY_L = negY_L + 1
+                                            if (Y_R < 0._wp) negY_R = negY_R + 1
+                                            if (i == chemxb + fuel_species_id - 1) then
+                                                Y_fuel_L = Y_L
+                                                Y_fuel_R = Y_R
+                                            end if
+                                            if (i == chemxb + 10 - 1) then
+                                                Y_O2_L = Y_L
+                                                Y_O2_R = Y_R
+                                            end if
+                                        end do
+
+                                        if (sumY_raw /= sumY_raw .or. abs(sumY_raw) > huge(sumY_raw)) then
+                                            $:GPU_ATOMIC(atomic='write')
+                                            hllc_model3_species_face_nonfinite = 1
+                                        else if (sumY_raw <= sgm_eps) then
+                                            $:GPU_ATOMIC(atomic='write')
+                                            hllc_model3_species_face_degenerate = 1
+                                        else if (minY_raw < 0._wp .or. maxY_raw > 1._wp) then
+                                            $:GPU_ATOMIC(atomic='write')
+                                            hllc_model3_species_face_bounds = 1
+                                        else
+                                            normalization_factor = 1._wp/sumY_raw
+                                        end if
+
+                                        if (sumY_raw /= sumY_raw .or. abs(sumY_raw) > huge(sumY_raw) .or. &
+                                            sumY_raw <= sgm_eps .or. minY_raw < 0._wp .or. maxY_raw > 1._wp) then
+                                            $:GPU_ATOMIC(atomic='write')
+                                            hllc_model3_species_face_debug_found = 1
+                                            selected_side = 0
+                                            if (xi_M > 5.e-1_wp) selected_side = -1
+                                            if (xi_P > 5.e-1_wp) selected_side = 1
+                                            hllc_model3_species_face_debug_j = j
+                                            hllc_model3_species_face_debug_k = k
+                                            hllc_model3_species_face_debug_l = l
+                                            hllc_model3_species_face_debug_side = selected_side
+                                            hllc_model3_species_face_debug_neg_L = negY_L
+                                            hllc_model3_species_face_debug_neg_R = negY_R
+                                            hllc_model3_species_face_debug_sumY_raw = sumY_raw
+                                            hllc_model3_species_face_debug_minY_raw = minY_raw
+                                            hllc_model3_species_face_debug_maxY_raw = maxY_raw
+                                            hllc_model3_species_face_debug_alpha_g_L = gas_alpha_L
+                                            hllc_model3_species_face_debug_alpha_g_R = gas_alpha_R
+                                            hllc_model3_species_face_debug_alpha_l_L = liquid_alpha_L
+                                            hllc_model3_species_face_debug_alpha_l_R = liquid_alpha_R
+                                            hllc_model3_species_face_debug_rhog_L = gas_mass_L
+                                            hllc_model3_species_face_debug_rhog_R = gas_mass_R
+                                            hllc_model3_species_face_debug_rho_L = rho_L
+                                            hllc_model3_species_face_debug_rho_R = rho_R
+                                            hllc_model3_species_face_debug_pres_L = pres_L
+                                            hllc_model3_species_face_debug_pres_R = pres_R
+                                            hllc_model3_species_face_debug_sumrhoY_L = gas_mass_L*sumY_L
+                                            hllc_model3_species_face_debug_sumrhoY_R = gas_mass_R*sumY_R
+                                            hllc_model3_species_face_debug_minrhoY_L = gas_mass_L*minY_L
+                                            hllc_model3_species_face_debug_minrhoY_R = gas_mass_R*minY_R
+                                            hllc_model3_species_face_debug_maxrhoY_L = gas_mass_L*maxY_L
+                                            hllc_model3_species_face_debug_maxrhoY_R = gas_mass_R*maxY_R
+                                            hllc_model3_species_face_debug_Yfuel_L = Y_fuel_L
+                                            hllc_model3_species_face_debug_Yfuel_R = Y_fuel_R
+                                            hllc_model3_species_face_debug_rhoYfuel_L = gas_mass_L*Y_fuel_L
+                                            hllc_model3_species_face_debug_rhoYfuel_R = gas_mass_R*Y_fuel_R
+                                            hllc_model3_species_face_debug_YO2_L = Y_O2_L
+                                            hllc_model3_species_face_debug_YO2_R = Y_O2_R
+                                            hllc_model3_species_face_debug_rhoYO2_L = gas_mass_L*Y_O2_L
+                                            hllc_model3_species_face_debug_rhoYO2_R = gas_mass_R*Y_O2_R
+                                        end if
+                                    end if
+
+                                    $:GPU_LOOP(parallelism='[seq]')
+                                    do i = chemxb, chemxe
+                                        Y_face = xi_M*qL_prim_rs${XYZ}$_vf(j, k, l, i) + &
+                                                 xi_P*qR_prim_rs${XYZ}$_vf(j + 1, k, l, i)
+                                        if (hllc_model3_species_face_normalize_enabled) &
+                                            Y_face = Y_face*normalization_factor
+                                        flux_rs${XYZ}$_vf(j, k, l, i) = Y_face*gas_flux
+                                        flux_src_rs${XYZ}$_vf(j, k, l, i) = 0._wp
+                                    end do
+                                end if
 
                                 ! MOMENTUM FLUX.
                                 ! f = \rho u u - \sigma, q = \rho u, q_star = \xi * \rho*(s_star, v, w)
@@ -3658,6 +3874,84 @@ contains
                 end if
             end if
         #:endfor
+
+        if (hllc_model3_species_face_normalize_enabled) then
+            $:GPU_UPDATE(host='[hllc_model3_species_face_nonfinite,hllc_model3_species_face_degenerate,hllc_model3_species_face_bounds,hllc_model3_species_face_debug_found,hllc_model3_species_face_debug_j,hllc_model3_species_face_debug_k,hllc_model3_species_face_debug_l,hllc_model3_species_face_debug_side,hllc_model3_species_face_debug_neg_L,hllc_model3_species_face_debug_neg_R,hllc_model3_species_face_debug_sumY_raw,hllc_model3_species_face_debug_minY_raw,hllc_model3_species_face_debug_maxY_raw,hllc_model3_species_face_debug_alpha_g_L,hllc_model3_species_face_debug_alpha_g_R,hllc_model3_species_face_debug_alpha_l_L,hllc_model3_species_face_debug_alpha_l_R,hllc_model3_species_face_debug_rhog_L,hllc_model3_species_face_debug_rhog_R,hllc_model3_species_face_debug_rho_L,hllc_model3_species_face_debug_rho_R,hllc_model3_species_face_debug_pres_L,hllc_model3_species_face_debug_pres_R,hllc_model3_species_face_debug_sumrhoY_L,hllc_model3_species_face_debug_sumrhoY_R,hllc_model3_species_face_debug_minrhoY_L,hllc_model3_species_face_debug_minrhoY_R,hllc_model3_species_face_debug_maxrhoY_L,hllc_model3_species_face_debug_maxrhoY_R,hllc_model3_species_face_debug_Yfuel_L,hllc_model3_species_face_debug_Yfuel_R,hllc_model3_species_face_debug_rhoYfuel_L,hllc_model3_species_face_debug_rhoYfuel_R,hllc_model3_species_face_debug_YO2_L,hllc_model3_species_face_debug_YO2_R,hllc_model3_species_face_debug_rhoYO2_L,hllc_model3_species_face_debug_rhoYO2_R]')
+            if (hllc_model3_species_face_nonfinite /= 0 .or. &
+                hllc_model3_species_face_degenerate /= 0 .or. &
+                hllc_model3_species_face_bounds /= 0) then
+                write (output_unit, '(&
+                    &"TEMP_HLLC_MODEL3_SPECIES_FACE_NORMALIZE failure rank=",I0,&
+                    &" direction=",I0," nonfinite_sum=",I0," nonpositive_or_tiny_sum=",I0,&
+                    &" component_bounds=",I0)') proc_rank, norm_dir, &
+                    hllc_model3_species_face_nonfinite, hllc_model3_species_face_degenerate, &
+                    hllc_model3_species_face_bounds
+                if (hllc_model3_species_face_debug_found /= 0) then
+                    write (output_unit, '(&
+                        &"TEMP_HLLC_MODEL3_SPECIES_FACE_NORMALIZE_FACE rank=",I0,&
+                        &" direction=",I0," local_ijk=",3(I0,1X),&
+                        &" selected_side=",I0," selected_side_label=",A,&
+                        &" tiny_sum_threshold=",ES16.8,&
+                        &" sumY_raw=",ES16.8," minY_raw=",ES16.8," maxY_raw=",ES16.8)') &
+                        proc_rank, norm_dir, hllc_model3_species_face_debug_j, &
+                        hllc_model3_species_face_debug_k, hllc_model3_species_face_debug_l, &
+                        hllc_model3_species_face_debug_side, &
+                        merge("right", merge("left ", "mixed", hllc_model3_species_face_debug_side < 0), &
+                              hllc_model3_species_face_debug_side > 0), &
+                        sgm_eps, hllc_model3_species_face_debug_sumY_raw, &
+                        hllc_model3_species_face_debug_minY_raw, hllc_model3_species_face_debug_maxY_raw
+                    write (output_unit, '(&
+                        &"TEMP_HLLC_MODEL3_SPECIES_FACE_NORMALIZE_STATE rank=",I0,&
+                        &" direction=",I0,&
+                        &" alpha_g_L=",ES16.8," alpha_g_R=",ES16.8,&
+                        &" alpha_liq_L=",ES16.8," alpha_liq_R=",ES16.8,&
+                        &" rho_g_L=",ES16.8," rho_g_R=",ES16.8,&
+                        &" rho_total_L=",ES16.8," rho_total_R=",ES16.8,&
+                        &" pressure_L=",ES16.8," pressure_R=",ES16.8,&
+                        &" valid_gas_L=",L1," valid_gas_R=",L1)') &
+                        proc_rank, norm_dir, &
+                        hllc_model3_species_face_debug_alpha_g_L, hllc_model3_species_face_debug_alpha_g_R, &
+                        hllc_model3_species_face_debug_alpha_l_L, hllc_model3_species_face_debug_alpha_l_R, &
+                        hllc_model3_species_face_debug_rhog_L, hllc_model3_species_face_debug_rhog_R, &
+                        hllc_model3_species_face_debug_rho_L, hllc_model3_species_face_debug_rho_R, &
+                        hllc_model3_species_face_debug_pres_L, hllc_model3_species_face_debug_pres_R, &
+                        hllc_model3_species_face_debug_alpha_g_L > 5.e-1_wp .and. &
+                        hllc_model3_species_face_debug_rhog_L > 1.e-8_wp .and. &
+                        hllc_model3_species_face_debug_alpha_l_L < 5.e-1_wp, &
+                        hllc_model3_species_face_debug_alpha_g_R > 5.e-1_wp .and. &
+                        hllc_model3_species_face_debug_rhog_R > 1.e-8_wp .and. &
+                        hllc_model3_species_face_debug_alpha_l_R < 5.e-1_wp
+                    write (output_unit, '(&
+                        &"TEMP_HLLC_MODEL3_SPECIES_FACE_NORMALIZE_SPECIES rank=",I0,&
+                        &" direction=",I0,&
+                        &" sum_rhoY_L=",ES16.8," sum_rhoY_R=",ES16.8,&
+                        &" min_rhoY_L=",ES16.8," min_rhoY_R=",ES16.8,&
+                        &" max_rhoY_L=",ES16.8," max_rhoY_R=",ES16.8,&
+                        &" negative_species_L=",I0," negative_species_R=",I0,&
+                        &" Y_NC12H26_L=",ES16.8," Y_NC12H26_R=",ES16.8,&
+                        &" rhoY_NC12H26_L=",ES16.8," rhoY_NC12H26_R=",ES16.8,&
+                        &" Y_O2_L=",ES16.8," Y_O2_R=",ES16.8,&
+                        &" rhoY_O2_L=",ES16.8," rhoY_O2_R=",ES16.8)') &
+                        proc_rank, norm_dir, &
+                        hllc_model3_species_face_debug_sumrhoY_L, hllc_model3_species_face_debug_sumrhoY_R, &
+                        hllc_model3_species_face_debug_minrhoY_L, hllc_model3_species_face_debug_minrhoY_R, &
+                        hllc_model3_species_face_debug_maxrhoY_L, hllc_model3_species_face_debug_maxrhoY_R, &
+                        hllc_model3_species_face_debug_neg_L, hllc_model3_species_face_debug_neg_R, &
+                        hllc_model3_species_face_debug_Yfuel_L, hllc_model3_species_face_debug_Yfuel_R, &
+                        hllc_model3_species_face_debug_rhoYfuel_L, hllc_model3_species_face_debug_rhoYfuel_R, &
+                        hllc_model3_species_face_debug_YO2_L, hllc_model3_species_face_debug_YO2_R, &
+                        hllc_model3_species_face_debug_rhoYO2_L, hllc_model3_species_face_debug_rhoYO2_R
+                    write (output_unit, '(&
+                        &"TEMP_HLLC_MODEL3_SPECIES_FACE_NORMALIZE_KIND",&
+                        &" species_variables=primitive_Y_reconstructed_independently",&
+                        &" reported_rhoY=reconstructed_chemistry_gas_mass_times_reconstructed_Y",&
+                        &" valid_gas_threshold=alpha_g_gt_0p5_and_rhog_gt_1e-8_and_alpha_liq_lt_0p5",&
+                        &" O2_species_index_assumed_SK54=10")')
+                end if
+                call flush(output_unit)
+                call s_mpi_abort("TEMP_HLLC_MODEL3_SPECIES_FACE_NORMALIZE encountered an invalid reconstructed composition")
+            end if
+        end if
         ! Computing HLLC flux and source flux for Euler system of equations
 
         if (viscous .or. dummy) then
@@ -3964,6 +4258,26 @@ contains
         ! left, right, and average states of the Riemann problem, as well
         ! the Riemann problem solution
         integer :: i, j
+        character(len=32) :: env_value
+        integer :: env_status
+
+        env_value = ""
+        call get_environment_variable("TEMP_HLLC_MODEL3_SPECIES_FLUX_FIX", env_value, status=env_status)
+        hllc_model3_species_flux_fix_enabled = env_status == 0 .and. trim(env_value) == "1"
+        $:GPU_UPDATE(device='[hllc_model3_species_flux_fix_enabled]')
+        if (hllc_model3_species_flux_fix_enabled .and. proc_rank == 0) then
+            print '(A)', "TEMP_HLLC_MODEL3_SPECIES_FLUX_FIX enabled"
+            call flush(output_unit)
+        end if
+
+        env_value = ""
+        call get_environment_variable("TEMP_HLLC_MODEL3_SPECIES_FACE_NORMALIZE", env_value, status=env_status)
+        hllc_model3_species_face_normalize_enabled = env_status == 0 .and. trim(env_value) == "1"
+        $:GPU_UPDATE(device='[hllc_model3_species_face_normalize_enabled]')
+        if (hllc_model3_species_face_normalize_enabled .and. proc_rank == 0) then
+            print '(A)', "TEMP_HLLC_MODEL3_SPECIES_FACE_NORMALIZE enabled"
+            call flush(output_unit)
+        end if
 
         @:ALLOCATE(Gs_rs(1:num_fluids))
 

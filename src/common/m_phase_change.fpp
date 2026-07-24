@@ -18,9 +18,16 @@ module m_phase_change
 
     use m_mpi_proxy            !< Message passing interface (MPI) module proxy
 
+#ifdef MFC_SIMULATION
+    use m_mpi_common, only: s_mpi_allreduce_integer_sum, s_mpi_allreduce_sum, &
+                            s_mpi_allreduce_max, s_mpi_allreduce_min, s_mpi_abort
+#endif
+
     use m_variables_conversion !< State variables type conversion procedures
 
     use m_helper_basic         !< Functions to compare floating point numbers
+
+    use m_constants, only: pi
 
     implicit none
 
@@ -44,32 +51,59 @@ module m_phase_change
     !> @{
     real(wp) :: A, B, C, D
     !> @}
+    logical :: phase_change_fuel_mass_coupling_fix_enabled = .false.
+    logical :: phase_change_evap_only_enabled = .false.
+    real(wp), parameter :: phase_change_fuel_mass_tolerance = 1.e-12_wp
+    integer :: phase_change_signed_condensation_occurrences = 0
+    integer :: phase_change_signed_condensation_insufficient = 0
+    integer :: phase_change_signed_condensation_slight_negative = 0
+    logical :: phase_change_budget_debug_enabled = .false.
+    integer :: phase_change_budget_target_step_min = 0
+    integer :: phase_change_budget_target_step_max = huge(0)
+    integer :: phase_change_budget_cum_evap_cells = 0
+    integer :: phase_change_budget_cum_cond_cells = 0
+    integer :: phase_change_budget_cum_insufficient_cells = 0
+    real(wp) :: phase_change_budget_cum_evap_mass = 0._wp
+    real(wp) :: phase_change_budget_cum_cond_mass = 0._wp
+    real(wp) :: phase_change_budget_cum_net_mass = 0._wp
+    real(wp) :: phase_change_budget_cum_insufficient_mass = 0._wp
+    real(wp) :: phase_change_budget_max_evap_delta = 0._wp
+    real(wp) :: phase_change_budget_max_cond_delta = 0._wp
+    integer :: phase_change_evap_only_rejections = 0
+    real(wp) :: phase_change_evap_only_suppressed_mass = 0._wp
+    real(wp) :: phase_change_evap_only_max_delta = 0._wp
 
-    $:GPU_DECLARE(create='[A,B,C,D]')
+#ifdef MFC_SIMULATION
+    integer :: phase_change_signed_local_condensation = 0
+    integer :: phase_change_signed_local_insufficient = 0
+    integer :: phase_change_signed_local_slight_negative = 0
+    integer :: phase_change_signed_failure_claimed = 0
+    integer, dimension(3) :: phase_change_signed_failure_ijk = 0
+    real(wp), dimension(12) :: phase_change_signed_failure_data = 0._wp
+#endif
+
+    $:GPU_DECLARE(create='[A,B,C,D,phase_change_fuel_mass_coupling_fix_enabled,phase_change_evap_only_enabled,phase_change_budget_debug_enabled]')
+#ifdef MFC_SIMULATION
+    $:GPU_DECLARE(create='[phase_change_signed_local_condensation,phase_change_signed_local_insufficient,phase_change_signed_local_slight_negative,phase_change_signed_failure_claimed,phase_change_signed_failure_ijk,phase_change_signed_failure_data]')
+#endif
 
 contains
 
-    logical function s_zhang_evap_hang_diag_active(t_step)
-        integer, intent(in) :: t_step
+#ifdef MFC_SIMULATION
+    subroutine s_phase_relax_read_target_integer(name, value)
+        character(len=*), intent(in) :: name
+        integer, intent(inout) :: value
 
-        character(len=16) :: env_value
-        integer :: env_status
+        character(len=32) :: env_value
+        integer :: env_status, read_status, parsed_value
 
-        call get_environment_variable("TEMP_ZHANG_EVAP_HANG_DIAG", env_value, status=env_status)
-        s_zhang_evap_hang_diag_active = env_status == 0 .and. trim(env_value) == "1" &
-                                        .and. t_step >= 9100 .and. t_step <= 9120
-    end function s_zhang_evap_hang_diag_active
-
-    subroutine s_zhang_evap_hang_trace(t_step, stage, label)
-        integer, intent(in) :: t_step, stage
-        character(len=*), intent(in) :: label
-
-        if (.not. s_zhang_evap_hang_diag_active(t_step)) return
-
-        print '(" TEMP_ZHANG_EVAP_HANG_DIAG rank=", I6, " t_step=", I8, " stage=", I4, " ", A)', &
-            proc_rank, t_step, stage, trim(label)
-        call flush(output_unit)
-    end subroutine s_zhang_evap_hang_trace
+        env_value = ""
+        call get_environment_variable(name, env_value, status=env_status)
+        if (env_status /= 0 .or. len_trim(env_value) == 0) return
+        read (env_value, *, iostat=read_status) parsed_value
+        if (read_status == 0) value = parsed_value
+    end subroutine s_phase_relax_read_target_integer
+#endif
 
     !> @brief GPU-safe typed finite check for phase-change device routines.
     logical function s_is_finite_wp(x)
@@ -97,6 +131,9 @@ contains
         !!      selecting the phase change module that will be used
         !!      (pT- or pTg-equilibrium)
     impure subroutine s_initialize_phasechange_module
+        character(len=16) :: env_value
+        integer :: env_status
+
         ! variables used in the calculation of the saturation curves for fluids 1 and 2
         A = (gs_min(lp)*cvs(lp) - gs_min(vp)*cvs(vp) &
              + qvps(vp) - qvps(lp))/((gs_min(vp) - 1.0_wp)*cvs(vp))
@@ -108,6 +145,57 @@ contains
 
         D = ((gs_min(lp) - 1.0_wp)*cvs(lp)) &
             /((gs_min(vp) - 1.0_wp)*cvs(vp))
+
+#ifdef MFC_SIMULATION
+        env_value = ""
+        call get_environment_variable("TEMP_PHASE_CHANGE_FUEL_MASS_COUPLING_FIX", env_value, status=env_status)
+        phase_change_fuel_mass_coupling_fix_enabled = env_status == 0 .and. trim(env_value) == "1"
+        $:GPU_UPDATE(device='[phase_change_fuel_mass_coupling_fix_enabled]')
+        if (phase_change_fuel_mass_coupling_fix_enabled .and. proc_rank == 0) then
+            print '(A)', "TEMP_PHASE_CHANGE_FUEL_MASS_COUPLING_FIX enabled"
+            call flush(output_unit)
+        end if
+
+        env_value = ""
+        call get_environment_variable("TEMP_PHASE_CHANGE_EVAP_ONLY", env_value, status=env_status)
+        phase_change_evap_only_enabled = env_status == 0 .and. trim(env_value) == "1"
+        phase_change_evap_only_rejections = 0
+        phase_change_evap_only_suppressed_mass = 0._wp
+        phase_change_evap_only_max_delta = 0._wp
+        $:GPU_UPDATE(device='[phase_change_evap_only_enabled]')
+        if (phase_change_evap_only_enabled .and. proc_rank == 0) then
+            print '(A)', "TEMP_PHASE_CHANGE_EVAP_ONLY enabled validation_only=T"
+            call flush(output_unit)
+        end if
+
+        phase_change_signed_condensation_occurrences = 0
+        phase_change_signed_condensation_insufficient = 0
+        phase_change_signed_condensation_slight_negative = 0
+
+        env_value = ""
+        call get_environment_variable("TEMP_PHASE_CHANGE_BUDGET_DEBUG", env_value, status=env_status)
+        phase_change_budget_debug_enabled = env_status == 0 .and. trim(env_value) == "1"
+        call s_phase_relax_read_target_integer("TEMP_PHASE_CHANGE_BUDGET_STEP_MIN", &
+                                               phase_change_budget_target_step_min)
+        call s_phase_relax_read_target_integer("TEMP_PHASE_CHANGE_BUDGET_STEP_MAX", &
+                                               phase_change_budget_target_step_max)
+        phase_change_budget_cum_evap_cells = 0
+        phase_change_budget_cum_cond_cells = 0
+        phase_change_budget_cum_insufficient_cells = 0
+        phase_change_budget_cum_evap_mass = 0._wp
+        phase_change_budget_cum_cond_mass = 0._wp
+        phase_change_budget_cum_net_mass = 0._wp
+        phase_change_budget_cum_insufficient_mass = 0._wp
+        phase_change_budget_max_evap_delta = 0._wp
+        phase_change_budget_max_cond_delta = 0._wp
+        $:GPU_UPDATE(device='[phase_change_budget_debug_enabled]')
+        if (phase_change_budget_debug_enabled .and. proc_rank == 0) then
+            write (output_unit, '("TEMP_PHASE_CHANGE_BUDGET_DEBUG enabled step_min=",I0," step_max=",I0)') &
+                phase_change_budget_target_step_min, phase_change_budget_target_step_max
+            call flush(output_unit)
+        end if
+
+#endif
 
     end subroutine s_initialize_phasechange_module
 
@@ -130,9 +218,13 @@ contains
 #endif
         real(wp) :: pS, pSOV, pSSL !< equilibrium pressure for mixture, overheated vapor, and subcooled liquid
         real(wp) :: TS, TSOV, TSSL, TSatOV, TSatSL !< equilibrium temperature for mixture, overheated vapor, and subcooled liquid. Saturation Temperatures at overheated vapor and subcooled liquid
+        real(wp) :: no_transfer_pS, no_transfer_TS
         real(wp) :: rhoe, dynE, rhos !< total internal energy, kinetic energy, and total entropy
-        real(wp) :: rho, rM, m1, m2, m2_after, MCT !< total density, total reacting mass, individual reacting masses
+        real(wp) :: rho, rM, m1, m2, m2_after, delta_m_vapor, MCT !< total density, total reacting mass, individual reacting masses
         real(wp) :: TvF !< total volume fraction
+        real(wp) :: fuel_before_coupling
+        real(wp) :: fuel_candidate, failure_rho_g, failure_sum_rhoY
+        real(wp) :: failure_x, failure_y, failure_z
         logical :: pt_state_ok, ptg_state_ok
 
         ! $:GPU_DECLARE(create='[pS,pSOV,pSSL,TS,TSOV,TSSL,TSatOV,TSatSL]')
@@ -146,19 +238,116 @@ contains
 
         !< Generic loop iterators
         integer :: i, j, k, l
+#ifdef MFC_SIMULATION
+        integer :: report_step, report_stage
+        integer :: signed_failure_old_claim
+        integer :: signed_gas_idx, signed_fluid_id, signed_species_eqn
+        integer :: local_budget_evap_cells, global_budget_evap_cells
+        integer :: local_budget_cond_cells, global_budget_cond_cells
+        integer :: local_budget_insufficient_cells, global_budget_insufficient_cells
+        integer :: local_budget_interface_cond_cells, global_budget_interface_cond_cells
+        integer :: local_budget_liquid_cond_cells, global_budget_liquid_cond_cells
+        integer :: local_budget_gas_cond_cells, global_budget_gas_cond_cells
+        integer :: local_evap_only_rejections, global_evap_only_rejections
+        real(wp) :: local_budget_evap_mass, global_budget_evap_mass
+        real(wp) :: local_budget_cond_mass, global_budget_cond_mass
+        real(wp) :: local_budget_net_mass, global_budget_net_mass
+        real(wp) :: local_budget_insufficient_mass, global_budget_insufficient_mass
+        real(wp) :: local_budget_max_evap_delta, global_budget_max_evap_delta
+        real(wp) :: local_budget_max_cond_delta, global_budget_max_cond_delta
+        real(wp) :: local_budget_max_insufficient_ratio, global_budget_max_insufficient_ratio
+        real(wp) :: local_budget_min_alpha_liq, global_budget_min_alpha_liq
+        real(wp) :: local_budget_max_alpha_liq, global_budget_max_alpha_liq
+        real(wp) :: local_budget_min_alpha_vap, global_budget_min_alpha_vap
+        real(wp) :: local_budget_max_alpha_vap, global_budget_max_alpha_vap
+        real(wp) :: local_budget_min_alpha_air, global_budget_min_alpha_air
+        real(wp) :: local_budget_max_alpha_air, global_budget_max_alpha_air
+        real(wp) :: local_budget_min_pressure, global_budget_min_pressure
+        real(wp) :: local_budget_max_pressure, global_budget_max_pressure
+        real(wp) :: local_budget_min_temperature, global_budget_min_temperature
+        real(wp) :: local_budget_max_temperature, global_budget_max_temperature
+        real(wp) :: local_budget_min_vapor_arho, global_budget_min_vapor_arho
+        real(wp) :: local_budget_max_vapor_arho, global_budget_max_vapor_arho
+        real(wp) :: local_budget_min_fuel, global_budget_min_fuel
+        real(wp) :: local_budget_max_fuel, global_budget_max_fuel
+        real(wp) :: local_budget_min_request_ratio, global_budget_min_request_ratio
+        real(wp) :: local_budget_max_request_ratio, global_budget_max_request_ratio
+        real(wp) :: local_evap_only_suppressed_mass, global_evap_only_suppressed_mass
+        real(wp) :: local_evap_only_max_delta, global_evap_only_max_delta
+        real(wp) :: local_evap_only_min_alpha_liq, global_evap_only_min_alpha_liq
+        real(wp) :: local_evap_only_max_alpha_liq, global_evap_only_max_alpha_liq
+        real(wp) :: local_evap_only_min_pressure, global_evap_only_min_pressure
+        real(wp) :: local_evap_only_max_pressure, global_evap_only_max_pressure
+        real(wp) :: local_evap_only_min_temperature, global_evap_only_min_temperature
+        real(wp) :: local_evap_only_max_temperature, global_evap_only_max_temperature
+        real(wp) :: budget_cell_volume, budget_delta_m_vapor, budget_abs_delta
+        real(wp) :: budget_cond_requested, budget_fuel_available, budget_ratio
+        real(wp) :: budget_alpha_liq, budget_alpha_vap, budget_alpha_air
+        real(wp) :: budget_evap_ratio
+        real(wp) :: evap_only_proposed_delta, evap_only_suppressed_delta
+#endif
 
 #ifdef MFC_SIMULATION
-        if (present(t_step_diag)) then
-            if (present(stage_diag)) then
-                call s_zhang_evap_hang_trace(t_step_diag, stage_diag, "S_INFINITE_RELAXATION_K_BEGIN")
-            else
-                call s_zhang_evap_hang_trace(t_step_diag, 0, "S_INFINITE_RELAXATION_K_BEGIN")
-            end if
+        report_step = -1
+        report_stage = -1
+        if (present(t_step_diag)) report_step = t_step_diag
+        if (present(stage_diag)) report_stage = stage_diag
+
+        if (phase_change_fuel_mass_coupling_fix_enabled) then
+            phase_change_signed_local_condensation = 0
+            phase_change_signed_local_insufficient = 0
+            phase_change_signed_local_slight_negative = 0
+            phase_change_signed_failure_claimed = 0
+            phase_change_signed_failure_ijk = 0
+            phase_change_signed_failure_data = 0._wp
+            $:GPU_UPDATE(device='[phase_change_signed_local_condensation,phase_change_signed_local_insufficient,phase_change_signed_local_slight_negative,phase_change_signed_failure_claimed,phase_change_signed_failure_ijk,phase_change_signed_failure_data]')
         end if
+
+        local_budget_evap_cells = 0
+        local_budget_cond_cells = 0
+        local_budget_insufficient_cells = 0
+        local_budget_interface_cond_cells = 0
+        local_budget_liquid_cond_cells = 0
+        local_budget_gas_cond_cells = 0
+        local_evap_only_rejections = 0
+        local_budget_evap_mass = 0._wp
+        local_budget_cond_mass = 0._wp
+        local_budget_net_mass = 0._wp
+        local_budget_insufficient_mass = 0._wp
+        local_budget_max_evap_delta = 0._wp
+        local_budget_max_cond_delta = 0._wp
+        local_budget_max_insufficient_ratio = 0._wp
+        local_budget_min_alpha_liq = huge(1._wp)
+        local_budget_max_alpha_liq = -huge(1._wp)
+        local_budget_min_alpha_vap = huge(1._wp)
+        local_budget_max_alpha_vap = -huge(1._wp)
+        local_budget_min_alpha_air = huge(1._wp)
+        local_budget_max_alpha_air = -huge(1._wp)
+        local_budget_min_pressure = huge(1._wp)
+        local_budget_max_pressure = -huge(1._wp)
+        local_budget_min_temperature = huge(1._wp)
+        local_budget_max_temperature = -huge(1._wp)
+        local_budget_min_vapor_arho = huge(1._wp)
+        local_budget_max_vapor_arho = -huge(1._wp)
+        local_budget_min_fuel = huge(1._wp)
+        local_budget_max_fuel = -huge(1._wp)
+        local_budget_min_request_ratio = huge(1._wp)
+        local_budget_max_request_ratio = -huge(1._wp)
+        local_evap_only_suppressed_mass = 0._wp
+        local_evap_only_max_delta = 0._wp
+        local_evap_only_min_alpha_liq = huge(1._wp)
+        local_evap_only_max_alpha_liq = -huge(1._wp)
+        local_evap_only_min_pressure = huge(1._wp)
+        local_evap_only_max_pressure = -huge(1._wp)
+        local_evap_only_min_temperature = huge(1._wp)
+        local_evap_only_max_temperature = -huge(1._wp)
+
 #endif
 
         ! starting equilibrium solver
-        $:GPU_PARALLEL_LOOP(collapse=3, private='[i,j,k,l,p_infOV, p_infpT, p_infSL, sk, hk, gk, ek, rhok,pS, pSOV, pSSL, TS, TSOV, TSatOV, TSatSL, TSSL, rhoe, dynE, rhos, rho, rM, m1, m2, m2_after, MCT, TvF, pt_state_ok, ptg_state_ok]')
+            $:GPU_PARALLEL_LOOP(collapse=3, private='[i,j,k,l,p_infOV, p_infpT, p_infSL, sk, hk, gk, ek, rhok,pS, pSOV, pSSL, TS, TSOV, TSatOV, TSatSL, TSSL, no_transfer_pS, no_transfer_TS, rhoe, dynE, rhos, rho, rM, m1, m2, m2_after, delta_m_vapor, MCT, TvF, pt_state_ok, ptg_state_ok, fuel_before_coupling,fuel_candidate,failure_rho_g,failure_sum_rhoY,signed_failure_old_claim,signed_gas_idx,signed_fluid_id,signed_species_eqn,budget_cell_volume,budget_delta_m_vapor,budget_abs_delta,budget_cond_requested,budget_fuel_available,budget_ratio,budget_alpha_liq,budget_alpha_vap,budget_alpha_air,evap_only_proposed_delta,evap_only_suppressed_delta]', &
+            reduction='[[local_budget_evap_cells,local_budget_cond_cells,local_budget_insufficient_cells,local_budget_interface_cond_cells,local_budget_liquid_cond_cells,local_budget_gas_cond_cells,local_evap_only_rejections,local_budget_evap_mass,local_budget_cond_mass,local_budget_net_mass,local_budget_insufficient_mass,local_evap_only_suppressed_mass],[local_budget_max_evap_delta,local_budget_max_cond_delta,local_budget_max_insufficient_ratio,local_budget_max_alpha_liq,local_budget_max_alpha_vap,local_budget_max_alpha_air,local_budget_max_pressure,local_budget_max_temperature,local_budget_max_vapor_arho,local_budget_max_fuel,local_budget_max_request_ratio,local_evap_only_max_delta,local_evap_only_max_alpha_liq,local_evap_only_max_pressure,local_evap_only_max_temperature],[local_budget_min_alpha_liq,local_budget_min_alpha_vap,local_budget_min_alpha_air,local_budget_min_pressure,local_budget_min_temperature,local_budget_min_vapor_arho,local_budget_min_fuel,local_budget_min_request_ratio,local_evap_only_min_alpha_liq,local_evap_only_min_pressure,local_evap_only_min_temperature]]', &
+            reductionOp='[+,MAX,MIN]')
         do j = 0, m
             do k = 0, n
                 do l = 0, p
@@ -187,7 +376,6 @@ contains
                     m1 = q_cons_vf(lp + contxb - 1)%sf(j, k, l)
 
                     m2 = q_cons_vf(vp + contxb - 1)%sf(j, k, l)
-
                     ! kinetic energy as an auxiliary variable to the calculation of the total internal energy
                     dynE = 0.0_wp
                     $:GPU_LOOP(parallelism='[seq]')
@@ -205,7 +393,8 @@ contains
                     ! Calling pT-equilibrium for either finishing phase-change module, or as an IC for the pTg-equilibrium
                     ! for this case, MFL cannot be either 0 or 1, so I chose it to be 2
                     call s_infinite_pt_relaxation_k(j, k, l, 2, pS, p_infpT, q_cons_vf, rhoe, TS)
-
+                    no_transfer_pS = pS
+                    no_transfer_TS = TS
                     pt_state_ok = s_is_finite_wp(pS) .and. s_is_finite_wp(TS) .and. &
                                   pS > 0._wp .and. TS > 0._wp
 
@@ -238,7 +427,6 @@ contains
 
                         ! calling pT-equilibrium for overheated vapor, which is MFL = 0
                         call s_infinite_pt_relaxation_k(j, k, l, 0, pSOV, p_infOV, q_cons_vf, rhoe, TSOV)
-
                         ! calculating Saturation temperature
                         call s_TSat(pSOV, TSatOV, TSOV)
 
@@ -251,7 +439,6 @@ contains
 
                         ! calling pT-equilibrium for subcooled liquid, which is MFL = 1
                         call s_infinite_pt_relaxation_k(j, k, l, 1, pSSL, p_infSL, q_cons_vf, rhoe, TSSL)
-
                         ! calculating Saturation temperature
                         call s_TSat(pSSL, TSatSL, TSSL)
 
@@ -317,6 +504,38 @@ contains
 
                     end if
 
+#ifdef MFC_SIMULATION
+                    if (phase_change_evap_only_enabled) then
+                        evap_only_proposed_delta = q_cons_vf(vp + contxb - 1)%sf(j, k, l) - m2
+                        if (evap_only_proposed_delta < 0._wp) then
+                            evap_only_suppressed_delta = -evap_only_proposed_delta
+                            budget_cell_volume = dx(j)
+                            if (n > 0) budget_cell_volume = budget_cell_volume*dy(k)
+                            if (p > 0) budget_cell_volume = budget_cell_volume*dz(l)
+                            if (cyl_coord .and. n > 0 .and. p == 0) &
+                                budget_cell_volume = budget_cell_volume*2._wp*pi*y_cc(k)
+                            local_evap_only_rejections = local_evap_only_rejections + 1
+                            local_evap_only_suppressed_mass = local_evap_only_suppressed_mass + &
+                                                              evap_only_suppressed_delta*budget_cell_volume
+                            local_evap_only_max_delta = max(local_evap_only_max_delta, &
+                                                            evap_only_suppressed_delta)
+                            local_evap_only_min_alpha_liq = min(local_evap_only_min_alpha_liq, &
+                                                                q_cons_vf(advxb)%sf(j, k, l))
+                            local_evap_only_max_alpha_liq = max(local_evap_only_max_alpha_liq, &
+                                                                q_cons_vf(advxb)%sf(j, k, l))
+                            local_evap_only_min_pressure = min(local_evap_only_min_pressure, pS)
+                            local_evap_only_max_pressure = max(local_evap_only_max_pressure, pS)
+                            local_evap_only_min_temperature = min(local_evap_only_min_temperature, TS)
+                            local_evap_only_max_temperature = max(local_evap_only_max_temperature, TS)
+
+                            q_cons_vf(lp + contxb - 1)%sf(j, k, l) = m1
+                            q_cons_vf(vp + contxb - 1)%sf(j, k, l) = m2
+                            pS = no_transfer_pS
+                            TS = no_transfer_TS
+                        end if
+                    end if
+#endif
+
                     ! Calculations AFTER equilibrium
 
                     $:GPU_LOOP(parallelism='[seq]')
@@ -362,7 +581,146 @@ contains
 
 #ifdef MFC_SIMULATION
                     m2_after = q_cons_vf(vp + contxb - 1)%sf(j, k, l)
-                    m_dot_evap%sf(j, k, l) = (m2_after - m2)/relax_dt
+                    delta_m_vapor = m2_after - m2
+                    m_dot_evap%sf(j, k, l) = delta_m_vapor/relax_dt
+                    fuel_before_coupling = 0._wp
+                    if (chemistry .and. fuel_species_id >= 1 .and. &
+                        fuel_species_id <= (chemxe - chemxb + 1)) then
+                        fuel_before_coupling = q_cons_vf(chemxb + fuel_species_id - 1)%sf(j, k, l)
+                    end if
+                    if (phase_change_budget_debug_enabled .and. &
+                        report_step >= phase_change_budget_target_step_min .and. &
+                        report_step <= phase_change_budget_target_step_max) then
+                        budget_cell_volume = dx(j)
+                        if (n > 0) budget_cell_volume = budget_cell_volume*dy(k)
+                        if (p > 0) budget_cell_volume = budget_cell_volume*dz(l)
+                        if (cyl_coord .and. n > 0 .and. p == 0) &
+                            budget_cell_volume = budget_cell_volume*2._wp*pi*y_cc(k)
+                        budget_delta_m_vapor = delta_m_vapor
+                        budget_abs_delta = abs(budget_delta_m_vapor)
+                        local_budget_net_mass = local_budget_net_mass + &
+                                                budget_delta_m_vapor*budget_cell_volume
+                        if (budget_delta_m_vapor > 0._wp) then
+                            local_budget_evap_cells = local_budget_evap_cells + 1
+                            local_budget_evap_mass = local_budget_evap_mass + &
+                                                     budget_delta_m_vapor*budget_cell_volume
+                            local_budget_max_evap_delta = max(local_budget_max_evap_delta, &
+                                                               budget_delta_m_vapor)
+                        elseif (budget_delta_m_vapor < 0._wp) then
+                            budget_alpha_liq = q_cons_vf(advxb)%sf(j, k, l)
+                            budget_alpha_vap = q_cons_vf(advxb + 1)%sf(j, k, l)
+                            budget_alpha_air = 0._wp
+                            if (num_fluids >= 3) budget_alpha_air = q_cons_vf(advxb + 2)%sf(j, k, l)
+                            budget_cond_requested = -budget_delta_m_vapor
+                            budget_fuel_available = fuel_before_coupling
+                            budget_ratio = budget_cond_requested/max(budget_fuel_available, &
+                                                                      phase_change_fuel_mass_tolerance)
+                            local_budget_cond_cells = local_budget_cond_cells + 1
+                            local_budget_cond_mass = local_budget_cond_mass + &
+                                                     budget_cond_requested*budget_cell_volume
+                            local_budget_max_cond_delta = max(local_budget_max_cond_delta, &
+                                                               budget_cond_requested)
+                            local_budget_min_alpha_liq = min(local_budget_min_alpha_liq, budget_alpha_liq)
+                            local_budget_max_alpha_liq = max(local_budget_max_alpha_liq, budget_alpha_liq)
+                            local_budget_min_alpha_vap = min(local_budget_min_alpha_vap, budget_alpha_vap)
+                            local_budget_max_alpha_vap = max(local_budget_max_alpha_vap, budget_alpha_vap)
+                            local_budget_min_alpha_air = min(local_budget_min_alpha_air, budget_alpha_air)
+                            local_budget_max_alpha_air = max(local_budget_max_alpha_air, budget_alpha_air)
+                            local_budget_min_pressure = min(local_budget_min_pressure, pS)
+                            local_budget_max_pressure = max(local_budget_max_pressure, pS)
+                            local_budget_min_temperature = min(local_budget_min_temperature, TS)
+                            local_budget_max_temperature = max(local_budget_max_temperature, TS)
+                            local_budget_min_vapor_arho = min(local_budget_min_vapor_arho, m2_after)
+                            local_budget_max_vapor_arho = max(local_budget_max_vapor_arho, m2_after)
+                            local_budget_min_fuel = min(local_budget_min_fuel, budget_fuel_available)
+                            local_budget_max_fuel = max(local_budget_max_fuel, budget_fuel_available)
+                            local_budget_min_request_ratio = min(local_budget_min_request_ratio, budget_ratio)
+                            local_budget_max_request_ratio = max(local_budget_max_request_ratio, budget_ratio)
+                            if (budget_cond_requested > budget_fuel_available + &
+                                phase_change_fuel_mass_tolerance) then
+                                local_budget_insufficient_cells = local_budget_insufficient_cells + 1
+                                local_budget_insufficient_mass = local_budget_insufficient_mass + &
+                                    (budget_cond_requested - budget_fuel_available)*budget_cell_volume
+                                local_budget_max_insufficient_ratio = max(local_budget_max_insufficient_ratio, &
+                                                                           budget_ratio)
+                            end if
+                            if (budget_alpha_liq > 0.9_wp) then
+                                local_budget_liquid_cond_cells = local_budget_liquid_cond_cells + 1
+                            elseif (budget_alpha_liq < 0.1_wp .and. budget_alpha_vap + budget_alpha_air > 0.9_wp) then
+                                local_budget_gas_cond_cells = local_budget_gas_cond_cells + 1
+                            else
+                                local_budget_interface_cond_cells = local_budget_interface_cond_cells + 1
+                            end if
+                        end if
+                    end if
+                    if (chemistry .and. evap_species_source .and. phase_change_fuel_mass_coupling_fix_enabled .and. &
+                        fuel_species_id >= 1 .and. fuel_species_id <= (chemxe - chemxb + 1)) then
+                        fuel_candidate = fuel_before_coupling + delta_m_vapor
+                        if (delta_m_vapor < 0._wp) then
+                            $:GPU_ATOMIC(atomic='update')
+                            phase_change_signed_local_condensation = phase_change_signed_local_condensation + 1
+                        end if
+                        if (delta_m_vapor < 0._wp .and. fuel_candidate < -phase_change_fuel_mass_tolerance) then
+                            $:GPU_ATOMIC(atomic='update')
+                            phase_change_signed_local_insufficient = phase_change_signed_local_insufficient + 1
+#ifdef MFC_OpenACC
+                            !$acc atomic capture
+#elif defined(MFC_OpenMP)
+                            !$omp atomic capture
+#endif
+                            signed_failure_old_claim = phase_change_signed_failure_claimed
+                            phase_change_signed_failure_claimed = 1
+#ifdef MFC_OpenACC
+                            !$acc end atomic
+#elif defined(MFC_OpenMP)
+                            !$omp end atomic
+#endif
+                            if (signed_failure_old_claim == 0) then
+                                failure_rho_g = 0._wp
+                                if (num_fluids == 1) then
+                                    failure_rho_g = q_cons_vf(contxe)%sf(j, k, l)
+                                elseif (chem_gas_num_fluids <= 0) then
+                                    signed_fluid_id = chem_gas_fluid_id
+                                    if (signed_fluid_id >= 1 .and. signed_fluid_id <= num_fluids) &
+                                        failure_rho_g = q_cons_vf(contxb + signed_fluid_id - 1)%sf(j, k, l)
+                                else
+                                    $:GPU_LOOP(parallelism='[seq]')
+                                    do signed_gas_idx = 1, chem_gas_num_fluids
+                                        signed_fluid_id = chem_gas_fluid_ids(signed_gas_idx)
+                                        if (signed_fluid_id >= 1 .and. signed_fluid_id <= num_fluids) &
+                                            failure_rho_g = failure_rho_g + &
+                                                q_cons_vf(contxb + signed_fluid_id - 1)%sf(j, k, l)
+                                    end do
+                                end if
+                                failure_sum_rhoY = 0._wp
+                                $:GPU_LOOP(parallelism='[seq]')
+                                do signed_species_eqn = chemxb, chemxe
+                                    failure_sum_rhoY = failure_sum_rhoY + &
+                                        q_cons_vf(signed_species_eqn)%sf(j, k, l)
+                                end do
+                                phase_change_signed_failure_ijk = (/j, k, l/)
+                                phase_change_signed_failure_data(1) = fuel_before_coupling
+                                phase_change_signed_failure_data(2) = delta_m_vapor
+                                phase_change_signed_failure_data(3) = fuel_candidate
+                                phase_change_signed_failure_data(4) = failure_rho_g
+                                phase_change_signed_failure_data(5) = failure_sum_rhoY
+                                phase_change_signed_failure_data(6) = q_cons_vf(advxb)%sf(j, k, l)
+                                phase_change_signed_failure_data(7) = q_cons_vf(advxb + 1)%sf(j, k, l)
+                                phase_change_signed_failure_data(8) = q_cons_vf(advxb + 2)%sf(j, k, l)
+                                phase_change_signed_failure_data(9) = pS
+                                phase_change_signed_failure_data(10) = TS
+                                phase_change_signed_failure_data(11) = m2
+                                phase_change_signed_failure_data(12) = m2_after
+                            end if
+                        else
+                            q_cons_vf(chemxb + fuel_species_id - 1)%sf(j, k, l) = fuel_candidate
+                            if (fuel_candidate < 0._wp) then
+                                $:GPU_ATOMIC(atomic='update')
+                                phase_change_signed_local_slight_negative = &
+                                    phase_change_signed_local_slight_negative + 1
+                            end if
+                        end if
+                    end if
 #endif
                 end do
             end do
@@ -370,13 +728,221 @@ contains
         $:END_GPU_PARALLEL_LOOP()
 
 #ifdef MFC_SIMULATION
-        if (present(t_step_diag)) then
-            if (present(stage_diag)) then
-                call s_zhang_evap_hang_trace(t_step_diag, stage_diag, "S_INFINITE_RELAXATION_K_END")
-            else
-                call s_zhang_evap_hang_trace(t_step_diag, 0, "S_INFINITE_RELAXATION_K_END")
+        if (phase_change_evap_only_enabled) then
+            call s_mpi_allreduce_integer_sum(local_evap_only_rejections, &
+                                             global_evap_only_rejections)
+            call s_mpi_allreduce_sum(local_evap_only_suppressed_mass, &
+                                     global_evap_only_suppressed_mass)
+            call s_mpi_allreduce_max(local_evap_only_max_delta, &
+                                     global_evap_only_max_delta)
+            call s_mpi_allreduce_min(local_evap_only_min_alpha_liq, &
+                                     global_evap_only_min_alpha_liq)
+            call s_mpi_allreduce_max(local_evap_only_max_alpha_liq, &
+                                     global_evap_only_max_alpha_liq)
+            call s_mpi_allreduce_min(local_evap_only_min_pressure, &
+                                     global_evap_only_min_pressure)
+            call s_mpi_allreduce_max(local_evap_only_max_pressure, &
+                                     global_evap_only_max_pressure)
+            call s_mpi_allreduce_min(local_evap_only_min_temperature, &
+                                     global_evap_only_min_temperature)
+            call s_mpi_allreduce_max(local_evap_only_max_temperature, &
+                                     global_evap_only_max_temperature)
+            phase_change_evap_only_rejections = phase_change_evap_only_rejections + &
+                                                global_evap_only_rejections
+            phase_change_evap_only_suppressed_mass = phase_change_evap_only_suppressed_mass + &
+                                                     global_evap_only_suppressed_mass
+            phase_change_evap_only_max_delta = max(phase_change_evap_only_max_delta, &
+                                                   global_evap_only_max_delta)
+            if (proc_rank == 0 .and. global_evap_only_rejections > 0) then
+                write (output_unit, '(&
+                    &"TEMP_PHASE_CHANGE_EVAP_ONLY t_step=",I0," stage=",I0,&
+                    &" rejected_count=",I0," cumulative_rejected_count=",I0,&
+                    &" suppressed_mass=",ES16.8,&
+                    &" cumulative_suppressed_mass=",ES16.8,&
+                    &" max_proposed_cond_delta_rho=",ES16.8,&
+                    &" cumulative_max_proposed_cond_delta_rho=",ES16.8,&
+                    &" alpha_liq_min=",ES16.8," alpha_liq_max=",ES16.8,&
+                    &" pressure_min=",ES16.8," pressure_max=",ES16.8,&
+                    &" temperature_min=",ES16.8," temperature_max=",ES16.8,&
+                    &" no_transfer_committed=T validation_only=T")') &
+                    report_step, report_stage, global_evap_only_rejections, &
+                    phase_change_evap_only_rejections, global_evap_only_suppressed_mass, &
+                    phase_change_evap_only_suppressed_mass, global_evap_only_max_delta, &
+                    phase_change_evap_only_max_delta, &
+                    merge(global_evap_only_min_alpha_liq, 0._wp, global_evap_only_rejections > 0), &
+                    merge(global_evap_only_max_alpha_liq, 0._wp, global_evap_only_rejections > 0), &
+                    merge(global_evap_only_min_pressure, 0._wp, global_evap_only_rejections > 0), &
+                    merge(global_evap_only_max_pressure, 0._wp, global_evap_only_rejections > 0), &
+                    merge(global_evap_only_min_temperature, 0._wp, global_evap_only_rejections > 0), &
+                    merge(global_evap_only_max_temperature, 0._wp, global_evap_only_rejections > 0)
+                call flush(output_unit)
             end if
         end if
+
+        if (phase_change_budget_debug_enabled .and. &
+            report_step >= phase_change_budget_target_step_min .and. &
+            report_step <= phase_change_budget_target_step_max) then
+            call s_mpi_allreduce_integer_sum(local_budget_evap_cells, global_budget_evap_cells)
+            call s_mpi_allreduce_integer_sum(local_budget_cond_cells, global_budget_cond_cells)
+            call s_mpi_allreduce_integer_sum(local_budget_insufficient_cells, &
+                                             global_budget_insufficient_cells)
+            call s_mpi_allreduce_integer_sum(local_budget_interface_cond_cells, &
+                                             global_budget_interface_cond_cells)
+            call s_mpi_allreduce_integer_sum(local_budget_liquid_cond_cells, &
+                                             global_budget_liquid_cond_cells)
+            call s_mpi_allreduce_integer_sum(local_budget_gas_cond_cells, &
+                                             global_budget_gas_cond_cells)
+            call s_mpi_allreduce_sum(local_budget_evap_mass, global_budget_evap_mass)
+            call s_mpi_allreduce_sum(local_budget_cond_mass, global_budget_cond_mass)
+            call s_mpi_allreduce_sum(local_budget_net_mass, global_budget_net_mass)
+            call s_mpi_allreduce_sum(local_budget_insufficient_mass, &
+                                     global_budget_insufficient_mass)
+            call s_mpi_allreduce_max(local_budget_max_evap_delta, global_budget_max_evap_delta)
+            call s_mpi_allreduce_max(local_budget_max_cond_delta, global_budget_max_cond_delta)
+            call s_mpi_allreduce_max(local_budget_max_insufficient_ratio, &
+                                     global_budget_max_insufficient_ratio)
+            call s_mpi_allreduce_min(local_budget_min_alpha_liq, global_budget_min_alpha_liq)
+            call s_mpi_allreduce_max(local_budget_max_alpha_liq, global_budget_max_alpha_liq)
+            call s_mpi_allreduce_min(local_budget_min_alpha_vap, global_budget_min_alpha_vap)
+            call s_mpi_allreduce_max(local_budget_max_alpha_vap, global_budget_max_alpha_vap)
+            call s_mpi_allreduce_min(local_budget_min_alpha_air, global_budget_min_alpha_air)
+            call s_mpi_allreduce_max(local_budget_max_alpha_air, global_budget_max_alpha_air)
+            call s_mpi_allreduce_min(local_budget_min_pressure, global_budget_min_pressure)
+            call s_mpi_allreduce_max(local_budget_max_pressure, global_budget_max_pressure)
+            call s_mpi_allreduce_min(local_budget_min_temperature, global_budget_min_temperature)
+            call s_mpi_allreduce_max(local_budget_max_temperature, global_budget_max_temperature)
+            call s_mpi_allreduce_min(local_budget_min_vapor_arho, global_budget_min_vapor_arho)
+            call s_mpi_allreduce_max(local_budget_max_vapor_arho, global_budget_max_vapor_arho)
+            call s_mpi_allreduce_min(local_budget_min_fuel, global_budget_min_fuel)
+            call s_mpi_allreduce_max(local_budget_max_fuel, global_budget_max_fuel)
+            call s_mpi_allreduce_min(local_budget_min_request_ratio, global_budget_min_request_ratio)
+            call s_mpi_allreduce_max(local_budget_max_request_ratio, global_budget_max_request_ratio)
+
+            phase_change_budget_cum_evap_cells = phase_change_budget_cum_evap_cells + &
+                                                 global_budget_evap_cells
+            phase_change_budget_cum_cond_cells = phase_change_budget_cum_cond_cells + &
+                                                 global_budget_cond_cells
+            phase_change_budget_cum_insufficient_cells = &
+                phase_change_budget_cum_insufficient_cells + global_budget_insufficient_cells
+            phase_change_budget_cum_evap_mass = phase_change_budget_cum_evap_mass + &
+                                                global_budget_evap_mass
+            phase_change_budget_cum_cond_mass = phase_change_budget_cum_cond_mass + &
+                                                global_budget_cond_mass
+            phase_change_budget_cum_net_mass = phase_change_budget_cum_net_mass + &
+                                               global_budget_net_mass
+            phase_change_budget_cum_insufficient_mass = &
+                phase_change_budget_cum_insufficient_mass + global_budget_insufficient_mass
+            phase_change_budget_max_evap_delta = max(phase_change_budget_max_evap_delta, &
+                                                     global_budget_max_evap_delta)
+            phase_change_budget_max_cond_delta = max(phase_change_budget_max_cond_delta, &
+                                                     global_budget_max_cond_delta)
+
+            budget_evap_ratio = 0._wp
+            if (global_budget_evap_mass > 0._wp) &
+                budget_evap_ratio = global_budget_cond_mass/global_budget_evap_mass
+            if (proc_rank == 0) then
+                write (output_unit, '(&
+                    &"TEMP_PHASE_CHANGE_BUDGET t_step=",I0," stage=",I0,&
+                    &" evap_cells=",I0," cond_cells=",I0,&
+                    &" insufficient_cells=",I0,&
+                    &" cond_liquid_cells=",I0," cond_interface_cells=",I0,&
+                    &" cond_gas_cells=",I0,&
+                    &" evap_mass=",ES16.8," cond_mass=",ES16.8,&
+                    &" net_mass=",ES16.8," cond_evap_ratio=",ES16.8,&
+                    &" cum_evap_mass=",ES16.8," cum_cond_mass=",ES16.8,&
+                    &" cum_net_mass=",ES16.8," cum_cond_evap_ratio=",ES16.8,&
+                    &" max_evap_delta_rho=",ES16.8,&
+                    &" max_cond_delta_rho=",ES16.8,&
+                    &" insufficient_excess_mass=",ES16.8,&
+                    &" cum_insufficient_excess_mass=",ES16.8,&
+                    &" max_insufficient_ratio=",ES16.8,&
+                    &" alpha_liq_min=",ES16.8," alpha_liq_max=",ES16.8,&
+                    &" alpha_vap_min=",ES16.8," alpha_vap_max=",ES16.8,&
+                    &" alpha_air_min=",ES16.8," alpha_air_max=",ES16.8,&
+                    &" pressure_min=",ES16.8," pressure_max=",ES16.8,&
+                    &" temperature_min=",ES16.8," temperature_max=",ES16.8,&
+                    &" vapor_arho_min=",ES16.8," vapor_arho_max=",ES16.8,&
+                    &" fuel_rhoY_min=",ES16.8," fuel_rhoY_max=",ES16.8,&
+                    &" requested_over_fuel_min=",ES16.8,&
+                    &" requested_over_fuel_max=",ES16.8)') &
+                    report_step, report_stage, global_budget_evap_cells, global_budget_cond_cells, &
+                    global_budget_insufficient_cells, global_budget_liquid_cond_cells, &
+                    global_budget_interface_cond_cells, global_budget_gas_cond_cells, &
+                    global_budget_evap_mass, global_budget_cond_mass, global_budget_net_mass, &
+                    budget_evap_ratio, phase_change_budget_cum_evap_mass, &
+                    phase_change_budget_cum_cond_mass, phase_change_budget_cum_net_mass, &
+                    merge(phase_change_budget_cum_cond_mass/phase_change_budget_cum_evap_mass, &
+                          0._wp, phase_change_budget_cum_evap_mass > 0._wp), &
+                    global_budget_max_evap_delta, global_budget_max_cond_delta, &
+                    global_budget_insufficient_mass, phase_change_budget_cum_insufficient_mass, &
+                    global_budget_max_insufficient_ratio, &
+                    merge(global_budget_min_alpha_liq, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_max_alpha_liq, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_min_alpha_vap, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_max_alpha_vap, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_min_alpha_air, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_max_alpha_air, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_min_pressure, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_max_pressure, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_min_temperature, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_max_temperature, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_min_vapor_arho, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_max_vapor_arho, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_min_fuel, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_max_fuel, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_min_request_ratio, 0._wp, global_budget_cond_cells > 0), &
+                    merge(global_budget_max_request_ratio, 0._wp, global_budget_cond_cells > 0)
+                call flush(output_unit)
+            end if
+        end if
+
+        if (phase_change_fuel_mass_coupling_fix_enabled) then
+            $:GPU_UPDATE(host='[phase_change_signed_local_condensation,phase_change_signed_local_insufficient,phase_change_signed_local_slight_negative,phase_change_signed_failure_claimed,phase_change_signed_failure_ijk,phase_change_signed_failure_data]')
+            if (phase_change_signed_local_slight_negative > 0 .and. &
+                phase_change_signed_condensation_slight_negative == 0) then
+                write (output_unit, '(&
+                    &"TEMP_PHASE_CHANGE_FUEL_MASS_COUPLING slight_negative_count=",I0,&
+                    &" tolerance=",ES16.8," t_step=",I0," stage=",I0," rank=",I0)') &
+                    phase_change_signed_local_slight_negative, phase_change_fuel_mass_tolerance, &
+                    report_step, report_stage, proc_rank
+                call flush(output_unit)
+            end if
+            phase_change_signed_condensation_occurrences = phase_change_signed_condensation_occurrences + &
+                                                            phase_change_signed_local_condensation
+            phase_change_signed_condensation_insufficient = phase_change_signed_condensation_insufficient + &
+                                                            phase_change_signed_local_insufficient
+            phase_change_signed_condensation_slight_negative = &
+                phase_change_signed_condensation_slight_negative + &
+                phase_change_signed_local_slight_negative
+            if (phase_change_signed_local_insufficient > 0) then
+                if (phase_change_signed_failure_claimed /= 0) then
+                    j = phase_change_signed_failure_ijk(1)
+                    k = phase_change_signed_failure_ijk(2)
+                    l = phase_change_signed_failure_ijk(3)
+                    failure_x = x_cc(j)
+                    failure_y = 0._wp
+                    failure_z = 0._wp
+                    if (n > 0) failure_y = y_cc(k)
+                    if (p > 0) failure_z = z_cc(l)
+                    write (output_unit, '(&
+                        &"TEMP_PHASE_CHANGE_FUEL_MASS_COUPLING insufficient_fuel=T",&
+                        &" tolerance=",ES16.8," t_step=",I0," stage=",I0," rank=",I0,&
+                        &" local_ijk=",3(I0,1X)," xyz=",3(ES16.8,1X),&
+                        &" available_fuel=",ES16.8," delta_m_vapor=",ES16.8,&
+                        &" requested_condensation_removal=",ES16.8," candidate_fuel=",ES16.8,&
+                        &" rho_g=",ES16.8," sum_rhoY=",ES16.8," alpha=",3(ES16.8,1X),&
+                        &" pressure=",ES16.8," temperature=",ES16.8,&
+                        &" m2_before=",ES16.8," m2_after=",ES16.8)') &
+                        phase_change_fuel_mass_tolerance, report_step, report_stage, proc_rank, j, k, l, &
+                        failure_x, failure_y, failure_z, phase_change_signed_failure_data(1), &
+                        phase_change_signed_failure_data(2), -phase_change_signed_failure_data(2), &
+                        phase_change_signed_failure_data(3:12)
+                    call flush(output_unit)
+                end if
+                call s_mpi_abort("TEMP_PHASE_CHANGE_FUEL_MASS_COUPLING insufficient NC12H26 for signed condensation removal")
+            end if
+        end if
+
 #endif
 
     end subroutine s_infinite_relaxation_k
@@ -842,6 +1408,48 @@ contains
 
     !>  This subroutine finalizes the phase change module
     impure subroutine s_finalize_relaxation_solver_module
+#ifdef MFC_SIMULATION
+        integer :: global_condensation_occurrences, global_condensation_insufficient
+        integer :: global_condensation_slight_negative
+        integer :: global_evap_only_rejections
+        real(wp) :: global_evap_only_suppressed_mass, global_evap_only_max_delta
+
+        if (phase_change_evap_only_enabled) then
+            call s_mpi_allreduce_integer_sum(phase_change_evap_only_rejections, &
+                                             global_evap_only_rejections)
+            call s_mpi_allreduce_sum(phase_change_evap_only_suppressed_mass, &
+                                     global_evap_only_suppressed_mass)
+            call s_mpi_allreduce_max(phase_change_evap_only_max_delta, &
+                                     global_evap_only_max_delta)
+            if (proc_rank == 0) then
+                write (output_unit, '(&
+                    &"TEMP_PHASE_CHANGE_EVAP_ONLY_SUMMARY validation_only=T",&
+                    &" rejected_count=",I0," suppressed_mass=",ES16.8,&
+                    &" max_proposed_cond_delta_rho=",ES16.8)') &
+                    global_evap_only_rejections, global_evap_only_suppressed_mass, &
+                    global_evap_only_max_delta
+                call flush(output_unit)
+            end if
+        end if
+
+        if (phase_change_fuel_mass_coupling_fix_enabled) then
+            call s_mpi_allreduce_integer_sum(phase_change_signed_condensation_occurrences, &
+                                             global_condensation_occurrences)
+            call s_mpi_allreduce_integer_sum(phase_change_signed_condensation_insufficient, &
+                                             global_condensation_insufficient)
+            call s_mpi_allreduce_integer_sum(phase_change_signed_condensation_slight_negative, &
+                                             global_condensation_slight_negative)
+            if (proc_rank == 0) then
+                write (output_unit, '(&
+                    &"TEMP_PHASE_CHANGE_FUEL_MASS_COUPLING_SUMMARY condensation_events=",I0,&
+                    &" insufficient_fuel_events=",I0," slight_negative_events=",I0,&
+                    &" tolerance=",ES16.8)') &
+                    global_condensation_occurrences, global_condensation_insufficient, &
+                    global_condensation_slight_negative, phase_change_fuel_mass_tolerance
+                call flush(output_unit)
+            end if
+        end if
+#endif
     end subroutine s_finalize_relaxation_solver_module
 
 #endif

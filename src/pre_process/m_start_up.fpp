@@ -5,6 +5,8 @@
 !> @brief Reads and validates user inputs, loads existing grid/IC data, and initializes pre-process modules
 module m_start_up
 
+    use iso_fortran_env, only: output_unit
+
     use m_derived_types         !< Definitions of the derived types
 
     use m_global_parameters     !< Global parameters for the code
@@ -52,6 +54,8 @@ module m_start_up
     use m_boundary_common
 
     use m_boundary_conditions
+
+    use m_thermochem, only: species_names
 
     implicit none
 
@@ -769,6 +773,284 @@ contains
 
     end subroutine s_read_grid
 
+
+    logical function f_temp_init_species_rhoy_rescale_enabled()
+
+        character(len=32) :: env_value
+        integer :: env_status
+
+        env_value = ""
+        call get_environment_variable("TEMP_INIT_SPECIES_RHOY_RESCALE", env_value, status=env_status)
+        f_temp_init_species_rhoy_rescale_enabled = env_status == 0 .and. trim(env_value) == "1"
+
+    end function f_temp_init_species_rhoy_rescale_enabled
+
+    real(wp) function f_temp_init_species_rho_g(q_cons, j, k, l)
+
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons
+        integer, intent(in) :: j, k, l
+
+        integer :: gas_idx, fluid_id
+
+        f_temp_init_species_rho_g = 0._wp
+        if (num_fluids == 1) then
+            f_temp_init_species_rho_g = q_cons(contxe)%sf(j, k, l)
+        elseif (chem_gas_num_fluids <= 0) then
+            fluid_id = chem_gas_fluid_id
+            if (fluid_id >= 1 .and. fluid_id <= num_fluids) then
+                f_temp_init_species_rho_g = q_cons(contxb + fluid_id - 1)%sf(j, k, l)
+            end if
+        else
+            do gas_idx = 1, chem_gas_num_fluids
+                fluid_id = chem_gas_fluid_ids(gas_idx)
+                if (fluid_id >= 1 .and. fluid_id <= num_fluids) then
+                    f_temp_init_species_rho_g = f_temp_init_species_rho_g + &
+                                                q_cons(contxb + fluid_id - 1)%sf(j, k, l)
+                end if
+            end do
+        end if
+
+    end function f_temp_init_species_rho_g
+
+    impure subroutine s_temp_init_species_cell_stats(q_cons, j, k, l, rho_g, sum_rhoY, sumY, &
+                                                     scale_factor, minY, maxY)
+
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons
+        integer, intent(in) :: j, k, l
+        real(wp), intent(out) :: rho_g, sum_rhoY, sumY, scale_factor, minY, maxY
+
+        integer :: species_id
+        real(wp) :: Y_value
+
+        rho_g = f_temp_init_species_rho_g(q_cons, j, k, l)
+        sum_rhoY = 0._wp
+        do species_id = chemxb, chemxe
+            sum_rhoY = sum_rhoY + q_cons(species_id)%sf(j, k, l)
+        end do
+
+        sumY = 0._wp
+        scale_factor = 1._wp
+        minY = huge(1._wp)
+        maxY = -huge(1._wp)
+        if (rho_g > verysmall) then
+            sumY = sum_rhoY/rho_g
+            if (abs(sum_rhoY) > verysmall) scale_factor = rho_g/sum_rhoY
+            do species_id = chemxb, chemxe
+                Y_value = q_cons(species_id)%sf(j, k, l)/rho_g
+                minY = min(minY, Y_value)
+                maxY = max(maxY, Y_value)
+            end do
+        end if
+        if (minY == huge(1._wp)) minY = 0._wp
+        if (maxY == -huge(1._wp)) maxY = 0._wp
+
+    end subroutine s_temp_init_species_cell_stats
+
+    impure subroutine s_temp_init_species_print_cell(q_cons, label, region, j, k, l)
+
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons
+        character(len=*), intent(in) :: label, region
+        integer, intent(in) :: j, k, l
+
+        integer :: species_id
+        real(wp) :: rho_g, sum_rhoY, sumY, scale_factor, minY, maxY, Y_value, z_value
+
+        call s_temp_init_species_cell_stats(q_cons, j, k, l, rho_g, sum_rhoY, sumY, &
+                                            scale_factor, minY, maxY)
+        z_value = 0._wp
+        if (p > 0) z_value = z_cc(l)
+
+        write (output_unit, '(&
+            &"TEMP_INIT_SPECIES_RHOY_RESCALE_CELL label=",A," region=",A,&
+            &" rank=",I0," local_ijk=",3(I0,1X),&
+            &" xyz=",3(ES16.8,1X)," rho_g=",ES16.8,&
+            &" sum_rhoY=",ES16.8," sumY=",ES16.8,&
+            &" rescale_factor=",ES16.8," minY=",ES16.8," maxY=",ES16.8)') &
+            trim(label), trim(region), proc_rank, j, k, l, x_cc(j), y_cc(k), z_value, &
+            rho_g, sum_rhoY, sumY, scale_factor, minY, maxY
+
+        do species_id = 1, num_species
+            if (rho_g > verysmall) then
+                Y_value = q_cons(chemxb + species_id - 1)%sf(j, k, l)/rho_g
+            else
+                Y_value = 0._wp
+            end if
+            if (abs(Y_value) > 1.e-14_wp) then
+                write (output_unit, '(&
+                    &"TEMP_INIT_SPECIES_RHOY_RESCALE_SPECIES label=",A," region=",A,&
+                    &" rank=",I0," species_index=",I0," species=",A," Y=",ES16.8,&
+                    &" rhoY=",ES16.8)') &
+                    trim(label), trim(region), proc_rank, species_id, trim(species_names(species_id)), &
+                    Y_value, q_cons(chemxb + species_id - 1)%sf(j, k, l)
+            end if
+        end do
+        call flush(output_unit)
+
+    end subroutine s_temp_init_species_print_cell
+
+    impure subroutine s_temp_init_species_rhoy_report(q_cons, label)
+
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons
+        character(len=*), intent(in) :: label
+
+        integer :: j, k, l, species_id
+        integer :: local_cells, global_cells
+        real(wp) :: rho_g, sum_rhoY, sumY, scale_factor, minY, maxY, Y_value
+        real(wp) :: rho_g_min_loc, rho_g_max_loc, rho_g_min_glb, rho_g_max_glb
+        real(wp) :: sum_rhoY_min_loc, sum_rhoY_max_loc, sum_rhoY_min_glb, sum_rhoY_max_glb
+        real(wp) :: sumY_min_loc, sumY_max_loc, sumY_min_glb, sumY_max_glb
+        real(wp) :: scale_min_loc, scale_max_loc, scale_min_glb, scale_max_glb
+        real(wp) :: minY_loc, maxY_loc, minY_glb, maxY_glb
+        real(wp) :: alpha_liq, candidate_key
+        real(wp), dimension(2) :: air_owner, droplet_owner
+        logical :: air_valid, droplet_valid
+        integer :: air_j, air_k, air_l, droplet_j, droplet_k, droplet_l
+
+        local_cells = 0
+        rho_g_min_loc = huge(1._wp); rho_g_max_loc = -huge(1._wp)
+        sum_rhoY_min_loc = huge(1._wp); sum_rhoY_max_loc = -huge(1._wp)
+        sumY_min_loc = huge(1._wp); sumY_max_loc = -huge(1._wp)
+        scale_min_loc = huge(1._wp); scale_max_loc = -huge(1._wp)
+        minY_loc = huge(1._wp); maxY_loc = -huge(1._wp)
+        air_owner = (/ -huge(1._wp), real(proc_rank, wp) /)
+        droplet_owner = (/ -huge(1._wp), real(proc_rank, wp) /)
+        air_valid = .false.; droplet_valid = .false.
+        air_j = 0; air_k = 0; air_l = 0
+        droplet_j = 0; droplet_k = 0; droplet_l = 0
+
+        do l = 0, p
+            do k = 0, n
+                do j = 0, m
+                    call s_temp_init_species_cell_stats(q_cons, j, k, l, rho_g, sum_rhoY, sumY, &
+                                                        scale_factor, minY, maxY)
+                    if (rho_g <= verysmall) cycle
+                    local_cells = local_cells + 1
+                    rho_g_min_loc = min(rho_g_min_loc, rho_g)
+                    rho_g_max_loc = max(rho_g_max_loc, rho_g)
+                    sum_rhoY_min_loc = min(sum_rhoY_min_loc, sum_rhoY)
+                    sum_rhoY_max_loc = max(sum_rhoY_max_loc, sum_rhoY)
+                    sumY_min_loc = min(sumY_min_loc, sumY)
+                    sumY_max_loc = max(sumY_max_loc, sumY)
+                    scale_min_loc = min(scale_min_loc, scale_factor)
+                    scale_max_loc = max(scale_max_loc, scale_factor)
+                    minY_loc = min(minY_loc, minY)
+                    maxY_loc = max(maxY_loc, maxY)
+
+                    alpha_liq = q_cons(advxb)%sf(j, k, l)
+                    candidate_key = -real(proc_rank*(m + 1)*(n + 1)*(p + 1) + &
+                                          l*(m + 1)*(n + 1) + k*(m + 1) + j, wp)
+                    if (alpha_liq < 0.5_wp .and. candidate_key > air_owner(1)) then
+                        air_owner = (/ candidate_key, real(proc_rank, wp) /)
+                        air_j = j; air_k = k; air_l = l
+                        air_valid = .true.
+                    end if
+                    if (alpha_liq > 0.5_wp .and. candidate_key > droplet_owner(1)) then
+                        droplet_owner = (/ candidate_key, real(proc_rank, wp) /)
+                        droplet_j = j; droplet_k = k; droplet_l = l
+                        droplet_valid = .true.
+                    end if
+                end do
+            end do
+        end do
+
+        if (local_cells == 0) then
+            rho_g_min_loc = huge(1._wp); rho_g_max_loc = -huge(1._wp)
+            sum_rhoY_min_loc = huge(1._wp); sum_rhoY_max_loc = -huge(1._wp)
+            sumY_min_loc = huge(1._wp); sumY_max_loc = -huge(1._wp)
+            scale_min_loc = huge(1._wp); scale_max_loc = -huge(1._wp)
+            minY_loc = huge(1._wp); maxY_loc = -huge(1._wp)
+        end if
+
+        call s_mpi_allreduce_integer_sum(local_cells, global_cells)
+        if (num_procs > 1) then
+            call s_mpi_allreduce_min(rho_g_min_loc, rho_g_min_glb)
+            call s_mpi_allreduce_max(rho_g_max_loc, rho_g_max_glb)
+            call s_mpi_allreduce_min(sum_rhoY_min_loc, sum_rhoY_min_glb)
+            call s_mpi_allreduce_max(sum_rhoY_max_loc, sum_rhoY_max_glb)
+            call s_mpi_allreduce_min(sumY_min_loc, sumY_min_glb)
+            call s_mpi_allreduce_max(sumY_max_loc, sumY_max_glb)
+            call s_mpi_allreduce_min(scale_min_loc, scale_min_glb)
+            call s_mpi_allreduce_max(scale_max_loc, scale_max_glb)
+            call s_mpi_allreduce_min(minY_loc, minY_glb)
+            call s_mpi_allreduce_max(maxY_loc, maxY_glb)
+            call s_mpi_reduce_maxloc(air_owner)
+            call s_mpi_reduce_maxloc(droplet_owner)
+        else
+            rho_g_min_glb = rho_g_min_loc; rho_g_max_glb = rho_g_max_loc
+            sum_rhoY_min_glb = sum_rhoY_min_loc; sum_rhoY_max_glb = sum_rhoY_max_loc
+            sumY_min_glb = sumY_min_loc; sumY_max_glb = sumY_max_loc
+            scale_min_glb = scale_min_loc; scale_max_glb = scale_max_loc
+            minY_glb = minY_loc; maxY_glb = maxY_loc
+        end if
+
+        if (proc_rank == 0) then
+            write (output_unit, '(&
+                &"TEMP_INIT_SPECIES_RHOY_RESCALE_SUMMARY label=",A,&
+                &" global_cells=",I0," rho_g_min=",ES16.8," rho_g_max=",ES16.8,&
+                &" sum_rhoY_min=",ES16.8," sum_rhoY_max=",ES16.8,&
+                &" sumY_min=",ES16.8," sumY_max=",ES16.8,&
+                &" rescale_factor_min=",ES16.8," rescale_factor_max=",ES16.8,&
+                &" minY=",ES16.8," maxY=",ES16.8)') &
+                trim(label), global_cells, rho_g_min_glb, rho_g_max_glb, &
+                sum_rhoY_min_glb, sum_rhoY_max_glb, sumY_min_glb, sumY_max_glb, &
+                scale_min_glb, scale_max_glb, minY_glb, maxY_glb
+            call flush(output_unit)
+        end if
+
+        if (air_valid .and. proc_rank == int(air_owner(2))) then
+            call s_temp_init_species_print_cell(q_cons, label, "air", air_j, air_k, air_l)
+        end if
+        if (droplet_valid .and. proc_rank == int(droplet_owner(2))) then
+            call s_temp_init_species_print_cell(q_cons, label, "droplet", droplet_j, droplet_k, droplet_l)
+        end if
+
+    end subroutine s_temp_init_species_rhoy_report
+
+    impure subroutine s_temp_init_species_rhoy_rescale(q_cons)
+
+        type(scalar_field), dimension(sys_size), intent(inout) :: q_cons
+
+        integer :: j, k, l, species_id
+        real(wp) :: rho_g, sum_rhoY, scale_factor
+
+        do l = 0, p
+            do k = 0, n
+                do j = 0, m
+                    rho_g = f_temp_init_species_rho_g(q_cons, j, k, l)
+                    if (rho_g <= verysmall) cycle
+                    sum_rhoY = 0._wp
+                    do species_id = chemxb, chemxe
+                        sum_rhoY = sum_rhoY + q_cons(species_id)%sf(j, k, l)
+                    end do
+                    if (abs(sum_rhoY) <= verysmall) cycle
+                    scale_factor = rho_g/sum_rhoY
+                    do species_id = chemxb, chemxe
+                        q_cons(species_id)%sf(j, k, l) = scale_factor*q_cons(species_id)%sf(j, k, l)
+                    end do
+                end do
+            end do
+        end do
+
+    end subroutine s_temp_init_species_rhoy_rescale
+
+    impure subroutine s_temp_apply_init_species_rhoy_rescale(q_cons)
+
+        type(scalar_field), dimension(sys_size), intent(inout) :: q_cons
+
+        if (.not. chemistry) return
+        if (.not. f_temp_init_species_rhoy_rescale_enabled()) return
+
+        if (proc_rank == 0) then
+            write (output_unit, '("TEMP_INIT_SPECIES_RHOY_RESCALE enabled")')
+            call flush(output_unit)
+        end if
+
+        call s_temp_init_species_rhoy_report(q_cons, "before")
+        call s_temp_init_species_rhoy_rescale(q_cons)
+        call s_temp_init_species_rhoy_report(q_cons, "after")
+
+    end subroutine s_temp_apply_init_species_rhoy_rescale
+
     !> @brief Generates or reads the initial condition, applies relaxation if needed, and writes output data files.
     impure subroutine s_apply_initial_condition(start, finish)
 
@@ -809,6 +1091,7 @@ contains
             end if
 
             call s_infinite_relaxation_k(q_cons_vf)
+            call s_temp_apply_init_species_rhoy_rescale(q_cons_vf)
         end if
 
         call s_write_data_files(q_cons_vf, q_prim_vf, bc_type)
