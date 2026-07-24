@@ -8,6 +8,34 @@
 #:set USING_CCE = (MFC_COMPILER == CCE_COMPILER_ID)
 #:set USING_AMD = (MFC_COMPILER == AMD_COMPILER_ID)
 
+
+#:def WRAP_DIRECTIVE_LINE(directive, continue_prefix, max_len=120)
+    #:assert isinstance(directive, str)
+    #:assert isinstance(continue_prefix, str)
+    #:set directive = directive.strip(chr(10))
+    #:if directive == ''
+        $:directive
+    #:elif len(directive) <= max_len
+        $:directive
+    #:else
+        #:set words = [word for word in directive.split(' ') if word != '']
+        #:set lines = []
+        #:set current_line = words[0]
+        #:for word in words[1:]
+            #:if len(current_line) + 1 + len(word) + 2 > max_len
+                #:set lines = lines + [current_line + ' &']
+                #:set current_line = continue_prefix + word
+            #:else
+                #:set current_line = current_line + ' ' + word
+            #:endif
+        #:endfor
+        #:set lines = lines + [current_line]
+        #:for wrapped_line in lines
+            $:wrapped_line
+        #:endfor
+    #:endif
+#:enddef
+
 #:def ASSERT_LIST(data, datatype)
     #:assert data is not None
     #:assert isinstance(data, list)

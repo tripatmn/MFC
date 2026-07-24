@@ -669,7 +669,8 @@ contains
                             if (heat_calc_active) then
                                 #:if USING_AMD
                                     h_k = h_rt(eqn - chemxb + 1)*gas_constant*T/molecular_weights_nonparameter(eqn - chemxb + 1)
-                                    e_k = (h_rt(eqn - chemxb + 1) - 1._wp)*gas_constant*T/molecular_weights_nonparameter(eqn - chemxb + 1)
+                                    e_k = (h_rt(eqn - chemxb + 1) - 1._wp)*gas_constant*T/ &
+                                          molecular_weights_nonparameter(eqn - chemxb + 1)
                                 #:else
                                     h_k = h_rt(eqn - chemxb + 1)*gas_constant*T/molecular_weights(eqn - chemxb + 1)
                                     e_k = (h_rt(eqn - chemxb + 1) - 1._wp)*gas_constant*T/molecular_weights(eqn - chemxb + 1)
@@ -1209,8 +1210,10 @@ contains
                             $:GPU_LOOP(parallelism='[seq]')
                             do i = chemxb, chemxe
                                 #:if USING_AMD
-                                    h_l(i - chemxb + 1) = h_l(i - chemxb + 1)*gas_constant*T_L/molecular_weights_nonparameter(i - chemxb + 1)
-                                    h_r(i - chemxb + 1) = h_r(i - chemxb + 1)*gas_constant*T_R/molecular_weights_nonparameter(i - chemxb + 1)
+                                    h_l(i - chemxb + 1) = h_l(i - chemxb + 1)*gas_constant*T_L/ &
+                                                          molecular_weights_nonparameter(i - chemxb + 1)
+                                    h_r(i - chemxb + 1) = h_r(i - chemxb + 1)*gas_constant*T_R/ &
+                                                          molecular_weights_nonparameter(i - chemxb + 1)
                                 #:else
                                     h_l(i - chemxb + 1) = h_l(i - chemxb + 1)*gas_constant*T_L/molecular_weights(i - chemxb + 1)
                                     h_r(i - chemxb + 1) = h_r(i - chemxb + 1)*gas_constant*T_R/molecular_weights(i - chemxb + 1)
@@ -1243,11 +1246,15 @@ contains
 	                            $:GPU_LOOP(parallelism='[seq]')
 	                            do eqn = chemxb, chemxe
                                 #:if USING_AMD
-                                    Mass_Diffu_Flux(eqn - chemxb + 1) = rho_cell*mass_diffusivities_mixavg_Cell(eqn - chemxb + 1)* &
-                                                                        molecular_weights_nonparameter(eqn - chemxb + 1)/MW_cell*dXk_dxi(eqn - chemxb + 1)
+                                    Mass_Diffu_Flux(eqn - chemxb + 1) = &
+                                        rho_cell*mass_diffusivities_mixavg_Cell(eqn - chemxb + 1)* &
+                                        molecular_weights_nonparameter(eqn - chemxb + 1)/MW_cell* &
+                                        dXk_dxi(eqn - chemxb + 1)
                                 #:else
-                                    Mass_Diffu_Flux(eqn - chemxb + 1) = rho_cell*mass_diffusivities_mixavg_Cell(eqn - chemxb + 1)* &
-                                                                        molecular_weights(eqn - chemxb + 1)/MW_cell*dXk_dxi(eqn - chemxb + 1)
+                                    Mass_Diffu_Flux(eqn - chemxb + 1) = &
+                                        rho_cell*mass_diffusivities_mixavg_Cell(eqn - chemxb + 1)* &
+                                        molecular_weights(eqn - chemxb + 1)/MW_cell* &
+                                        dXk_dxi(eqn - chemxb + 1)
 	                                #:endif
 	                                rho_Vic = rho_Vic + Mass_Diffu_Flux(eqn - chemxb + 1)
 	                                Mass_Diffu_Energy = Mass_Diffu_Energy + h_k(eqn - chemxb + 1)*Mass_Diffu_Flux(eqn - chemxb + 1)
@@ -1406,7 +1413,11 @@ contains
                 ! Model 2: Unity Lewis Number
             else if (chem_params%transport_model == 2) then
                 ! Note: Added ALL scalars and 'i'/'eqn' to private list to prevent race conditions.
-                $:GPU_PARALLEL_LOOP(collapse=3, private='[x,y,z,i,eqn,Ys_L, Ys_R, Ys_cell, dYk_dxi, Mass_Diffu_Flux, grid_spacing, MW_L, MW_R, MW_cell, Rgas_L, Rgas_R, P_L, P_R, rho_L, rho_R, rho_cell, T_L, T_R, Cp_L, Cp_R, hmix_L, hmix_R, dh_dxi, lambda_L, lambda_R, lambda_Cell, diffusivity_L, diffusivity_R, diffusivity_cell, Mass_Diffu_Energy]', copyin='[offsets]')
+                #:set unity_lewis_private = '[x,y,z,i,eqn,Ys_L, Ys_R, Ys_cell, dYk_dxi, Mass_Diffu_Flux, ' + &
+                    & 'grid_spacing, MW_L, MW_R, MW_cell, Rgas_L, Rgas_R, P_L, P_R, rho_L, rho_R, ' + &
+                    & 'rho_cell, T_L, T_R, Cp_L, Cp_R, hmix_L, hmix_R, dh_dxi, lambda_L, lambda_R, ' + &
+                    & 'lambda_Cell, diffusivity_L, diffusivity_R, diffusivity_cell, Mass_Diffu_Energy]'
+                $:GPU_PARALLEL_LOOP(collapse=3, private=unity_lewis_private, copyin='[offsets]')
                 do z = isc3%beg, isc3%end
                     do y = isc2%beg, isc2%end
                         do x = isc1%beg, isc1%end

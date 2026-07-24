@@ -144,7 +144,7 @@
     #:set omp_directive = '!$omp target teams ' + omp_clause_val + extraOmpArgs_val.strip('\n')
 
     #:set omp_end_directive = '!$omp end target teams'
-    $:omp_directive
+    $:WRAP_DIRECTIVE_LINE(omp_directive, '!$omp& ')
     $:code
     $:omp_end_directive
 #:enddef
@@ -187,7 +187,7 @@
     #:endif
 
     #:set omp_directive = omp_start_directive + clause_val + extraOmpArgs_val.strip('\n')
-    $:omp_directive
+    $:WRAP_DIRECTIVE_LINE(omp_directive, '!$omp& ')
 #:enddef
 
 #:def END_OMP_PARALLEL_LOOP()
@@ -227,7 +227,7 @@
 
     #:set omp_directive = '!$omp declare target ' + &
         & clause_val + extraOmpArgs_val.strip('\n')
-    $:omp_directive
+    $:WRAP_DIRECTIVE_LINE(omp_directive, '!$omp& ')
 #:enddef
 
 #:def OMP_DECLARE(copyin=None, copyinReadOnly=None, create=None, link=None, extraOmpArgs=None)
@@ -238,11 +238,12 @@
     #:set clause_val = copyin_val.strip('\n') + &
         & create_val.strip('\n') + link_val.strip('\n')
     #:set omp_directive = '!$omp declare target ' + clause_val + extraOmpArgs_val.strip('\n')
-    $:omp_directive
+    $:WRAP_DIRECTIVE_LINE(omp_directive, '!$omp& ')
 #:enddef
 
 #! Not fully implemented yet (ignores most args right now)
-#:def OMP_LOOP(collapse=None, parallelism=None, data_dependency=None, reduction=None, reductionOp=None, private=None, extraOmpArgs=None)
+#:def OMP_LOOP(collapse=None, parallelism=None, data_dependency=None, &
+    & reduction=None, reductionOp=None, private=None, extraOmpArgs=None)
     #:if MFC_COMPILER == NVIDIA_COMPILER_ID or MFC_COMPILER == PGI_COMPILER_ID
         #:set omp_directive = '!$omp loop bind(thread)'
     #:elif MFC_COMPILER == CCE_COMPILER_ID or MFC_COMPILER == AMD_COMPILER_ID
@@ -250,10 +251,12 @@
     #:else
         #:set omp_directive = ''
     #:endif
-    $:omp_directive
+    $:WRAP_DIRECTIVE_LINE(omp_directive, '!$omp& ')
 #:enddef
 
-#:def OMP_DATA(code, copy=None, copyin=None, copyinReadOnly=None, copyout=None, create=None, no_create=None, present=None, deviceptr=None, attach=None, default=None, extraOmpArgs=None)
+#:def OMP_DATA(code, copy=None, copyin=None, copyinReadOnly=None, &
+    & copyout=None, create=None, no_create=None, present=None, &
+    & deviceptr=None, attach=None, default=None, extraOmpArgs=None)
     #:assert code is not None
     #:assert isinstance(code, str)
     #:if code == '' or code.isspace()
@@ -276,7 +279,7 @@
         & default_val.strip('\n')
     #:set omp_directive = '!$omp target data ' + clause_val + extraOmpArgs_val.strip('\n')
     #:set end_omp_directive = '!$omp end target data'
-    $:omp_directive
+    $:WRAP_DIRECTIVE_LINE(omp_directive, '!$omp& ')
     $:code
     $:end_omp_directive
 #:enddef
@@ -288,7 +291,7 @@
     #:set extraOmpArgs_val = GEN_EXTRA_ARGS_STR(extraOmpArgs)
     #:set omp_clause_val = copyin_val.strip('\n') + create_val.strip('\n') + attach_val.strip('\n')
     #:set omp_directive = '!$omp target enter data ' + omp_clause_val + extraOmpArgs_val.strip('\n')
-    $:omp_directive
+    $:WRAP_DIRECTIVE_LINE(omp_directive, '!$omp& ')
 #:enddef
 
 #:def OMP_EXIT_DATA(copyout=None, delete=None, detach=None, extraOmpArgs=None)
@@ -298,7 +301,7 @@
     #:set extraOmpArgs_val = GEN_EXTRA_ARGS_STR(extraOmpArgs)
     #:set clause_val = copyout_val.strip('\n') + delete_val.strip('\n') + detach_val.strip('\n')
     #:set omp_directive = '!$omp target exit data ' + clause_val + extraOmpArgs_val.strip('\n')
-    $:omp_directive
+    $:WRAP_DIRECTIVE_LINE(omp_directive, '!$omp& ')
 #:enddef
 
 #:def OMP_UPDATE(host=None, device=None, extraOmpArgs=None)
@@ -307,7 +310,7 @@
     #:set extraOmpArgs_val = GEN_EXTRA_ARGS_STR(extraOmpArgs)
     #:set clause_val = host_val.strip('\n') + device_val.strip('\n')
     #:set omp_directive = '!$omp target update ' + clause_val + extraOmpArgs_val.strip('\n')
-    $:omp_directive
+    $:WRAP_DIRECTIVE_LINE(omp_directive, '!$omp& ')
 #:enddef
 
 #:def OMP_HOST_DATA(code, use_device_addr, use_device_ptr, extraOmpArgs)
@@ -322,7 +325,7 @@
     #:set clause_val = use_device_addr_val.strip('\n') + use_device_ptr_val.strip('\n')
     #:set omp_directive = '!$omp target data ' + clause_val + extraOmpArgs_val.strip('\n')
     #:set omp_end_directive = '!$omp end target data'
-    $:omp_directive
+    $:WRAP_DIRECTIVE_LINE(omp_directive, '!$omp& ')
     $:code
     $:omp_end_directive
 #:enddef
@@ -334,14 +337,14 @@
     #:set extraOmpArgs_val = GEN_EXTRA_ARGS_STR(extraOmpArgs)
     #:set clause_val = atomic_val.strip('\n')
     #:set omp_directive = '!$omp atomic ' + clause_val + extraOmpArgs_val.strip('\n')
-    $:omp_directive
+    $:WRAP_DIRECTIVE_LINE(omp_directive, '!$omp& ')
 #:enddef
 
 #:def OMP_WAIT(extraOmpArgs=None)
     #:set extraOmpArgs_val = GEN_EXTRA_ARGS_STR(extraOmpArgs)
     #:set clause_val = ''
     #:set omp_directive = '!$omp barrier ' + clause_val + extraOmpArgs_val.strip('\n')
-    $:omp_directive
+    $:WRAP_DIRECTIVE_LINE(omp_directive, '!$omp& ')
 #:enddef
 
 #:def UNDEF_AMD(code)
