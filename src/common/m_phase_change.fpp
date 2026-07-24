@@ -82,9 +82,17 @@ module m_phase_change
     real(wp), dimension(12) :: phase_change_signed_failure_data = 0._wp
 #endif
 
-    $:GPU_DECLARE(create='[A,B,C,D,phase_change_fuel_mass_coupling_fix_enabled,phase_change_evap_only_enabled,phase_change_budget_debug_enabled]')
+    #:set phase_change_core_gpu_vars = '[A,B,C,D,' + &
+        & 'phase_change_fuel_mass_coupling_fix_enabled,' + &
+        & 'phase_change_evap_only_enabled,phase_change_budget_debug_enabled]'
+    $:GPU_DECLARE(create=phase_change_core_gpu_vars)
 #ifdef MFC_SIMULATION
-    $:GPU_DECLARE(create='[phase_change_signed_local_condensation,phase_change_signed_local_insufficient,phase_change_signed_local_slight_negative,phase_change_signed_failure_claimed,phase_change_signed_failure_ijk,phase_change_signed_failure_data]')
+    #:set phase_change_signed_gpu_vars = '[phase_change_signed_local_condensation,' + &
+        & 'phase_change_signed_local_insufficient,' + &
+        & 'phase_change_signed_local_slight_negative,' + &
+        & 'phase_change_signed_failure_claimed,phase_change_signed_failure_ijk,' + &
+        & 'phase_change_signed_failure_data]'
+    $:GPU_DECLARE(create=phase_change_signed_gpu_vars)
 #endif
 
 contains
@@ -300,7 +308,7 @@ contains
             phase_change_signed_failure_claimed = 0
             phase_change_signed_failure_ijk = 0
             phase_change_signed_failure_data = 0._wp
-            $:GPU_UPDATE(device='[phase_change_signed_local_condensation,phase_change_signed_local_insufficient,phase_change_signed_local_slight_negative,phase_change_signed_failure_claimed,phase_change_signed_failure_ijk,phase_change_signed_failure_data]')
+            $:GPU_UPDATE(device=phase_change_signed_gpu_vars)
         end if
 
         local_budget_evap_cells = 0
@@ -345,9 +353,40 @@ contains
 #endif
 
         ! starting equilibrium solver
-            $:GPU_PARALLEL_LOOP(collapse=3, private='[i,j,k,l,p_infOV, p_infpT, p_infSL, sk, hk, gk, ek, rhok,pS, pSOV, pSSL, TS, TSOV, TSatOV, TSatSL, TSSL, no_transfer_pS, no_transfer_TS, rhoe, dynE, rhos, rho, rM, m1, m2, m2_after, delta_m_vapor, MCT, TvF, pt_state_ok, ptg_state_ok, fuel_before_coupling,fuel_candidate,failure_rho_g,failure_sum_rhoY,signed_failure_old_claim,signed_gas_idx,signed_fluid_id,signed_species_eqn,budget_cell_volume,budget_delta_m_vapor,budget_abs_delta,budget_cond_requested,budget_fuel_available,budget_ratio,budget_alpha_liq,budget_alpha_vap,budget_alpha_air,evap_only_proposed_delta,evap_only_suppressed_delta]', &
-            reduction='[[local_budget_evap_cells,local_budget_cond_cells,local_budget_insufficient_cells,local_budget_interface_cond_cells,local_budget_liquid_cond_cells,local_budget_gas_cond_cells,local_evap_only_rejections,local_budget_evap_mass,local_budget_cond_mass,local_budget_net_mass,local_budget_insufficient_mass,local_evap_only_suppressed_mass],[local_budget_max_evap_delta,local_budget_max_cond_delta,local_budget_max_insufficient_ratio,local_budget_max_alpha_liq,local_budget_max_alpha_vap,local_budget_max_alpha_air,local_budget_max_pressure,local_budget_max_temperature,local_budget_max_vapor_arho,local_budget_max_fuel,local_budget_max_request_ratio,local_evap_only_max_delta,local_evap_only_max_alpha_liq,local_evap_only_max_pressure,local_evap_only_max_temperature],[local_budget_min_alpha_liq,local_budget_min_alpha_vap,local_budget_min_alpha_air,local_budget_min_pressure,local_budget_min_temperature,local_budget_min_vapor_arho,local_budget_min_fuel,local_budget_min_request_ratio,local_evap_only_min_alpha_liq,local_evap_only_min_pressure,local_evap_only_min_temperature]]', &
-            reductionOp='[+,MAX,MIN]')
+            #:set phase_relax_private = '[i,j,k,l,p_infOV,p_infpT,p_infSL,sk,hk,gk,ek,' + &
+                & 'rhok,pS,pSOV,pSSL,TS,TSOV,TSatOV,TSatSL,TSSL,' + &
+                & 'no_transfer_pS,no_transfer_TS,rhoe,dynE,rhos,rho,rM,' + &
+                & 'm1,m2,m2_after,delta_m_vapor,MCT,TvF,pt_state_ok,' + &
+                & 'ptg_state_ok,fuel_before_coupling,fuel_candidate,' + &
+                & 'failure_rho_g,failure_sum_rhoY,signed_failure_old_claim,' + &
+                & 'signed_gas_idx,signed_fluid_id,signed_species_eqn,' + &
+                & 'budget_cell_volume,budget_delta_m_vapor,budget_abs_delta,' + &
+                & 'budget_cond_requested,budget_fuel_available,budget_ratio,' + &
+                & 'budget_alpha_liq,budget_alpha_vap,budget_alpha_air,' + &
+                & 'evap_only_proposed_delta,evap_only_suppressed_delta]'
+            #:set phase_relax_reduction = '[[local_budget_evap_cells,' + &
+                & 'local_budget_cond_cells,local_budget_insufficient_cells,' + &
+                & 'local_budget_interface_cond_cells,local_budget_liquid_cond_cells,' + &
+                & 'local_budget_gas_cond_cells,local_evap_only_rejections,' + &
+                & 'local_budget_evap_mass,local_budget_cond_mass,' + &
+                & 'local_budget_net_mass,local_budget_insufficient_mass,' + &
+                & 'local_evap_only_suppressed_mass],' + &
+                & '[local_budget_max_evap_delta,local_budget_max_cond_delta,' + &
+                & 'local_budget_max_insufficient_ratio,local_budget_max_alpha_liq,' + &
+                & 'local_budget_max_alpha_vap,local_budget_max_alpha_air,' + &
+                & 'local_budget_max_pressure,local_budget_max_temperature,' + &
+                & 'local_budget_max_vapor_arho,local_budget_max_fuel,' + &
+                & 'local_budget_max_request_ratio,local_evap_only_max_delta,' + &
+                & 'local_evap_only_max_alpha_liq,local_evap_only_max_pressure,' + &
+                & 'local_evap_only_max_temperature],' + &
+                & '[local_budget_min_alpha_liq,local_budget_min_alpha_vap,' + &
+                & 'local_budget_min_alpha_air,local_budget_min_pressure,' + &
+                & 'local_budget_min_temperature,local_budget_min_vapor_arho,' + &
+                & 'local_budget_min_fuel,local_budget_min_request_ratio,' + &
+                & 'local_evap_only_min_alpha_liq,local_evap_only_min_pressure,' + &
+                & 'local_evap_only_min_temperature]]'
+            $:GPU_PARALLEL_LOOP(collapse=3, private=phase_relax_private, &
+                reduction=phase_relax_reduction, reductionOp='[+,MAX,MIN]')
         do j = 0, m
             do k = 0, n
                 do l = 0, p
@@ -663,18 +702,9 @@ contains
                         if (delta_m_vapor < 0._wp .and. fuel_candidate < -phase_change_fuel_mass_tolerance) then
                             $:GPU_ATOMIC(atomic='update')
                             phase_change_signed_local_insufficient = phase_change_signed_local_insufficient + 1
-#ifdef MFC_OpenACC
-                            !$acc atomic capture
-#elif defined(MFC_OpenMP)
-                            !$omp atomic capture
-#endif
+                            $:GPU_ATOMIC(atomic='capture')
                             signed_failure_old_claim = phase_change_signed_failure_claimed
                             phase_change_signed_failure_claimed = 1
-#ifdef MFC_OpenACC
-                            !$acc end atomic
-#elif defined(MFC_OpenMP)
-                            !$omp end atomic
-#endif
                             if (signed_failure_old_claim == 0) then
                                 failure_rho_g = 0._wp
                                 if (num_fluids == 1) then
@@ -897,7 +927,7 @@ contains
         end if
 
         if (phase_change_fuel_mass_coupling_fix_enabled) then
-            $:GPU_UPDATE(host='[phase_change_signed_local_condensation,phase_change_signed_local_insufficient,phase_change_signed_local_slight_negative,phase_change_signed_failure_claimed,phase_change_signed_failure_ijk,phase_change_signed_failure_data]')
+            $:GPU_UPDATE(host=phase_change_signed_gpu_vars)
             if (phase_change_signed_local_slight_negative > 0 .and. &
                 phase_change_signed_condensation_slight_negative == 0) then
                 write (output_unit, '(&

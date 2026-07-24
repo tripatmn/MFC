@@ -83,7 +83,10 @@ module m_time_steppers
     integer, private :: num_probe_ts
     logical :: phase_change_fuel_mass_coupling_fix_enabled = .false.
 
-    $:GPU_DECLARE(create='[q_cons_ts,q_prim_vf,q_T_sf,m_dot_evap,rhs_vf,q_prim_ts1,q_prim_ts2,rhs_mv,rhs_pb,max_dt,rk_coef,stor,bc_type]')
+    #:set time_stepper_gpu_vars = '[q_cons_ts,q_prim_vf,q_T_sf,m_dot_evap,' + &
+        & 'rhs_vf,q_prim_ts1,q_prim_ts2,rhs_mv,rhs_pb,max_dt,rk_coef,' + &
+        & 'stor,bc_type]'
+    $:GPU_DECLARE(create=time_stepper_gpu_vars)
 
 !> @cond
 #if defined(__NVCOMPILER_GPU_UNIFIED_MEM)
@@ -182,7 +185,9 @@ contains
         pool_dims(4) = sys_size
         pool_starts(4) = 1
 #ifdef MFC_MIXED_PRECISION
-        pool_size = 1_8*(idwbuff(1)%end - idwbuff(1)%beg + 1)*(idwbuff(2)%end - idwbuff(2)%beg + 1)*(idwbuff(3)%end - idwbuff(3)%beg + 1)*sys_size
+        pool_size = 1_8*(idwbuff(1)%end - idwbuff(1)%beg + 1)* &
+                    (idwbuff(2)%end - idwbuff(2)%beg + 1)* &
+                    (idwbuff(3)%end - idwbuff(3)%beg + 1)*sys_size
         call hipCheck(hipMalloc_(cptr_device, pool_size*2_8))
         call c_f_pointer(cptr_device, q_cons_ts_pool_device, shape=pool_dims)
         q_cons_ts_pool_device(idwbuff(1)%beg:, idwbuff(2)%beg:, idwbuff(3)%beg:, 1:) => q_cons_ts_pool_device
@@ -203,7 +208,8 @@ contains
         if (num_ts == 2) then
             call hipCheck(hipMallocManaged(q_cons_ts_pool_host, dims8=pool_dims, lbounds8=pool_starts, flags=hipMemAttachGlobal))
 #if defined(MFC_OpenMP)
-            call hipCheck(hipMemAdvise(c_loc(q_cons_ts_pool_host), c_sizeof(q_cons_ts_pool_host), hipMemAdviseSetPreferredLocation, -1))
+            call hipCheck(hipMemAdvise(c_loc(q_cons_ts_pool_host), &
+                c_sizeof(q_cons_ts_pool_host), hipMemAdviseSetPreferredLocation, -1))
 #endif
         end if
 #endif
@@ -1235,7 +1241,9 @@ contains
 
             if (patch_ib(i)%moving_ibm > 0) then
                 patch_ib(i)%vel = (rk_coef(s, 1)*patch_ib(i)%step_vel + rk_coef(s, 2)*patch_ib(i)%vel)/rk_coef(s, 4)
-                patch_ib(i)%angular_vel = (rk_coef(s, 1)*patch_ib(i)%step_angular_vel + rk_coef(s, 2)*patch_ib(i)%angular_vel)/rk_coef(s, 4)
+                patch_ib(i)%angular_vel = &
+                    (rk_coef(s, 1)*patch_ib(i)%step_angular_vel + &
+                     rk_coef(s, 2)*patch_ib(i)%angular_vel)/rk_coef(s, 4)
 
                 if (patch_ib(i)%moving_ibm == 1) then
                     ! plug in analytic velocities for 1-way coupling, if it exists
@@ -1251,18 +1259,35 @@ contains
                     patch_ib(i)%vel = patch_ib(i)%vel + rk_coef(s, 3)*dt*(patch_ib(i)%force/patch_ib(i)%mass)/rk_coef(s, 4)
 
                     ! update the angular velocity with the torque value
-                    patch_ib(i)%angular_vel = (patch_ib(i)%angular_vel*patch_ib(i)%moment) + (rk_coef(s, 3)*dt*patch_ib(i)%torque/rk_coef(s, 4)) ! add the torque to the angular momentum
-                    call s_compute_moment_of_inertia(i, patch_ib(i)%angular_vel) ! update the moment of inertia to be based on the direction of the angular momentum
-                    patch_ib(i)%angular_vel = patch_ib(i)%angular_vel/patch_ib(i)%moment ! convert back to angular velocity with the new moment of inertia
+                    ! Add the torque to the angular momentum.
+                    patch_ib(i)%angular_vel = &
+                        (patch_ib(i)%angular_vel*patch_ib(i)%moment) + &
+                        (rk_coef(s, 3)*dt*patch_ib(i)%torque/rk_coef(s, 4))
+                    ! Update moment of inertia from the angular-momentum direction.
+                    call s_compute_moment_of_inertia(i, patch_ib(i)%angular_vel)
+                    ! Convert back to angular velocity with the new moment of inertia.
+                    patch_ib(i)%angular_vel = patch_ib(i)%angular_vel/patch_ib(i)%moment
                 end if
 
                 ! Update the angle of the IB
-                patch_ib(i)%angles = (rk_coef(s, 1)*patch_ib(i)%step_angles + rk_coef(s, 2)*patch_ib(i)%angles + rk_coef(s, 3)*patch_ib(i)%angular_vel*dt)/rk_coef(s, 4)
+                patch_ib(i)%angles = &
+                    (rk_coef(s, 1)*patch_ib(i)%step_angles + &
+                     rk_coef(s, 2)*patch_ib(i)%angles + &
+                     rk_coef(s, 3)*patch_ib(i)%angular_vel*dt)/rk_coef(s, 4)
 
                 ! Update the position of the IB
-                patch_ib(i)%x_centroid = (rk_coef(s, 1)*patch_ib(i)%step_x_centroid + rk_coef(s, 2)*patch_ib(i)%x_centroid + rk_coef(s, 3)*patch_ib(i)%vel(1)*dt)/rk_coef(s, 4)
-                patch_ib(i)%y_centroid = (rk_coef(s, 1)*patch_ib(i)%step_y_centroid + rk_coef(s, 2)*patch_ib(i)%y_centroid + rk_coef(s, 3)*patch_ib(i)%vel(2)*dt)/rk_coef(s, 4)
-                patch_ib(i)%z_centroid = (rk_coef(s, 1)*patch_ib(i)%step_z_centroid + rk_coef(s, 2)*patch_ib(i)%z_centroid + rk_coef(s, 3)*patch_ib(i)%vel(3)*dt)/rk_coef(s, 4)
+                patch_ib(i)%x_centroid = &
+                    (rk_coef(s, 1)*patch_ib(i)%step_x_centroid + &
+                     rk_coef(s, 2)*patch_ib(i)%x_centroid + &
+                     rk_coef(s, 3)*patch_ib(i)%vel(1)*dt)/rk_coef(s, 4)
+                patch_ib(i)%y_centroid = &
+                    (rk_coef(s, 1)*patch_ib(i)%step_y_centroid + &
+                     rk_coef(s, 2)*patch_ib(i)%y_centroid + &
+                     rk_coef(s, 3)*patch_ib(i)%vel(2)*dt)/rk_coef(s, 4)
+                patch_ib(i)%z_centroid = &
+                    (rk_coef(s, 1)*patch_ib(i)%step_z_centroid + &
+                     rk_coef(s, 2)*patch_ib(i)%z_centroid + &
+                     rk_coef(s, 3)*patch_ib(i)%vel(3)*dt)/rk_coef(s, 4)
             end if
         end do
 
