@@ -1,0 +1,39 @@
+C1 vs C2 short diffusion regression comparison
+C1: /home/tripatmn/mfc_work/MFC_alpha_diag/runs/shockdroplet_air_sk54/alpha_source_fix/C1_diffusion_ON_reactions_OFF_0p2us
+C2: /home/tripatmn/mfc_work/MFC_alpha_diag/runs/shockdroplet_air_sk54/alpha_source_fix/C2_diffusion_ON_reactions_ON_0p2us
+matched analyzed saves: [1, 2, 3, 4]
+time window: 0.050 to 0.200 us
+
+Runtime parsing:
+  run_time.inf columns are Time-step, dt, Time, ICFL Max.
+  dt and Time are fixed six-decimal fields and are printed as 0.000000 for these sub-microsecond runs.
+  Per-save timestep count and dt are therefore NaN rather than inferred.
+  C1 final runtime/timestep/cost: 6288.0 s / 3172 / 1.9823455233291298 s-step
+  C2 final runtime/timestep/cost: 8581.0 s / 3172 / 2.7052332912988653 s-step
+
+Failure-message scan:
+  C1 explicit failure lines: 0
+  C2 explicit failure lines: 0
+  Chemistry limiter aggregate activity: not recorded in available run files.
+
+Final matched-save selected metrics:
+  valid_gas_Tmax: C1=1.9148186289249545e+03 C2=1.9147806538273476e+03 diff=-3.7975097606931740e-02 rel=-1.983222e-05 class=small
+  valid_gas_Tmean: C1=8.2055801752386833e+02 C2=8.2055933071442064e+02 diff=1.3131905523096066e-03 rel=1.600363e-06 class=small
+  rhoY_NC12H26_integral: C1=1.3276795724597155e-08 C2=1.2993978305770415e-08 diff=-2.8281741882673958e-10 rel=-2.130163e-02 class=meaningful
+  rhoY_O2_integral: C1=3.4218580708273204e-07 C2=3.4218487478490187e-07 diff=-9.3229783017065545e-13 rel=-2.724537e-06 class=roundoff-level
+  rhoY_OH_integral: C1=0.0000000000000000e+00 C2=4.3357222150807538e-13 diff=4.3357222150807538e-13 rel=nan class=roundoff-level
+  rhoY_HO2_integral: C1=0.0000000000000000e+00 C2=1.7051947195943511e-12 diff=1.7051947195943511e-12 rel=nan class=small-to-moderate
+  rhoY_H2O2_integral: C1=0.0000000000000000e+00 C2=3.8251168329796818e-14 diff=3.8251168329796818e-14 rel=nan class=roundoff-level
+  rhoY_H2O_integral: C1=0.0000000000000000e+00 C2=1.2619380078798070e-12 diff=1.2619380078798070e-12 rel=nan class=small-to-moderate
+  rhoY_CO2_integral: C1=0.0000000000000000e+00 C2=3.7003370122726246e-14 diff=3.7003370122726246e-14 rel=nan class=roundoff-level
+  vaporized_fuel_mass_proxy_vapor_alpha_rho_integral: C1=2.0733615493884968e-08 C2=2.0675217998516678e-08 diff=-5.8397495368290414e-11 rel=-2.816561e-03 class=small-to-moderate
+  liquid_alpha_area: C1=7.8678548192849067e-09 C2=7.8678548192849067e-09 diff=0.0000000000000000e+00 rel=0.000000e+00 class=roundoff-level
+  D2_m2: C1=1.0017663888148669e-08 C2=1.0017663888148669e-08 diff=0.0000000000000000e+00 rel=0.000000e+00 class=roundoff-level
+  max_abs_sumY_minus_1: C1=4.7073456244106637e-14 C2=7.3940853440035426e-14 diff=2.6867397195928788e-14 rel=5.707547e-01 class=roundoff-level
+  gas_species_mass_relative_error: C1=-1.4306339430523659e-15 C2=-2.1460147318295572e-15 diff=-7.1538078877719130e-16 rel=5.000446e-01 class=roundoff-level
+
+Scientific interpretation:
+  This 0.2 microsecond interval is a regression and very-early chemistry comparison only.
+  Species admissibility and gas/species mass consistency remain clean in both C1 and C2 saved outputs.
+  Small radical/product or temperature differences are early chemistry response, not ignition evidence.
+  Vaporization and droplet-deformation metrics are too early-window to interpret physically beyond regression consistency.
