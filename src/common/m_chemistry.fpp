@@ -930,6 +930,9 @@ contains
         integer :: local_inactive_alpha_g_count, local_inactive_alpha_liq_count
         integer :: global_face_count, global_active_face_count, global_inactive_face_count
         integer :: global_inactive_alpha_g_count, global_inactive_alpha_liq_count
+        integer :: diff_failure_claimed, diff_failure_old_claim, diff_failure_code
+        integer, dimension(3) :: diff_failure_ijk, diff_failure_int_data
+        real(wp), dimension(32) :: diff_failure_data
         real(wp), parameter :: model3_diff_alpha_min = 1.0e-4_wp
         real(wp), parameter :: model3_diff_alpha_liq_max = 0.99_wp
 
@@ -961,6 +964,11 @@ contains
                 local_inactive_alpha_liq_count = 0
                 local_max_species_flux = 0._wp
                 local_max_energy_flux = 0._wp
+                diff_failure_claimed = 0
+                diff_failure_code = 0
+                diff_failure_ijk = 0
+                diff_failure_int_data = 0
+                diff_failure_data = 0._wp
                 #:set chem_diff_private = '[x,y,z,i,eqn,Ys_L,Ys_R,Ys_cell,Xs_L,Xs_R,' + &
                     & 'mass_diffusivities_mixavg1,mass_diffusivities_mixavg2,' + &
                     & 'mass_diffusivities_mixavg_Cell,h_l,h_r,Xs_cell,h_k,' + &
@@ -978,7 +986,7 @@ contains
                     & 'h_max,h_max_abs,thermal_term,unweighted_energy_flux,' + &
                     & 'intrinsic_face_inactive,intrinsic_inactive_due_alpha_g,' + &
                     & 'intrinsic_inactive_due_alpha_liq,intrinsic_flux_invalid,' + &
-                    & 'corrected_property_invalid]'
+                    & 'corrected_property_invalid,diff_failure_old_claim]'
                 #:set chem_diff_reduction = '[[local_face_count,local_active_face_count,' + &
                     & 'local_inactive_face_count,local_inactive_alpha_g_count,' + &
                     & 'local_inactive_alpha_liq_count], [local_max_species_flux,' + &
@@ -986,7 +994,9 @@ contains
                 #:set chem_diff_copy = '[local_face_count,local_active_face_count,' + &
                     & 'local_inactive_face_count,local_inactive_alpha_g_count,' + &
                     & 'local_inactive_alpha_liq_count,local_max_species_flux,' + &
-                    & 'local_max_energy_flux]'
+                    & 'local_max_energy_flux,diff_failure_claimed,' + &
+                    & 'diff_failure_code,diff_failure_ijk,diff_failure_int_data,' + &
+                    & 'diff_failure_data]'
                 $:GPU_PARALLEL_LOOP(collapse=3, &
                     private=chem_diff_private, reduction=chem_diff_reduction, &
                     reductionOp='[+, MAX]', copy=chem_diff_copy, copyin='[offsets]')
@@ -1095,22 +1105,28 @@ contains
 	                                    cycle
 	                                end if
 	                                corrected_property_invalid = .false.
-	                                if (rho_g_L /= rho_g_L .or. rho_g_R /= rho_g_R .or. rho_g_L <= 0._wp .or. rho_g_R <= 0._wp) &
-	                                    corrected_property_invalid = .true.
-	                                if (rho_g_intrinsic_L /= rho_g_intrinsic_L .or. rho_g_intrinsic_R /= rho_g_intrinsic_R .or. &
-	                                    rho_g_intrinsic_L <= 0._wp .or. rho_g_intrinsic_R <= 0._wp) corrected_property_invalid = .true.
-	                                if (corrected_property_invalid) then
-	                                    write (output_unit, '(&
-	                                        &"TEMP_CHEM_DIFFUSION_MODEL3_GAS_DENSITY_FIX_INVALID rank=",I0,&
-	                                        &" direction=",I0," face_xyz=",3(I0,1X),&
-	                                        &" reason=density alpha_g_L=",ES16.8," alpha_g_R=",ES16.8,&
-	                                        &" rho_g_stored_L=",ES16.8," rho_g_stored_R=",ES16.8,&
-	                                        &" rho_g_intrinsic_L=",ES16.8," rho_g_intrinsic_R=",ES16.8)') &
-	                                        proc_rank, idir, x, y, z, alpha_g_L, alpha_g_R, rho_g_L, rho_g_R, &
-	                                        rho_g_intrinsic_L, rho_g_intrinsic_R
-	                                    call flush(output_unit)
-	                                    call s_mpi_abort("TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_FIX invalid gas density")
-	                                end if
+		                                if (rho_g_L /= rho_g_L .or. rho_g_R /= rho_g_R .or. rho_g_L <= 0._wp .or. rho_g_R <= 0._wp) &
+		                                    corrected_property_invalid = .true.
+		                                if (rho_g_intrinsic_L /= rho_g_intrinsic_L .or. rho_g_intrinsic_R /= rho_g_intrinsic_R .or. &
+		                                    rho_g_intrinsic_L <= 0._wp .or. rho_g_intrinsic_R <= 0._wp) &
+		                                    corrected_property_invalid = .true.
+		                                if (corrected_property_invalid) then
+		                                    $:GPU_ATOMIC(atomic='capture')
+		                                    diff_failure_old_claim = diff_failure_claimed
+		                                    diff_failure_claimed = 1
+		                                    if (diff_failure_old_claim == 0) then
+		                                        diff_failure_code = 1
+		                                        diff_failure_ijk = (/x, y, z/)
+		                                        diff_failure_int_data = (/idir, 0, 0/)
+		                                        diff_failure_data(5) = rho_g_L
+		                                        diff_failure_data(6) = rho_g_R
+		                                        diff_failure_data(7) = rho_g_intrinsic_L
+		                                        diff_failure_data(8) = rho_g_intrinsic_R
+		                                        diff_failure_data(9) = alpha_g_L
+		                                        diff_failure_data(10) = alpha_g_R
+		                                    end if
+		                                    cycle
+		                                end if
 	                                local_active_face_count = local_active_face_count + 1
 	                                alpha_face = min(alpha_g_L, alpha_g_R)
 	                                rho_L = rho_g_intrinsic_L
@@ -1133,25 +1149,30 @@ contains
 	                                    corrected_property_invalid = .true.
 	                                if (T_L /= T_L .or. T_R /= T_R .or. T_L <= 1.e-6_wp .or. T_R <= 1.e-6_wp .or. &
 	                                    T_L > 1.e8_wp .or. T_R > 1.e8_wp) corrected_property_invalid = .true.
-	                                if (model3_intrinsic_alpha_fix_enabled .and. (T_L /= T_L .or. T_R /= T_R)) &
-	                                    corrected_property_invalid = .true.
-	                                if (corrected_property_invalid) then
-	                                    write (output_unit, '(&
-	                                        &"TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_INVALID rank=",I0,&
-	                                        &" direction=",I0," face_xyz=",3(I0,1X),&
-	                                        &" rho_old_L=",ES16.8," rho_old_R=",ES16.8,&
-	                                        &" rho_g_L=",ES16.8," rho_g_R=",ES16.8,&
-	                                        &" P_L=",ES16.8," P_R=",ES16.8,&
-	                                        &" T_old_L=",ES16.8," T_old_R=",ES16.8,&
-	                                        &" T_corr_L=",ES16.8," T_corr_R=",ES16.8)') &
-	                                        proc_rank, idir, x, y, z, rho_old_L, rho_old_R, rho_g_L, rho_g_R, &
-	                                        P_L, P_R, T_old_L, T_old_R, T_L, T_R
-	                                    call flush(output_unit)
-		                                    call s_mpi_abort(&
-                                        "TEMP_CHEM_DIFFUSION_MODEL3_GAS_DENSITY_FIX "// &
-                                        "invalid corrected density/temperature")
-	                                end if
-	                            end if
+		                                if (model3_intrinsic_alpha_fix_enabled .and. (T_L /= T_L .or. T_R /= T_R)) &
+		                                    corrected_property_invalid = .true.
+		                                if (corrected_property_invalid) then
+		                                    $:GPU_ATOMIC(atomic='capture')
+		                                    diff_failure_old_claim = diff_failure_claimed
+		                                    diff_failure_claimed = 1
+		                                    if (diff_failure_old_claim == 0) then
+		                                        diff_failure_code = 2
+		                                        diff_failure_ijk = (/x, y, z/)
+		                                        diff_failure_int_data = (/idir, 0, 0/)
+		                                        diff_failure_data(1) = P_L
+		                                        diff_failure_data(2) = P_R
+		                                        diff_failure_data(3) = rho_old_L
+		                                        diff_failure_data(4) = rho_old_R
+		                                        diff_failure_data(5) = rho_g_L
+		                                        diff_failure_data(6) = rho_g_R
+		                                        diff_failure_data(14) = T_old_L
+		                                        diff_failure_data(15) = T_old_R
+		                                        diff_failure_data(16) = T_L
+		                                        diff_failure_data(17) = T_R
+		                                    end if
+		                                    cycle
+		                                end if
+		                            end if
 
                             rho_cell = 0.5_wp*(rho_L + rho_R)
                             dT_dxi = (T_R - T_L)/grid_spacing
@@ -1172,39 +1193,46 @@ contains
 	                                if (lambda_L /= lambda_L .or. lambda_R /= lambda_R .or. lambda_L < 0._wp .or. lambda_R < 0._wp) &
 	                                    corrected_property_invalid = .true.
 	                                $:GPU_LOOP(parallelism='[seq]')
-	                                do i = 1, num_species
-	                                    if (mass_diffusivities_mixavg1(i) /= mass_diffusivities_mixavg1(i) .or. &
-	                                        mass_diffusivities_mixavg2(i) /= mass_diffusivities_mixavg2(i) .or. &
-	                                        mass_diffusivities_mixavg1(i) < 0._wp .or. mass_diffusivities_mixavg2(i) < 0._wp .or. &
-	                                        h_l(i) /= h_l(i) .or. h_r(i) /= h_r(i)) corrected_property_invalid = .true.
-	                                end do
-	                                if (corrected_property_invalid) then
-	                                    write (output_unit, '(&
-		                                        &"TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_INVALID_PROPERTY rank=",I0,&
-	                                        &" direction=",I0," face_xyz=",3(I0,1X),&
-	                                        &" P_L=",ES16.8," P_R=",ES16.8,&
-	                                        &" rho_old_L=",ES16.8," rho_old_R=",ES16.8,&
-	                                        &" rho_g_L=",ES16.8," rho_g_R=",ES16.8,&
-	                                        &" rho_total_L=",ES16.8," rho_total_R=",ES16.8,&
-	                                        &" alpha_g_L=",ES16.8," alpha_g_R=",ES16.8,&
-	                                        &" alpha_liq_L=",ES16.8," alpha_liq_R=",ES16.8,&
-	                                        &" p_over_rho_g_L=",ES16.8," p_over_rho_g_R=",ES16.8,&
-	                                        &" MW_L=",ES16.8," MW_R=",ES16.8,&
-	                                        &" Rgas_L=",ES16.8," Rgas_R=",ES16.8,&
-	                                        &" T_old_L=",ES16.8," T_old_R=",ES16.8,&
-	                                        &" T_corr_L=",ES16.8," T_corr_R=",ES16.8,&
-	                                        &" sumY_L=",ES16.8," sumY_R=",ES16.8,&
-	                                        &" lambda_L=",ES16.8," lambda_R=",ES16.8)') &
-	                                        proc_rank, idir, x, y, z, P_L, P_R, rho_old_L, rho_old_R, rho_g_L, rho_g_R, &
-	                                        rho_total_L, rho_total_R, alpha_g_L, alpha_g_R, alpha_liq_L, alpha_liq_R, &
-	                                        P_L/rho_g_L, P_R/rho_g_R, MW_L, MW_R, Rgas_L, Rgas_R, &
-	                                        T_old_L, T_old_R, T_L, T_R, sumY_L, sumY_R, lambda_L, lambda_R
-	                                    call flush(output_unit)
-		                                    call s_mpi_abort(&
-                                        "TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_FIX "// &
-                                        "invalid corrected transport/enthalpy property")
-	                                end if
-	                            end if
+		                                do i = 1, num_species
+		                                    if (mass_diffusivities_mixavg1(i) /= mass_diffusivities_mixavg1(i) .or. &
+		                                        mass_diffusivities_mixavg2(i) /= mass_diffusivities_mixavg2(i) .or. &
+		                                        mass_diffusivities_mixavg1(i) < 0._wp .or. mass_diffusivities_mixavg2(i) < 0._wp .or. &
+		                                        h_l(i) /= h_l(i) .or. h_r(i) /= h_r(i)) corrected_property_invalid = .true.
+		                                end do
+		                                if (corrected_property_invalid) then
+		                                    $:GPU_ATOMIC(atomic='capture')
+		                                    diff_failure_old_claim = diff_failure_claimed
+		                                    diff_failure_claimed = 1
+		                                    if (diff_failure_old_claim == 0) then
+		                                        diff_failure_code = 3
+		                                        diff_failure_ijk = (/x, y, z/)
+		                                        diff_failure_int_data = (/idir, 0, 0/)
+		                                        diff_failure_data(1) = P_L
+		                                        diff_failure_data(2) = P_R
+		                                        diff_failure_data(3) = rho_old_L
+		                                        diff_failure_data(4) = rho_old_R
+		                                        diff_failure_data(5) = rho_g_L
+		                                        diff_failure_data(6) = rho_g_R
+		                                        diff_failure_data(9) = alpha_g_L
+		                                        diff_failure_data(10) = alpha_g_R
+		                                        diff_failure_data(11) = alpha_liq_L
+		                                        diff_failure_data(12) = alpha_liq_R
+		                                        diff_failure_data(13) = rho_total_L
+		                                        diff_failure_data(14) = rho_total_R
+		                                        diff_failure_data(16) = T_L
+		                                        diff_failure_data(17) = T_R
+		                                        diff_failure_data(18) = MW_L
+		                                        diff_failure_data(19) = MW_R
+		                                        diff_failure_data(20) = Rgas_L
+		                                        diff_failure_data(21) = Rgas_R
+		                                        diff_failure_data(22) = sumY_L
+		                                        diff_failure_data(23) = sumY_R
+		                                        diff_failure_data(24) = lambda_L
+		                                        diff_failure_data(25) = lambda_R
+		                                    end if
+		                                    cycle
+		                                end if
+		                            end if
 
                             ! Calculate species properties and gradients
                             $:GPU_LOOP(parallelism='[seq]')
@@ -1335,24 +1363,29 @@ contains
 	                                    if (js_idx == 10) J_O2 = Mass_Diffu_Flux(js_idx)
 	                                    if (js_idx == fuel_species_id) J_fuel = Mass_Diffu_Flux(js_idx)
 	                                    if (Mass_Diffu_Flux(js_idx) /= Mass_Diffu_Flux(js_idx)) intrinsic_flux_invalid = .true.
-	                                end do
-	                                J_weighted_min = J_min
-	                                J_weighted_max = J_max
-	                                J_weighted_max_abs = J_max_abs
-	                                if (Mass_Diffu_Energy /= Mass_Diffu_Energy) intrinsic_flux_invalid = .true.
-	                                if (intrinsic_flux_invalid) then
-	                                    write (output_unit, '(&
-	                                        &"TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_INVALID rank=",I0,&
-	                                        &" direction=",I0," face_xyz=",3(I0,1X),&
-	                                        &" reason=flux alpha_face=",ES16.8,&
-	                                        &" J_unweighted_min=",ES16.8," J_unweighted_max=",ES16.8,&
-	                                        &" J_weighted_min=",ES16.8," J_weighted_max=",ES16.8,&
-	                                        &" energy_unweighted=",ES16.8," energy_weighted=",ES16.8)') &
-	                                        proc_rank, idir, x, y, z, alpha_face, J_unweighted_min, J_unweighted_max, &
-	                                        J_weighted_min, J_weighted_max, unweighted_energy_flux, Mass_Diffu_Energy
-	                                    call flush(output_unit)
-	                                    call s_mpi_abort("TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_FIX invalid final flux")
-	                                end if
+		                                end do
+		                                J_weighted_min = J_min
+		                                J_weighted_max = J_max
+		                                J_weighted_max_abs = J_max_abs
+		                                if (Mass_Diffu_Energy /= Mass_Diffu_Energy) intrinsic_flux_invalid = .true.
+		                                if (intrinsic_flux_invalid) then
+		                                    $:GPU_ATOMIC(atomic='capture')
+		                                    diff_failure_old_claim = diff_failure_claimed
+		                                    diff_failure_claimed = 1
+		                                    if (diff_failure_old_claim == 0) then
+		                                        diff_failure_code = 4
+		                                        diff_failure_ijk = (/x, y, z/)
+		                                        diff_failure_int_data = (/idir, max_abs_J_idx, max_abs_h_idx/)
+		                                        diff_failure_data(26) = J_unweighted_min
+		                                        diff_failure_data(27) = J_unweighted_max
+		                                        diff_failure_data(28) = J_weighted_min
+		                                        diff_failure_data(29) = J_weighted_max
+		                                        diff_failure_data(30) = unweighted_energy_flux
+		                                        diff_failure_data(31) = Mass_Diffu_Energy
+		                                        diff_failure_data(32) = alpha_face
+		                                    end if
+		                                    cycle
+		                                end if
 	                                local_max_species_flux = max(local_max_species_flux, J_weighted_max_abs)
 	                                local_max_energy_flux = max(local_max_energy_flux, abs(Mass_Diffu_Energy))
 	                            else
@@ -1369,13 +1402,98 @@ contains
 	                                flux_src_vf(eqn)%sf(x, y, z) = flux_src_vf(eqn)%sf(x, y, z) - Mass_Diffu_Flux(eqn - chemxb + 1)
 	                            end do
 	                        end do
-                    end do
-                end do
-                $:END_GPU_PARALLEL_LOOP()
+	                    end do
+	                end do
+	                $:END_GPU_PARALLEL_LOOP()
 
-	                if (model3_intrinsic_alpha_fix_enabled) then
-	                    if (num_procs > 1) then
-	                        call s_mpi_allreduce_integer_sum(local_face_count, global_face_count)
+                if (diff_failure_claimed /= 0) then
+                    select case (diff_failure_code)
+                    case (1)
+                        write (output_unit, '(&
+                            &"TEMP_CHEM_DIFFUSION_MODEL3_GAS_DENSITY_FIX_INVALID rank=",I0,&
+                            &" direction=",I0," face_xyz=",3(I0,1X),&
+                            &" reason=density alpha_g_L=",ES16.8," alpha_g_R=",ES16.8,&
+                            &" rho_g_stored_L=",ES16.8," rho_g_stored_R=",ES16.8,&
+                            &" rho_g_intrinsic_L=",ES16.8," rho_g_intrinsic_R=",ES16.8)') &
+                            proc_rank, diff_failure_int_data(1), diff_failure_ijk, &
+                            diff_failure_data(9), diff_failure_data(10), &
+                            diff_failure_data(5), diff_failure_data(6), &
+                            diff_failure_data(7), diff_failure_data(8)
+                        call flush(output_unit)
+                        call s_mpi_abort("TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_FIX invalid gas density")
+                    case (2)
+                        write (output_unit, '(&
+                            &"TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_INVALID rank=",I0,&
+                            &" direction=",I0," face_xyz=",3(I0,1X),&
+                            &" rho_old_L=",ES16.8," rho_old_R=",ES16.8,&
+                            &" rho_g_L=",ES16.8," rho_g_R=",ES16.8,&
+                            &" P_L=",ES16.8," P_R=",ES16.8,&
+                            &" T_old_L=",ES16.8," T_old_R=",ES16.8,&
+                            &" T_corr_L=",ES16.8," T_corr_R=",ES16.8)') &
+                            proc_rank, diff_failure_int_data(1), diff_failure_ijk, &
+                            diff_failure_data(3), diff_failure_data(4), &
+                            diff_failure_data(5), diff_failure_data(6), &
+                            diff_failure_data(1), diff_failure_data(2), &
+                            diff_failure_data(14), diff_failure_data(15), &
+                            diff_failure_data(16), diff_failure_data(17)
+                        call flush(output_unit)
+                        call s_mpi_abort("TEMP_CHEM_DIFFUSION_MODEL3_GAS_DENSITY_FIX "// &
+                                         "invalid corrected density/temperature")
+                    case (3)
+                        write (output_unit, '(&
+                            &"TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_INVALID_PROPERTY rank=",I0,&
+                            &" direction=",I0," face_xyz=",3(I0,1X),&
+                            &" P_L=",ES16.8," P_R=",ES16.8,&
+                            &" rho_old_L=",ES16.8," rho_old_R=",ES16.8,&
+                            &" rho_g_L=",ES16.8," rho_g_R=",ES16.8,&
+                            &" rho_total_L=",ES16.8," rho_total_R=",ES16.8,&
+                            &" alpha_g_L=",ES16.8," alpha_g_R=",ES16.8,&
+                            &" alpha_liq_L=",ES16.8," alpha_liq_R=",ES16.8,&
+                            &" MW_L=",ES16.8," MW_R=",ES16.8,&
+                            &" Rgas_L=",ES16.8," Rgas_R=",ES16.8,&
+                            &" T_corr_L=",ES16.8," T_corr_R=",ES16.8,&
+                            &" sumY_L=",ES16.8," sumY_R=",ES16.8,&
+                            &" lambda_L=",ES16.8," lambda_R=",ES16.8)') &
+                            proc_rank, diff_failure_int_data(1), diff_failure_ijk, &
+                            diff_failure_data(1), diff_failure_data(2), &
+                            diff_failure_data(3), diff_failure_data(4), &
+                            diff_failure_data(5), diff_failure_data(6), &
+                            diff_failure_data(13), diff_failure_data(14), &
+                            diff_failure_data(9), diff_failure_data(10), &
+                            diff_failure_data(11), diff_failure_data(12), &
+                            diff_failure_data(18), diff_failure_data(19), &
+                            diff_failure_data(20), diff_failure_data(21), &
+                            diff_failure_data(16), diff_failure_data(17), &
+                            diff_failure_data(22), diff_failure_data(23), &
+                            diff_failure_data(24), diff_failure_data(25)
+                        call flush(output_unit)
+                        call s_mpi_abort("TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_FIX "// &
+                                         "invalid corrected transport/enthalpy property")
+                    case (4)
+                        write (output_unit, '(&
+                            &"TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_INVALID rank=",I0,&
+                            &" direction=",I0," face_xyz=",3(I0,1X),&
+                            &" reason=flux max_abs_J_idx=",I0," max_abs_h_idx=",I0,&
+                            &" alpha_face=",ES16.8,&
+                            &" J_unweighted_min=",ES16.8," J_unweighted_max=",ES16.8,&
+                            &" J_weighted_min=",ES16.8," J_weighted_max=",ES16.8,&
+                            &" energy_unweighted=",ES16.8," energy_weighted=",ES16.8)') &
+                            proc_rank, diff_failure_int_data(1), diff_failure_ijk, &
+                            diff_failure_int_data(2), diff_failure_int_data(3), &
+                            diff_failure_data(32), diff_failure_data(26), &
+                            diff_failure_data(27), diff_failure_data(28), &
+                            diff_failure_data(29), diff_failure_data(30), &
+                            diff_failure_data(31)
+                        call flush(output_unit)
+                        call s_mpi_abort("TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_FIX invalid final flux")
+                    case default
+                        call s_mpi_abort("TEMP_CHEM_DIFFUSION_MODEL3_INTRINSIC_ALPHA_FIX invalid unknown state")
+                    end select
+                end if
+
+		                if (model3_intrinsic_alpha_fix_enabled) then
+		                    if (num_procs > 1) then
+		                        call s_mpi_allreduce_integer_sum(local_face_count, global_face_count)
 	                        call s_mpi_allreduce_integer_sum(local_active_face_count, global_active_face_count)
 	                        call s_mpi_allreduce_integer_sum(local_inactive_face_count, global_inactive_face_count)
 	                        call s_mpi_allreduce_integer_sum(local_inactive_alpha_g_count, global_inactive_alpha_g_count)
