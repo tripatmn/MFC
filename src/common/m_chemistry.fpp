@@ -933,8 +933,8 @@ contains
         integer :: diff_failure_claimed, diff_failure_old_claim, diff_failure_code
         integer, dimension(3) :: diff_failure_ijk, diff_failure_int_data
         real(wp), dimension(32) :: diff_failure_data
-        real(wp), parameter :: model3_diff_alpha_min = 1.0e-4_wp
-        real(wp), parameter :: model3_diff_alpha_liq_max = 0.99_wp
+        real(wp), parameter :: model3_diff_alpha_min = 0.5_wp
+        real(wp), parameter :: model3_diff_alpha_liq_max = 0.5_wp
 
         isc1 = irx; isc2 = iry; isc3 = irz
 
