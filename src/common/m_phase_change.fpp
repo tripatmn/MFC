@@ -225,7 +225,9 @@ contains
         integer, optional, intent(in) :: t_step_diag, stage_diag
 #endif
         real(wp) :: pS, pSOV, pSSL !< equilibrium pressure for mixture, overheated vapor, and subcooled liquid
-        real(wp) :: TS, TSOV, TSSL, TSatOV, TSatSL !< equilibrium temperature for mixture, overheated vapor, and subcooled liquid. Saturation Temperatures at overheated vapor and subcooled liquid
+        !< equilibrium temperature for mixture, overheated vapor, and subcooled liquid.
+        !< Saturation temperatures at overheated vapor and subcooled liquid.
+        real(wp) :: TS, TSOV, TSSL, TSatOV, TSatSL
         real(wp) :: no_transfer_pS, no_transfer_TS
         real(wp) :: rhoe, dynE, rhos !< total internal energy, kinetic energy, and total entropy
         real(wp) :: rho, rM, m1, m2, m2_after, delta_m_vapor, MCT !< total density, total reacting mass, individual reacting masses
@@ -705,6 +707,7 @@ contains
                             $:GPU_ATOMIC(atomic='capture')
                             signed_failure_old_claim = phase_change_signed_failure_claimed
                             phase_change_signed_failure_claimed = 1
+                            $:END_GPU_ATOMIC()
                             if (signed_failure_old_claim == 0) then
                                 failure_rho_g = 0._wp
                                 if (num_fluids == 1) then
@@ -1136,8 +1139,8 @@ contains
         p_infpTg = p_infpT
 
         if (((pS < 0.0_wp) .and. ((q_cons_vf(lp + contxb - 1)%sf(j, k, l) &
-                                   + q_cons_vf(vp + contxb - 1)%sf(j, k, l)) > ((rhoe &
-                                                                                 - gs_min(lp)*ps_inf(lp)/(gs_min(lp) - 1))/qvs(lp)))) .or. &
+                                   + q_cons_vf(vp + contxb - 1)%sf(j, k, l)) > &
+                                  ((rhoe - gs_min(lp)*ps_inf(lp)/(gs_min(lp) - 1))/qvs(lp)))) .or. &
             ((pS >= 0.0_wp) .and. (pS < 1.0e-1_wp))) then
 
             ! improve this initial condition
