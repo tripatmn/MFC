@@ -304,6 +304,11 @@
     $:WRAP_DIRECTIVE_LINE(acc_directive, '!$acc& ')
 #:enddef
 
+#:def END_ACC_ATOMIC()
+    #:set end_acc_directive = '!$acc end atomic'
+    $:end_acc_directive
+#:enddef
+
 #:def ACC_WAIT(extraAccArgs=None)
     #:set extraAccArgs_val = GEN_EXTRA_ARGS_STR(extraAccArgs)
     #:set clause_val = ''

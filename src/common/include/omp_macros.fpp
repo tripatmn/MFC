@@ -340,6 +340,11 @@
     $:WRAP_DIRECTIVE_LINE(omp_directive, '!$omp& ')
 #:enddef
 
+#:def END_OMP_ATOMIC()
+    #:set end_omp_directive = '!$omp end atomic'
+    $:end_omp_directive
+#:enddef
+
 #:def OMP_WAIT(extraOmpArgs=None)
     #:set extraOmpArgs_val = GEN_EXTRA_ARGS_STR(extraOmpArgs)
     #:set clause_val = ''

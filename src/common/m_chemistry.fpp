@@ -1111,10 +1111,11 @@ contains
 		                                    rho_g_intrinsic_L <= 0._wp .or. rho_g_intrinsic_R <= 0._wp) &
 		                                    corrected_property_invalid = .true.
 		                                if (corrected_property_invalid) then
-		                                    $:GPU_ATOMIC(atomic='capture')
-		                                    diff_failure_old_claim = diff_failure_claimed
-		                                    diff_failure_claimed = 1
-		                                    if (diff_failure_old_claim == 0) then
+			                                    $:GPU_ATOMIC(atomic='capture')
+			                                    diff_failure_old_claim = diff_failure_claimed
+			                                    diff_failure_claimed = 1
+			                                    $:END_GPU_ATOMIC()
+			                                    if (diff_failure_old_claim == 0) then
 		                                        diff_failure_code = 1
 		                                        diff_failure_ijk = (/x, y, z/)
 		                                        diff_failure_int_data = (/idir, 0, 0/)
@@ -1152,10 +1153,11 @@ contains
 		                                if (model3_intrinsic_alpha_fix_enabled .and. (T_L /= T_L .or. T_R /= T_R)) &
 		                                    corrected_property_invalid = .true.
 		                                if (corrected_property_invalid) then
-		                                    $:GPU_ATOMIC(atomic='capture')
-		                                    diff_failure_old_claim = diff_failure_claimed
-		                                    diff_failure_claimed = 1
-		                                    if (diff_failure_old_claim == 0) then
+			                                    $:GPU_ATOMIC(atomic='capture')
+			                                    diff_failure_old_claim = diff_failure_claimed
+			                                    diff_failure_claimed = 1
+			                                    $:END_GPU_ATOMIC()
+			                                    if (diff_failure_old_claim == 0) then
 		                                        diff_failure_code = 2
 		                                        diff_failure_ijk = (/x, y, z/)
 		                                        diff_failure_int_data = (/idir, 0, 0/)
@@ -1200,10 +1202,11 @@ contains
 		                                        h_l(i) /= h_l(i) .or. h_r(i) /= h_r(i)) corrected_property_invalid = .true.
 		                                end do
 		                                if (corrected_property_invalid) then
-		                                    $:GPU_ATOMIC(atomic='capture')
-		                                    diff_failure_old_claim = diff_failure_claimed
-		                                    diff_failure_claimed = 1
-		                                    if (diff_failure_old_claim == 0) then
+			                                    $:GPU_ATOMIC(atomic='capture')
+			                                    diff_failure_old_claim = diff_failure_claimed
+			                                    diff_failure_claimed = 1
+			                                    $:END_GPU_ATOMIC()
+			                                    if (diff_failure_old_claim == 0) then
 		                                        diff_failure_code = 3
 		                                        diff_failure_ijk = (/x, y, z/)
 		                                        diff_failure_int_data = (/idir, 0, 0/)
@@ -1369,10 +1372,11 @@ contains
 		                                J_weighted_max_abs = J_max_abs
 		                                if (Mass_Diffu_Energy /= Mass_Diffu_Energy) intrinsic_flux_invalid = .true.
 		                                if (intrinsic_flux_invalid) then
-		                                    $:GPU_ATOMIC(atomic='capture')
-		                                    diff_failure_old_claim = diff_failure_claimed
-		                                    diff_failure_claimed = 1
-		                                    if (diff_failure_old_claim == 0) then
+			                                    $:GPU_ATOMIC(atomic='capture')
+			                                    diff_failure_old_claim = diff_failure_claimed
+			                                    diff_failure_claimed = 1
+			                                    $:END_GPU_ATOMIC()
+			                                    if (diff_failure_old_claim == 0) then
 		                                        diff_failure_code = 4
 		                                        diff_failure_ijk = (/x, y, z/)
 		                                        diff_failure_int_data = (/idir, max_abs_J_idx, max_abs_h_idx/)

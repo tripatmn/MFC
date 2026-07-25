@@ -174,6 +174,17 @@
 #endif
 #:enddef
 
+#:def END_GPU_ATOMIC()
+    #:set acc_code = END_ACC_ATOMIC()
+    #:set omp_code = END_OMP_ATOMIC()
+
+#if defined(MFC_OpenACC)
+    $:acc_code
+#elif defined(MFC_OpenMP)
+    $:omp_code
+#endif
+#:enddef
+
 #:def GPU_UPDATE(host=None, device=None, extraAccArgs=None, extraOmpArgs=None)
     #:set acc_code = ACC_UPDATE(host=host, device=device, extraAccArgs=extraAccArgs)
     #:set omp_code = OMP_UPDATE(host=host, device=device, extraOmpArgs=extraOmpArgs)
