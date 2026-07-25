@@ -551,6 +551,7 @@ function(MFC_SETUP_TARGET)
 
                 target_compile_options(${a_target}
                     PRIVATE -gpu=keep,ptxinfo,lineinfo
+                            -Xptxas --disable-optimizer-constants
                 )
 
                 if (MFC_Fastmath)
