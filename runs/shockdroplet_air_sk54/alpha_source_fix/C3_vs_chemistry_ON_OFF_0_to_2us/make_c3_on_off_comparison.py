@@ -122,6 +122,17 @@ DIFF_METRICS = [key for key, _label, _file in TREND_GROUPS] + [
     "species_sumY_max_abs_error",
     "species_sumY_violation_count",
 ]
+EXPORT_CASE_ORDER = [
+    "chemistry_OFF_diffusion_OFF",
+    "chemistry_ON_diffusion_OFF",
+    "chemistry_ON_diffusion_ON_C3",
+]
+EXPORT_CASE_LABEL = {
+    "chemistry_OFF_diffusion_OFF": "chemistry OFF / diffusion OFF",
+    "chemistry_ON_diffusion_OFF": "chemistry ON / diffusion OFF",
+    "chemistry_ON_diffusion_ON_C3": "C3 chemistry ON / diffusion ON",
+}
+EXPORT_C3_CASE = "chemistry_ON_diffusion_ON_C3"
 
 
 @dataclass(frozen=True)
@@ -270,19 +281,115 @@ def read_fields(item: SaveItem, names: list[str]) -> dict[str, dict]:
     return {name: raw.read_field(item.run_dir, name, item.raw_step) for name in names}
 
 
+def empty_field() -> dict:
+    return {"available": False, "values": {}, "stats": raw.missing_stats([], 0)}
+
+
+def read_available_fields(item: SaveItem, names: list[str]) -> dict[str, dict]:
+    fields = {}
+    for name in names:
+        if name in raw.FIELDS and field_available(item.run_dir, name, item.raw_step):
+            fields[name] = raw.read_field(item.run_dir, name, item.raw_step)
+        else:
+            fields[name] = empty_field()
+    return fields
+
+
 def valid_gas_temperature(fields: dict[str, dict]) -> dict:
     temp = raw.reconstruct_temperature(fields, gas_mass_threshold=None)
     masks = gas_metrics.mask_context(fields, GAS_MASS_FLOOR)
     vals = {
         key: value
         for key, value in temp.get("values", {}).items()
-        if key in masks["valid_gas_thermo"] and math.isfinite(value)
+        if key in masks["valid_gas_thermo"]
     }
     return {
         "available": bool(vals),
         "values": vals,
         "stats": raw.stats_from_values(vals, available=bool(vals)),
     }
+
+
+def valid_gas_keys(fields: dict[str, dict]) -> set[tuple[float, float]]:
+    required = ["liquid_alpha", "vapor_alpha", "air_alpha", "vapor_alpha_rho", "air_alpha_rho", "pressure"]
+    if not all(fields.get(name, empty_field()).get("available") for name in required):
+        return set()
+    return set(gas_metrics.mask_context(fields, GAS_MASS_FLOOR)["valid_gas_thermo"])
+
+
+def finite_sum(field: dict) -> float:
+    if not field.get("available"):
+        return math.nan
+    values = finite_values(field)
+    return float(np.sum(values)) if values.size else math.nan
+
+
+def compute_metrics_incremental(item: SaveItem, all_species: list[str], case_name: str | None = None) -> dict:
+    """Compute compact per-save metrics while tolerating unavailable fields."""
+    wanted = sorted(set(BASE_FIELDS + [f"rhoY_{s}" for s in sorted(set(all_species + SPECIES_OF_INTEREST))]))
+    fields = read_available_fields(item, wanted)
+    out_case = case_name or item.case
+    row = {
+        "case": out_case,
+        "save": item.global_save,
+        "global_save": item.global_save,
+        "raw_step": item.raw_step,
+        "origin": item.origin,
+        "time_s": item.global_save * T_SAVE,
+        "time_us": item.global_save * T_SAVE * 1e6,
+        "run_dir": str(item.run_dir.relative_to(REPO)),
+        "missing_fields": ",".join(name for name in METRIC_FIELDS if not fields.get(name, empty_field()).get("available")),
+    }
+    dx, dy, area = gas_metrics.estimate_cell_area(fields)
+    row["cell_area_m2"] = area
+    if fields["liquid_alpha_rho"].get("available") and math.isfinite(area):
+        row["liquid_mass"] = finite_sum(fields["liquid_alpha_rho"]) * area
+    else:
+        row["liquid_mass"] = math.nan
+    if fields["vapor_alpha_rho"].get("available") and math.isfinite(area):
+        row["vapor_mass"] = finite_sum(fields["vapor_alpha_rho"]) * area
+    else:
+        row["vapor_mass"] = math.nan
+    if fields["liquid_alpha"].get("available") and math.isfinite(area):
+        liquid_keys = {
+            key
+            for key, value in fields["liquid_alpha"]["values"].items()
+            if math.isfinite(value) and value >= 0.5
+        }
+        row["liquid_alpha_area_m2"] = len(liquid_keys) * area
+        if liquid_keys:
+            xs = [key[0] for key in liquid_keys]
+            ys = [key[1] for key in liquid_keys]
+            row["liquid_extent_x_m"] = max(xs) - min(xs)
+            row["liquid_extent_y_m"] = max(ys) - min(ys)
+        else:
+            row["liquid_extent_x_m"] = math.nan
+            row["liquid_extent_y_m"] = math.nan
+    else:
+        row["liquid_alpha_area_m2"] = math.nan
+        row["liquid_extent_x_m"] = math.nan
+        row["liquid_extent_y_m"] = math.nan
+    temp = valid_gas_temperature(fields)
+    temp_vals = finite_values(temp)
+    row["valid_gas_Tmax_K"] = float(np.max(temp_vals)) if temp_vals.size else math.nan
+    row["valid_gas_Tmean_K"] = float(np.mean(temp_vals)) if temp_vals.size else math.nan
+    row["valid_gas_cell_count"] = int(temp_vals.size)
+    for species in SPECIES_OF_INTEREST:
+        field = fields.get(f"rhoY_{species}", empty_field())
+        row[f"integrated_{species}"] = finite_sum(field) * area if field.get("available") and math.isfinite(area) else math.nan
+        vals = finite_values(field)
+        row[f"max_{species}"] = float(np.max(vals)) if vals.size else math.nan
+    missing_species = [name for name in all_species if not fields.get(f"rhoY_{name}", empty_field()).get("available")]
+    row["missing_species_fields"] = ",".join(missing_species)
+    keys = valid_gas_keys(fields)
+    if missing_species:
+        row.update(species_diagnostics_unavailable(missing_species))
+    elif keys and math.isfinite(area):
+        row.update(species_bounds(fields, all_species, keys, area))
+    else:
+        row.update(species_diagnostics_unavailable([]))
+    row["available"] = "T"
+    return row
 
 
 def species_bounds(
@@ -350,6 +457,34 @@ def species_bounds(
         "integrated_valid_gas_sum_rhoY": species_int,
         "mass_consistency_integrated_diff": species_int - gas_int,
         "mass_consistency_relative_error": (species_int - gas_int) / gas_int if gas_int else math.nan,
+        "species_diagnostics_available": "T",
+        "species_diagnostics_missing_reason": "",
+    }
+
+
+def species_diagnostics_unavailable(missing_species: list[str]) -> dict:
+    return {
+        "species_negative_rhoY_count": math.nan,
+        "species_negative_Y_count": math.nan,
+        "species_Y_above_one_count": math.nan,
+        "species_sumY_min": math.nan,
+        "species_sumY_max": math.nan,
+        "species_sumY_max_abs_error": math.nan,
+        "species_sumY_violation_count": math.nan,
+        "species_min_rhoY": math.nan,
+        "species_min_rhoY_name": "",
+        "species_min_Y": math.nan,
+        "species_max_Y": math.nan,
+        "species_max_Y_name": "",
+        "integrated_valid_gas_mass": math.nan,
+        "integrated_valid_gas_sum_rhoY": math.nan,
+        "mass_consistency_integrated_diff": math.nan,
+        "mass_consistency_relative_error": math.nan,
+        "species_diagnostics_available": "F",
+        "species_diagnostics_missing_reason": (
+            "missing species fields: " + ",".join(missing_species)
+            if missing_species else "valid-gas mask or cell area unavailable"
+        ),
     }
 
 
@@ -402,7 +537,12 @@ def compute_metrics(item: SaveItem, all_species: list[str]) -> dict:
         row[f"integrated_{species}"] = field["stats"]["sum"] * area if field.get("available") else math.nan
         vals = finite_values(field)
         row[f"max_{species}"] = float(np.max(vals)) if vals.size else math.nan
-    row.update(species_bounds(fields, all_species, set(masks["valid_gas_thermo"]), area))
+    missing_species = [name for name in all_species if not fields.get(f"rhoY_{name}", {}).get("available")]
+    row["missing_species_fields"] = ",".join(missing_species)
+    if missing_species:
+        row.update(species_diagnostics_unavailable(missing_species))
+    else:
+        row.update(species_bounds(fields, all_species, set(masks["valid_gas_thermo"]), area))
     return row
 
 
@@ -637,9 +777,11 @@ def make_frame_manifest(dry_run: bool = False) -> list[dict]:
 
 def plot_metric(rows: list[dict], key: str, ylabel: str, filename: str) -> None:
     fig, ax = plt.subplots(figsize=(7.6, 4.8), constrained_layout=True)
-    for case in CASE_ORDER:
+    present_cases = [case for case in CASE_ORDER + EXPORT_CASE_ORDER if any(r.get("case") == case for r in rows)]
+    for case in present_cases:
         rr = [r for r in rows if r["case"] == case and r.get("available") == "T" and math.isfinite(ff(r.get(key)))]
-        ax.plot([ff(r["time_us"]) for r in rr], [ff(r[key]) for r in rr], "o-", ms=3, lw=1.3, label=CASE_SHORT[case])
+        label = CASE_SHORT.get(case, EXPORT_CASE_LABEL.get(case, case))
+        ax.plot([ff(r["time_us"]) for r in rr], [ff(r[key]) for r in rr], "o-", ms=3, lw=1.3, label=label)
     ax.axvline(0.85, color="k", ls="--", lw=1.0)
     ax.text(0.855, 0.98, "shock exits domain", transform=ax.get_xaxis_transform(), rotation=90, va="top", ha="left", fontsize=8)
     ax.set_xlabel("Time [µs]")
@@ -664,16 +806,18 @@ def make_trend_plots(rows: list[dict]) -> None:
     ]
     for filename, keys, ylabel in combined:
         fig, ax = plt.subplots(figsize=(8.0, 4.9), constrained_layout=True)
-        for case in CASE_ORDER:
+        present_cases = [case for case in CASE_ORDER + EXPORT_CASE_ORDER if any(r.get("case") == case for r in rows)]
+        for case in present_cases:
             for key in keys:
                 rr = [r for r in rows if r["case"] == case and r.get("available") == "T" and math.isfinite(ff(r.get(key)))]
+                label = CASE_SHORT.get(case, EXPORT_CASE_LABEL.get(case, case))
                 ax.plot(
                     [ff(r["time_us"]) for r in rr],
                     [ff(r[key]) for r in rr],
                     marker="o",
                     ms=2.5,
                     lw=1.1,
-                    label=f"{CASE_SHORT[case]} {key.replace('integrated_', '')}",
+                    label=f"{label} {key.replace('integrated_', '')}",
                 )
         ax.axvline(0.85, color="k", ls="--", lw=1.0)
         ax.set_xlabel("Time [µs]")
@@ -782,6 +926,589 @@ def make_report(rows: list[dict], diffs: list[dict], frame_manifest: list[dict])
     (OUT / "three_case_comparison_report.md").write_text("\n".join(lines) + "\n")
 
 
+def full_domain_arrays(
+    field: dict,
+    alpha_field: dict,
+    valid_by_presence: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    ag = grid(alpha_field)
+    if ag is None:
+        return None
+    x, y, alpha_values = ag
+    values = np.full_like(alpha_values, np.nan)
+    valid_mask = np.zeros(alpha_values.shape, dtype=bool)
+    field_values = field.get("values", {})
+    for iy, yy in enumerate(y):
+        for ix, xx in enumerate(x):
+            value = field_values.get((float(xx), float(yy)), math.nan)
+            values[iy, ix] = value
+            valid_mask[iy, ix] = (
+                (float(xx), float(yy)) in field_values
+                if valid_by_presence else math.isfinite(value)
+            )
+    return x, y, values, valid_mask, alpha_values
+
+
+def full_domain_field(field: dict, alpha_field: dict) -> dict:
+    arrays = full_domain_arrays(field, alpha_field)
+    if arrays is None:
+        return empty_field()
+    x, y, values, _valid_mask, _alpha = arrays
+    out_values = {
+        (float(xx), float(yy)): float(values[iy, ix])
+        for iy, yy in enumerate(y)
+        for ix, xx in enumerate(x)
+    }
+    return {
+        "available": True,
+        "values": out_values,
+        "stats": raw.stats_from_values(out_values, available=True),
+    }
+
+
+def mask_description(variable: str) -> str:
+    if variable == "valid_gas_temperature":
+        return "actual valid-gas mask: gas_alpha > 0.5, gas_mass > 1e-8, alpha_liq < 0.5"
+    return "finite field values on the full liquid-alpha domain grid"
+
+
+def save_field_npz(path: Path, field: dict, item: SaveItem, variable: str, alpha_field: dict) -> bool:
+    arrays = full_domain_arrays(field, alpha_field, valid_by_presence=(variable == "valid_gas_temperature"))
+    if arrays is None:
+        return False
+    x, y, values, valid_mask, alpha_values = arrays
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        x=x,
+        y=y,
+        values=values,
+        time=np.array(item.global_save * T_SAVE),
+        save=np.array(item.global_save),
+        raw_step=np.array(item.raw_step),
+        variable=np.array(variable),
+        valid_mask=valid_mask,
+        mask_description=np.array(mask_description(variable)),
+        alpha_liq=alpha_values,
+    )
+    return True
+
+
+def draw_single_export_field(field: dict, alpha: dict, variable: str, item: SaveItem, path: Path) -> bool:
+    g = grid(field)
+    if g is None:
+        return False
+    x, y, values = g
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return False
+    scale = choose_scale([field], variable)
+    fig, ax = plt.subplots(figsize=(9.2, 4.5), constrained_layout=True)
+    if scale["log"]:
+        mesh = ax.pcolormesh(
+            edges(x * 1.0e6),
+            edges(y * 1.0e6),
+            np.where(values > 0.0, values, np.nan),
+            shading="auto",
+            cmap="magma",
+            norm=colors.LogNorm(vmin=scale["vmin"], vmax=scale["vmax"]),
+        )
+    else:
+        mesh = ax.pcolormesh(
+            edges(x * 1.0e6),
+            edges(y * 1.0e6),
+            values,
+            shading="auto",
+            cmap="viridis",
+            vmin=scale["vmin"],
+            vmax=scale["vmax"],
+        )
+    ag = grid(alpha)
+    if ag is not None:
+        axx, ayy, aa = ag
+        if axx.size >= 2 and ayy.size >= 2 and np.nanmin(aa) <= 0.5 <= np.nanmax(aa):
+            ax.contour(axx * 1.0e6, ayy * 1.0e6, aa, levels=[0.5], colors="white", linewidths=1.1)
+            ax.contour(axx * 1.0e6, ayy * 1.0e6, aa, levels=[0.5], colors="black", linewidths=0.35)
+    fig.colorbar(mesh, ax=ax, pad=0.02)
+    ax.set_xlabel("x [µm]")
+    ax.set_ylabel("y [µm]")
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title(f"C3 {variable}, save {item.global_save}, t={item.global_save * T_SAVE * 1e6:.2f} µs")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=190)
+    plt.close(fig)
+    return True
+
+
+def nearest_save(target_time_us: float, saves: list[int]) -> int | None:
+    if not saves:
+        return None
+    return min(saves, key=lambda save: abs(save * T_SAVE * 1e6 - target_time_us))
+
+
+def c3_export(output_dir: Path | None = None) -> None:
+    out = output_dir or (OUT / "c3_export")
+    all_species = species_names()
+    ensure_species_fields(all_species)
+    saves = sorted(available_d_steps(C3_RUN))
+    rows: list[dict] = []
+    time_rows: list[dict] = []
+    for save in saves:
+        item = SaveItem(EXPORT_C3_CASE, C3_RUN, save, save, "fresh")
+        rows.append(compute_metrics_incremental(item, all_species, EXPORT_C3_CASE))
+        time_rows.append({
+            "case": EXPORT_C3_CASE,
+            "save": save,
+            "raw_step": save,
+            "time_s": save * T_SAVE,
+            "time_us": save * T_SAVE * 1e6,
+            "run_dir": str(C3_RUN.relative_to(REPO)),
+        })
+    if rows:
+        base = next((ff(r.get("liquid_mass")) for r in rows if math.isfinite(ff(r.get("liquid_mass")))), math.nan)
+        for row in rows:
+            liquid = ff(row.get("liquid_mass"))
+            if math.isfinite(base) and abs(base) > REL_DENOM_EPS and math.isfinite(liquid):
+                row["liquid_mass_loss"] = base - liquid
+                row["liquid_mass_loss_fraction"] = (base - liquid) / base
+            else:
+                row["liquid_mass_loss"] = math.nan
+                row["liquid_mass_loss_fraction"] = math.nan
+    write_csv(out / "c3_timeseries.csv", rows)
+    write_csv(out / "c3_time_map.csv", time_rows)
+    write_csv(out / "c3_species_bounds_by_save.csv", [
+        {key: row.get(key, "") for key in [
+            "save",
+            "global_save",
+            "raw_step",
+            "time_s",
+            "time_us",
+            "species_negative_rhoY_count",
+            "species_negative_Y_count",
+            "species_Y_above_one_count",
+            "species_sumY_min",
+            "species_sumY_max",
+            "species_sumY_max_abs_error",
+            "species_sumY_violation_count",
+            "species_min_rhoY",
+            "species_min_rhoY_name",
+            "species_min_Y",
+            "species_max_Y",
+            "species_max_Y_name",
+        ]}
+        for row in rows
+    ])
+    write_csv(out / "c3_mass_consistency_by_save.csv", [
+        {key: row.get(key, "") for key in [
+            "global_save",
+            "raw_step",
+            "time_s",
+            "time_us",
+            "integrated_valid_gas_mass",
+            "integrated_valid_gas_sum_rhoY",
+            "mass_consistency_integrated_diff",
+            "mass_consistency_relative_error",
+        ]}
+        for row in rows
+    ])
+    manifest: list[dict] = []
+    for target_us in FRAME_TIMES_US:
+        save = nearest_save(target_us, saves)
+        if save is None:
+            for variable in FRAME_VARIABLES:
+                manifest.append({"target_time_us": target_us, "status": "skipped", "reason": "no C3 saves", "variable": variable})
+            continue
+        item = SaveItem(EXPORT_C3_CASE, C3_RUN, save, save, "fresh")
+        actual_us = save * T_SAVE * 1e6
+        alpha = raw.read_field(C3_RUN, "liquid_alpha", save) if field_available(C3_RUN, "liquid_alpha", save) else empty_field()
+        for variable in FRAME_VARIABLES:
+            field, _label, _unit, _is_species = load_frame_field(item, variable)
+            row = {
+                "target_time_us": target_us,
+                "actual_time_us": actual_us,
+                "time_mismatch_us": actual_us - target_us,
+                "save": save,
+                "raw_step": save,
+                "variable": variable,
+            }
+            if not field.get("available") or finite_values(field).size == 0:
+                row.update({"status": "skipped", "reason": "field unavailable/no finite values"})
+                manifest.append(row)
+                continue
+            if not alpha.get("available"):
+                row.update({"status": "skipped", "reason": "liquid alpha unavailable for full-domain export"})
+                manifest.append(row)
+                continue
+            stem = f"{variable}_save{save:03d}_t{actual_us:.2f}us"
+            png = out / "field_frames" / variable / f"{stem}.png"
+            npz = out / "field_data" / variable / f"{stem}.npz"
+            full_field = full_domain_field(field, alpha)
+            png_ok = draw_single_export_field(full_field, alpha, variable, item, png)
+            npz_ok = save_field_npz(npz, field, item, variable, alpha)
+            row.update({
+                "status": "written" if png_ok and npz_ok else "partial",
+                "reason": "" if png_ok and npz_ok else "PNG or NPZ write failed",
+                "png": str(png.relative_to(out)) if png_ok else "",
+                "npz": str(npz.relative_to(out)) if npz_ok else "",
+            })
+            manifest.append(row)
+    write_csv(out / "c3_frame_manifest.csv", manifest)
+    make_export_trend_plots(rows, out / "trend_plots")
+    summary = [
+        "C3 compact export",
+        "=================",
+        "",
+        f"run_dir: {C3_RUN}",
+        f"output_dir: {out}",
+        f"saves: {saves}",
+        f"timeseries_rows: {len(rows)}",
+        f"frame_manifest_rows: {len(manifest)}",
+        "",
+        "NPZ fields: x, y, values, time, save, raw_step, variable, valid_mask, alpha_liq.",
+        "Raw D/ and p_all/ data are not copied.",
+        "Unavailable pressure/temperature fields are skipped without aborting.",
+    ]
+    (out / "c3_export_summary.txt").write_text("\n".join(summary) + "\n")
+
+
+def make_export_trend_plots(rows: list[dict], out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for key, ylabel, filename in TREND_GROUPS:
+        rr = [row for row in rows if math.isfinite(ff(row.get(key)))]
+        if not rr:
+            continue
+        fig, ax = plt.subplots(figsize=(7.2, 4.4), constrained_layout=True)
+        ax.plot([ff(r["time_us"]) for r in rr], [ff(r[key]) for r in rr], "o-", ms=3, lw=1.3)
+        ax.set_xlabel("Time [µs]")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.25)
+        fig.savefig(out_dir / filename, dpi=200)
+        plt.close(fig)
+
+
+def read_csv_rows(path: Path) -> list[dict]:
+    with path.open() as f:
+        return list(csv.DictReader(f))
+
+
+def nearest_row(time_us: float, rows: list[dict]) -> dict | None:
+    valid = [row for row in rows if math.isfinite(ff(row.get("time_us")))]
+    if not valid:
+        return None
+    return min(valid, key=lambda row: abs(ff(row["time_us"]) - time_us))
+
+
+def local_raw_rows_for_compare(all_species: list[str]) -> list[dict]:
+    rows: list[dict] = []
+    max_save = max_global_save_candidate()
+    cases = [
+        ("chemistry_OFF_diffusion_OFF", "CHEM_OFF_DIFF_OFF"),
+        ("chemistry_ON_diffusion_OFF", "CHEM_ON_DIFF_OFF"),
+    ]
+    for _export_case, raw_case in cases:
+        for save in range(max_save + 1):
+            item = item_for(raw_case, save)
+            if not available_d_steps(item.run_dir) or item.raw_step not in available_d_steps(item.run_dir):
+                continue
+            row = compute_metrics_incremental(item, all_species, _export_case)
+            rows.append(row)
+    add_export_liquid_loss(rows)
+    return rows
+
+
+def add_export_liquid_loss(rows: list[dict]) -> None:
+    initial: dict[str, float] = {}
+    for case in {row["case"] for row in rows}:
+        rr = [row for row in rows if row["case"] == case and math.isfinite(ff(row.get("liquid_mass")))]
+        if rr:
+            initial[case] = ff(sorted(rr, key=lambda row: ff(row["time_us"]))[0]["liquid_mass"])
+    for row in rows:
+        base = initial.get(row["case"], math.nan)
+        liquid = ff(row.get("liquid_mass"))
+        if math.isfinite(base) and abs(base) > REL_DENOM_EPS and math.isfinite(liquid):
+            row["liquid_mass_loss"] = base - liquid
+            row["liquid_mass_loss_fraction"] = (base - liquid) / base
+        else:
+            row["liquid_mass_loss"] = math.nan
+            row["liquid_mass_loss_fraction"] = math.nan
+
+
+def c3_rows_from_export(path: Path) -> list[dict]:
+    rows = read_csv_rows(path / "c3_timeseries.csv")
+    for row in rows:
+        row["case"] = EXPORT_C3_CASE
+    return rows
+
+
+def compare_from_c3_export(export_path: Path) -> None:
+    all_species = species_names()
+    ensure_species_fields(all_species)
+    export_path = export_path.resolve()
+    if not (export_path / "c3_timeseries.csv").is_file():
+        raise RuntimeError(f"missing {export_path / 'c3_timeseries.csv'}")
+    c3_rows = c3_rows_from_export(export_path)
+    raw_rows = local_raw_rows_for_compare(all_species)
+    by_case = {case: [row for row in raw_rows if row["case"] == case] for case in EXPORT_CASE_ORDER[:2]}
+    matched_rows: list[dict] = []
+    time_rows: list[dict] = []
+    for c3 in c3_rows:
+        time_us = ff(c3.get("time_us"))
+        if not math.isfinite(time_us):
+            continue
+        c3_out = dict(c3)
+        c3_out["case"] = EXPORT_C3_CASE
+        time_rows.append(c3_out)
+        for case in EXPORT_CASE_ORDER[:2]:
+            row = nearest_row(time_us, by_case[case])
+            if row is not None:
+                out_row = dict(row)
+                out_row["matched_to_C3_time_us"] = time_us
+                out_row["time_mismatch_us"] = ff(row.get("time_us")) - time_us
+                time_rows.append(out_row)
+        matched_rows.append(make_export_diff_row(time_us, c3, by_case))
+    write_csv(OUT / "three_case_timeseries.csv", time_rows)
+    write_csv(OUT / "three_case_matched_differences.csv", matched_rows)
+    frame_manifest = make_export_comparison_frames(export_path, by_case, c3_rows)
+    write_csv(OUT / "frame_manifest.csv", frame_manifest)
+    make_trend_plots(time_rows)
+    make_export_summary(time_rows, matched_rows, frame_manifest, export_path)
+    make_export_report(time_rows, matched_rows, frame_manifest, export_path)
+
+
+def make_export_diff_row(time_us: float, c3: dict, by_case: dict[str, list[dict]]) -> dict:
+    row = {"C3_time_us": time_us}
+    cases = {
+        EXPORT_C3_CASE: c3,
+        "chemistry_OFF_diffusion_OFF": nearest_row(time_us, by_case["chemistry_OFF_diffusion_OFF"]),
+        "chemistry_ON_diffusion_OFF": nearest_row(time_us, by_case["chemistry_ON_diffusion_OFF"]),
+    }
+    for case, case_row in cases.items():
+        if case_row is None:
+            continue
+        row[f"{case}_time_us"] = ff(case_row.get("time_us"))
+        row[f"{case}_time_mismatch_us"] = ff(case_row.get("time_us")) - time_us
+    pairs = [
+        ("C3_minus_chemistry_ON_diffusion_OFF", EXPORT_C3_CASE, "chemistry_ON_diffusion_OFF"),
+        ("C3_minus_chemistry_OFF_diffusion_OFF", EXPORT_C3_CASE, "chemistry_OFF_diffusion_OFF"),
+        ("chemistry_ON_minus_chemistry_OFF", "chemistry_ON_diffusion_OFF", "chemistry_OFF_diffusion_OFF"),
+    ]
+    for label, a_case, b_case in pairs:
+        arow = cases.get(a_case)
+        brow = cases.get(b_case)
+        for metric in DIFF_METRICS:
+            a = ff(arow.get(metric)) if arow else math.nan
+            b = ff(brow.get(metric)) if brow else math.nan
+            row[f"{label}_{metric}_abs"] = a - b if math.isfinite(a) and math.isfinite(b) else math.nan
+            rel, status = rel_diff(a, b)
+            row[f"{label}_{metric}_rel"] = rel
+            row[f"{label}_{metric}_rel_status"] = status
+    return row
+
+
+def c3_npz_for(export_path: Path, variable: str, target_time_us: float) -> tuple[Path | None, dict]:
+    manifest = read_csv_rows(export_path / "c3_frame_manifest.csv")
+    candidates = [
+        row for row in manifest
+        if row.get("variable") == variable and row.get("status") == "written" and row.get("npz")
+    ]
+    if not candidates:
+        return None, {}
+    best = min(candidates, key=lambda row: abs(ff(row.get("actual_time_us")) - target_time_us))
+    return export_path / best["npz"], best
+
+
+def field_from_npz(path: Path) -> tuple[dict, dict]:
+    data = np.load(path, allow_pickle=False)
+    x = np.array(data["x"], dtype=float)
+    y = np.array(data["y"], dtype=float)
+    values = np.array(data["values"], dtype=float)
+    alpha = np.array(data["alpha_liq"], dtype=float)
+    field_values = {}
+    alpha_values = {}
+    for iy, yy in enumerate(y):
+        for ix, xx in enumerate(x):
+            field_values[(float(xx), float(yy))] = float(values[iy, ix])
+            alpha_values[(float(xx), float(yy))] = float(alpha[iy, ix])
+    return (
+        {"available": True, "values": field_values, "stats": raw.stats_from_values(field_values, True)},
+        {"available": True, "values": alpha_values, "stats": raw.stats_from_values(alpha_values, True)},
+    )
+
+
+def make_export_comparison_frames(export_path: Path, by_case: dict[str, list[dict]], c3_rows: list[dict]) -> list[dict]:
+    manifest: list[dict] = []
+    for target_us in FRAME_TIMES_US:
+        for variable in FRAME_VARIABLES:
+            npz, c3_meta = c3_npz_for(export_path, variable, target_us)
+            if npz is None:
+                manifest.append({"target_time_us": target_us, "variable": variable, "status": "skipped", "reason": "missing C3 NPZ"})
+                continue
+            c3_time = ff(c3_meta.get("actual_time_us"))
+            c3_save = int(ff(c3_meta.get("save"))) if math.isfinite(ff(c3_meta.get("save"))) else -1
+            raw_items = []
+            missing = []
+            for export_case, raw_case in [
+                ("chemistry_OFF_diffusion_OFF", "CHEM_OFF_DIFF_OFF"),
+                ("chemistry_ON_diffusion_OFF", "CHEM_ON_DIFF_OFF"),
+            ]:
+                row = nearest_row(c3_time, by_case[export_case])
+                if row is None:
+                    missing.append(f"{export_case}:no time row")
+                    continue
+                item = item_for(raw_case, int(ff(row["global_save"])))
+                field, _label, _unit, _species = load_frame_field(item, variable)
+                if not field.get("available") or finite_values(field).size == 0:
+                    missing.append(f"{export_case}:{variable} unavailable")
+                raw_items.append((export_case, item, field, liquid_alpha_field(item), row))
+            if missing:
+                manifest.append({
+                    "target_time_us": target_us,
+                    "variable": variable,
+                    "status": "skipped",
+                    "reason": "; ".join(missing),
+                    "C3_actual_time_us": c3_time,
+                    "C3_time_mismatch_us": c3_time - target_us,
+                    "C3_save": c3_save,
+                })
+                continue
+            c3_field, c3_alpha = field_from_npz(npz)
+            output = OUT / "comparison_frames" / variable / f"{variable}_t{target_us:.2f}us.png"
+            ok, reason = draw_export_three_panel(raw_items, c3_field, c3_alpha, c3_meta, variable, output)
+            manifest.append({
+                "target_time_us": target_us,
+                "variable": variable,
+                "status": "written" if ok else "skipped",
+                "reason": reason,
+                "file": str(output.relative_to(OUT)) if ok else "",
+                "chemistry_OFF_actual_time_us": ff(raw_items[0][4].get("time_us")),
+                "chemistry_OFF_time_mismatch_us": ff(raw_items[0][4].get("time_us")) - c3_time,
+                "chemistry_OFF_save": raw_items[0][1].global_save,
+                "chemistry_ON_actual_time_us": ff(raw_items[1][4].get("time_us")),
+                "chemistry_ON_time_mismatch_us": ff(raw_items[1][4].get("time_us")) - c3_time,
+                "chemistry_ON_save": raw_items[1][1].global_save,
+                "C3_actual_time_us": c3_time,
+                "C3_time_mismatch_us": c3_time - target_us,
+                "C3_save": c3_save,
+            })
+    return manifest
+
+
+def draw_export_three_panel(
+    raw_items: list[tuple[str, SaveItem, dict, dict, dict]],
+    c3_field: dict,
+    c3_alpha: dict,
+    c3_meta: dict,
+    variable: str,
+    output: Path,
+) -> tuple[bool, str]:
+    panels = [
+        ("chemistry_OFF_diffusion_OFF", raw_items[0][2], raw_items[0][3], raw_items[0][1].global_save, ff(raw_items[0][4].get("time_us"))),
+        ("chemistry_ON_diffusion_OFF", raw_items[1][2], raw_items[1][3], raw_items[1][1].global_save, ff(raw_items[1][4].get("time_us"))),
+        (EXPORT_C3_CASE, c3_field, c3_alpha, int(ff(c3_meta.get("save"))), ff(c3_meta.get("actual_time_us"))),
+    ]
+    fields = [panel[1] for panel in panels]
+    if not all(field.get("available") and finite_values(field).size for field in fields):
+        return False, "missing finite panel data"
+    scale = choose_scale(fields, variable)
+    if variable == "valid_gas_temperature":
+        for field in fields:
+            field["values"] = {key: val for key, val in field["values"].items() if math.isfinite(val)}
+    fig, axes = plt.subplots(1, 3, figsize=(15.8, 4.8), sharex=True, sharey=True, constrained_layout=True)
+    mesh = None
+    for ax, (case, field, alpha, save, time_us) in zip(axes, panels):
+        g = grid(field)
+        if g is None:
+            plt.close(fig)
+            return False, f"{case} has no gridded data"
+        x, y, vals = g
+        if scale["log"]:
+            mesh = ax.pcolormesh(
+                edges(x * 1.0e6),
+                edges(y * 1.0e6),
+                np.where(vals > 0.0, vals, np.nan),
+                shading="auto",
+                cmap="magma",
+                norm=colors.LogNorm(vmin=scale["vmin"], vmax=scale["vmax"]),
+            )
+        else:
+            mesh = ax.pcolormesh(
+                edges(x * 1.0e6),
+                edges(y * 1.0e6),
+                vals,
+                shading="auto",
+                cmap="viridis",
+                vmin=scale["vmin"],
+                vmax=scale["vmax"],
+            )
+        ag = grid(alpha)
+        if ag is not None:
+            axx, ayy, avals = ag
+            if np.nanmin(avals) <= 0.5 <= np.nanmax(avals):
+                ax.contour(axx * 1.0e6, ayy * 1.0e6, avals, levels=[0.5], colors="white", linewidths=1.1)
+                ax.contour(axx * 1.0e6, ayy * 1.0e6, avals, levels=[0.5], colors="black", linewidths=0.35)
+        ax.set_title(f"{EXPORT_CASE_LABEL[case]}\nsave {save}, t={time_us:.2f} µs", fontsize=9)
+        ax.set_xlabel("x [µm]")
+        ax.set_aspect("equal", adjustable="box")
+    axes[0].set_ylabel("y [µm]")
+    if mesh is not None:
+        fig.colorbar(mesh, ax=axes, pad=0.015)
+    fig.suptitle(f"{variable}, shared finite-value color scale")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=210)
+    plt.close(fig)
+    return True, ""
+
+
+def make_export_summary(rows: list[dict], diffs: list[dict], frame_manifest: list[dict], export_path: Path) -> None:
+    lines = [
+        "Three-case comparison from compact C3 export",
+        "============================================",
+        "",
+        f"C3 export: {export_path}",
+        f"timeseries_rows: {len(rows)}",
+        f"matched_difference_rows: {len(diffs)}",
+        f"frame_rows: {len(frame_manifest)}",
+        "",
+        "Relative differences are blank/NaN when the denominator is zero, near zero, or nonfinite.",
+        "",
+        "Caveats:",
+        "- C3 used temporary evap-only gates and a provisional diffusion mask.",
+        "- Successful completion is numerical viability, not physical validation.",
+        "- The C3 post-process segmentation fault occurred after simulation completion and is unrelated to raw-field analysis.",
+        "- Maximum temperature alone does not prove ignition.",
+    ]
+    (OUT / "three_case_final_summary.txt").write_text("\n".join(lines) + "\n")
+
+
+def make_export_report(rows: list[dict], diffs: list[dict], frame_manifest: list[dict], export_path: Path) -> None:
+    lines = [
+        "# Three-case comparison from C3 compact export",
+        "",
+        "Case names:",
+        "",
+        "- `chemistry_OFF_diffusion_OFF`",
+        "- `chemistry_ON_diffusion_OFF`",
+        "- `chemistry_ON_diffusion_ON_C3`",
+        "",
+        "C3 spatial panels read numerical `.npz` arrays, not PNG pixels. ON/OFF panels read raw local `D/` fields.",
+        "",
+        "Matching is by nearest physical time; time mismatches are reported in the CSV outputs.",
+        "",
+        "Caveats:",
+        "",
+        "- C3 used temporary evap-only gates and a provisional diffusion mask.",
+        "- Successful completion is numerical viability, not physical validation.",
+        "- The C3 post-process segmentation fault occurred after simulation completion and is unrelated to raw-field analysis.",
+        "- Maximum temperature alone does not prove ignition.",
+        "- Chemistry-limiter aggregate severity is unavailable unless present in logs.",
+        "",
+        f"C3 export path: `{export_path}`",
+        f"Matched rows: {len(diffs)}",
+        f"Frame rows: {len(frame_manifest)}",
+    ]
+    (OUT / "three_case_comparison_report.md").write_text("\n".join(lines) + "\n")
+
+
 def run_full() -> None:
     all_species = species_names()
     ensure_species_fields(all_species)
@@ -845,9 +1572,19 @@ def dry_run() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="Only validate paths, common saves, and requested frame availability")
+    parser.add_argument("--export-c3", action="store_true", help="Export compact C3 CSV/PNG/NPZ artifacts from the HPC C3 raw D/ output")
+    parser.add_argument("--c3-export-out", type=Path, default=OUT / "c3_export", help="Output directory for --export-c3")
+    parser.add_argument("--compare-from-c3-export", type=Path, help="Compare local ON/OFF raw data against a compact C3 export directory")
     args = parser.parse_args()
+    modes = sum(bool(v) for v in [args.dry_run, args.export_c3, args.compare_from_c3_export])
+    if modes > 1:
+        parser.error("choose only one of --dry-run, --export-c3, or --compare-from-c3-export")
     if args.dry_run:
         dry_run()
+    elif args.export_c3:
+        c3_export(args.c3_export_out)
+    elif args.compare_from_c3_export:
+        compare_from_c3_export(args.compare_from_c3_export)
     else:
         run_full()
 
