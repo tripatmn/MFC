@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-REPO = Path("/home/tripatmn/mfc_work/MFC_alpha_diag")
+REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "examples/2D_dodecane_global_reduced"))
 import analyze_shockdroplet_air_sk54 as raw
 import analyze_shockdroplet_air_sk54_gas_metrics as gas_metrics
