@@ -44,6 +44,7 @@ RESTART_ON = RUN_ROOT / "restart18_to_2us_evap_only_consistency_gates"
 OFF_RUN = RUN_ROOT / "full_2us_evap_only_chemistry_OFF"
 C3_RUN = RUN_ROOT / "C3_diffusion_ON_reactions_ON_2p0us"
 FUEL_OUT = OUT / "fuel_inventory_budget"
+C3_FUEL_OUTPUT = OUT / "c3_fuel_inventory.csv"
 
 sys.path.insert(0, str(REPO / "examples/2D_dodecane_global_reduced"))
 import analyze_shockdroplet_air_sk54 as raw
@@ -1945,6 +1946,96 @@ def fuel_inventory_for_save(case: str, save: int) -> dict:
     }
 
 
+def c3_parent_inventory_for_save(run_dir: Path, save: int) -> dict:
+    item = SaveItem("ON_WITH_DIFF_C3", run_dir, save, save, "fresh")
+    fields = read_fields(item, ["liquid_alpha_rho", "rhoY_NC12H26"])
+    _dx, _dy, area = gas_metrics.estimate_cell_area(fields)
+    keys: set[tuple[float, float]] = set()
+    keys.update(fields["liquid_alpha_rho"].get("values", {}).keys())
+    keys.update(fields["rhoY_NC12H26"].get("values", {}).keys())
+    gas_density_sum = 0.0
+    liquid_density_sum = 0.0
+    nonfinite_count = 0
+    for key in keys:
+        liquid = fields["liquid_alpha_rho"].get("values", {}).get(key, math.nan)
+        rhoY_fuel = fields["rhoY_NC12H26"].get("values", {}).get(key, math.nan)
+        if not math.isfinite(liquid) or not math.isfinite(rhoY_fuel):
+            nonfinite_count += 1
+            continue
+        gas_density_sum += rhoY_fuel
+        liquid_density_sum += liquid
+    if not math.isfinite(area):
+        gas_parent = liquid_parent = combined_parent = math.nan
+    else:
+        gas_parent = gas_density_sum * area
+        liquid_parent = liquid_density_sum * area
+        combined_parent = gas_parent + liquid_parent
+    return {
+        "save": save,
+        "time_s": save * T_SAVE,
+        "time_us": save * T_SAVE * 1e6,
+        "gas_parent_fuel_mass": gas_parent,
+        "liquid_dodecane_mass": liquid_parent,
+        "combined_parent_dodecane_mass": combined_parent,
+        "nonfinite_cell_count": nonfinite_count,
+    }
+
+
+def c3_fuel_inventory_saves(run_dir: Path) -> list[int]:
+    saves: list[int] = []
+    for save in sorted(available_d_steps(run_dir)):
+        if all(field_available(run_dir, field, save) for field in ["liquid_alpha_rho", "rhoY_NC12H26"]):
+            saves.append(save)
+    return saves
+
+
+def export_c3_fuel_inventory(c3_raw_case: Path, output_file: Path, dry_run_only: bool = False) -> None:
+    all_species = species_names()
+    ensure_species_fields(all_species)
+    mappings = {
+        "alpha_rho_liquid": raw.FIELDS.get("liquid_alpha_rho"),
+        "rhoY_NC12H26": raw.FIELDS.get("rhoY_NC12H26"),
+    }
+    saves = c3_fuel_inventory_saves(c3_raw_case) if (c3_raw_case / "D").is_dir() else []
+    print("C3 parent-dodecane inventory export")
+    print(f"  c3_raw_case: {c3_raw_case}")
+    print(f"  D_exists: {(c3_raw_case / 'D').is_dir()}")
+    print(f"  output_file: {output_file}")
+    print("  mappings:")
+    for name, mapping in mappings.items():
+        print(f"    {name}: {mapping}")
+    if saves:
+        print(f"  available saves: {saves[:4]}...{saves[-4:] if len(saves) > 4 else saves}")
+        print(f"  save range: {saves[0]} to {saves[-1]}")
+        print(f"  time range: {saves[0]*T_SAVE*1e6:.2f} to {saves[-1]*T_SAVE*1e6:.2f} us")
+    else:
+        print("  available saves: []")
+    if dry_run_only:
+        print("  dry_run_only: no CSV written")
+        return
+    if not (c3_raw_case / "D").is_dir():
+        raise RuntimeError(f"missing raw D directory under {c3_raw_case}")
+    if not saves:
+        raise RuntimeError("no C3 saves with liquid_alpha_rho and rhoY_NC12H26 available")
+    rows = [c3_parent_inventory_for_save(c3_raw_case, save) for save in saves]
+    initial = ff(rows[0].get("combined_parent_dodecane_mass")) if rows else math.nan
+    for row in rows:
+        gas = ff(row.get("gas_parent_fuel_mass"))
+        liquid = ff(row.get("liquid_dodecane_mass"))
+        combined = ff(row.get("combined_parent_dodecane_mass"))
+        if math.isfinite(initial) and abs(initial) > REL_DENOM_EPS:
+            row["gas_fraction_of_initial_combined"] = gas / initial if math.isfinite(gas) else math.nan
+            row["liquid_fraction_of_initial_combined"] = liquid / initial if math.isfinite(liquid) else math.nan
+            row["combined_fraction_of_initial"] = combined / initial if math.isfinite(combined) else math.nan
+        else:
+            row["gas_fraction_of_initial_combined"] = math.nan
+            row["liquid_fraction_of_initial_combined"] = math.nan
+            row["combined_fraction_of_initial"] = math.nan
+    write_csv(output_file, rows)
+    print(f"  wrote: {output_file}")
+    print("  label: C3 parent-dodecane inventory only; not a closed conservation budget")
+
+
 def fuel_inventory_rows(common_saves: list[int]) -> list[dict]:
     available_by_case = {case: fuel_available_saves(case) for case in FUEL_CASE_ORDER}
     initial: dict[str, float] = {}
@@ -2839,11 +2930,14 @@ def main() -> None:
     parser.add_argument("--export-diffusion-diagnostics", action="store_true", help="Reconstruct C3 saved-state model-3 chemistry-diffusion masks and species fluxes")
     parser.add_argument("--export-diffusion-mask-only", action="store_true", help="Export C3 saved-state model-3 chemistry-diffusion active masks without Cantera")
     parser.add_argument("--export-fuel-inventory-budget", action="store_true", help="Export full-domain C1/C2/C3 dodecane fuel-inventory budgets")
+    parser.add_argument("--export-c3-fuel-inventory", action="store_true", help="Export C3-only parent-dodecane inventory CSV")
     parser.add_argument("--c3-raw-case", type=Path, default=C3_RUN, help="Raw C3 case directory for diffusion exports")
     parser.add_argument("--saves", type=int, nargs="+", default=[30, 38], help="C3 save indices for diffusion exports")
     parser.add_argument("--output-dir", type=Path, default=OUT, help="Output directory for diffusion exports")
+    parser.add_argument("--output-file", type=Path, default=C3_FUEL_OUTPUT, help="Output CSV for --export-c3-fuel-inventory")
     parser.add_argument("--diffusion-dry-run", action="store_true", help="Check diffusion diagnostic arguments/mapping without requiring HPC raw fields")
     parser.add_argument("--fuel-inventory-dry-run", action="store_true", help="Check fuel-inventory case paths, mappings, and common saves without exporting")
+    parser.add_argument("--c3-fuel-inventory-dry-run", action="store_true", help="Check C3-only fuel inventory inputs without writing CSV")
     args = parser.parse_args()
     modes = sum(bool(v) for v in [
         args.dry_run,
@@ -2853,6 +2947,7 @@ def main() -> None:
         args.export_diffusion_diagnostics,
         args.export_diffusion_mask_only,
         args.export_fuel_inventory_budget,
+        args.export_c3_fuel_inventory,
     ])
     if modes > 1:
         parser.error("choose only one primary mode")
@@ -2872,11 +2967,15 @@ def main() -> None:
         export_diffusion_mask_only(args.c3_raw_case, args.saves, args.output_dir, args.diffusion_dry_run)
     elif args.export_fuel_inventory_budget:
         export_fuel_inventory_budget(args.fuel_inventory_dry_run)
+    elif args.export_c3_fuel_inventory:
+        export_c3_fuel_inventory(args.c3_raw_case, args.output_file, args.c3_fuel_inventory_dry_run)
     else:
         if args.diffusion_dry_run:
             parser.error("--diffusion-dry-run requires --export-diffusion-diagnostics or --export-diffusion-mask-only")
         if args.fuel_inventory_dry_run:
             parser.error("--fuel-inventory-dry-run requires --export-fuel-inventory-budget")
+        if args.c3_fuel_inventory_dry_run:
+            parser.error("--c3-fuel-inventory-dry-run requires --export-c3-fuel-inventory")
         run_full()
 
 
