@@ -10,7 +10,9 @@ files, though it follows their plotting conventions.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
+import io
 import math
 import os
 import sys
@@ -41,6 +43,7 @@ SOURCE_ON = RUN_ROOT / "full_1us_evap_only_consistency_gates"
 RESTART_ON = RUN_ROOT / "restart18_to_2us_evap_only_consistency_gates"
 OFF_RUN = RUN_ROOT / "full_2us_evap_only_chemistry_OFF"
 C3_RUN = RUN_ROOT / "C3_diffusion_ON_reactions_ON_2p0us"
+FUEL_OUT = OUT / "fuel_inventory_budget"
 
 sys.path.insert(0, str(REPO / "examples/2D_dodecane_global_reduced"))
 import analyze_shockdroplet_air_sk54 as raw
@@ -84,6 +87,21 @@ FRAME_VARIABLES = [
 ]
 DIFFERENCE_FRAME_TIMES_US = [1.50, 1.90]
 DIFFERENCE_FRAME_VARIABLES = ["NC12H26", "O2", "OH", "valid_gas_temperature", "liquid_alpha"]
+FUEL_REQUIRED_FIELDS = ["liquid_alpha_rho", "vapor_alpha_rho", "air_alpha_rho", "rhoY_NC12H26"]
+FUEL_CASE_ORDER = ["OFF_NO_DIFF", "ON_NO_DIFF", "ON_WITH_DIFF_C3"]
+FUEL_CASE_LABEL = {
+    "OFF_NO_DIFF": "chemistry OFF / diffusion OFF",
+    "ON_NO_DIFF": "chemistry ON / diffusion OFF",
+    "ON_WITH_DIFF_C3": "chemistry ON / diffusion ON C3",
+}
+FUEL_CASE_TO_COMPARISON = {
+    "OFF_NO_DIFF": "CHEM_OFF_DIFF_OFF",
+    "ON_NO_DIFF": "CHEM_ON_DIFF_OFF",
+    "ON_WITH_DIFF_C3": "CHEM_ON_DIFF_ON_C3",
+}
+FUEL_CASE_DIFFUSION = {"OFF_NO_DIFF": "F", "ON_NO_DIFF": "F", "ON_WITH_DIFF_C3": "T"}
+FUEL_CASE_REACTIONS = {"OFF_NO_DIFF": "F", "ON_NO_DIFF": "T", "ON_WITH_DIFF_C3": "T"}
+FUEL_REPORT_TIMES_US = [1.50, 1.90]
 BASE_FIELDS = [
     "liquid_alpha_rho",
     "vapor_alpha_rho",
@@ -1796,6 +1814,377 @@ def make_difference_frames(export_path: Path) -> None:
 
 
 
+
+def fuel_case_paths() -> dict[str, list[Path]]:
+    return {
+        "OFF_NO_DIFF": [OFF_RUN],
+        "ON_NO_DIFF": [SOURCE_ON, RESTART_ON],
+        "ON_WITH_DIFF_C3": [C3_RUN],
+    }
+
+
+def fuel_item_for(case: str, save: int) -> SaveItem:
+    item = item_for(FUEL_CASE_TO_COMPARISON[case], save)
+    return SaveItem(case, item.run_dir, item.raw_step, item.global_save, item.origin)
+
+
+def case_assignment_preview(case_path: Path, keys: list[str]) -> dict[str, str]:
+    if not case_path.is_file():
+        return {key: "case.py missing" for key in keys}
+    namespace = {"__file__": str(case_path)}
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            exec(compile(case_path.read_text(), str(case_path), "exec"), namespace)
+        case = namespace.get("case")
+        if isinstance(case, dict):
+            return {key: repr(case.get(key, "not present")) for key in keys}
+    except Exception:
+        pass
+    text = case_path.read_text()
+    out: dict[str, str] = {}
+    for key in keys:
+        token = f'case["{key}"]'
+        value = "not directly assigned in wrapper"
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(token) and "=" in stripped:
+                value = stripped.split("=", 1)[1].strip()
+        out[key] = value
+    return out
+
+
+def validate_fuel_cases() -> None:
+    missing: list[str] = []
+    for case, paths in fuel_case_paths().items():
+        for run_dir in paths:
+            if not run_dir.is_dir():
+                missing.append(f"{case}: missing run directory {run_dir}")
+            elif not (run_dir / "D").is_dir():
+                missing.append(f"{case}: missing raw D directory {run_dir / 'D'}")
+    if missing:
+        raise RuntimeError("fuel-inventory case unavailable:\n" + "\n".join(missing))
+
+
+def fuel_available_saves(case: str) -> list[int]:
+    candidates: set[int] = set()
+    for run_dir in fuel_case_paths()[case]:
+        candidates.update(available_d_steps(run_dir))
+    saves: list[int] = []
+    for save in sorted(candidates):
+        item = fuel_item_for(case, save)
+        if all(field_available(item.run_dir, field, item.raw_step) for field in FUEL_REQUIRED_FIELDS):
+            saves.append(save)
+    return saves
+
+
+def fuel_common_saves() -> list[int]:
+    save_sets = [set(fuel_available_saves(case)) for case in FUEL_CASE_ORDER]
+    if not save_sets:
+        return []
+    return sorted(set.intersection(*save_sets))
+
+
+def fuel_field_mappings() -> dict[str, tuple[str, int] | None]:
+    ensure_species_fields(species_names())
+    return {name: raw.FIELDS.get(name) for name in FUEL_REQUIRED_FIELDS}
+
+
+def fuel_inventory_for_save(case: str, save: int) -> dict:
+    item = fuel_item_for(case, save)
+    fields = read_fields(item, FUEL_REQUIRED_FIELDS)
+    _dx, _dy, area = gas_metrics.estimate_cell_area(fields)
+    keys: set[tuple[float, float]] = set()
+    for field in fields.values():
+        keys.update(field.get("values", {}).keys())
+    gas_density_sum = 0.0
+    liquid_density_sum = 0.0
+    nonfinite_count = 0
+    for key in keys:
+        liquid = fields["liquid_alpha_rho"].get("values", {}).get(key, math.nan)
+        vapor = fields["vapor_alpha_rho"].get("values", {}).get(key, math.nan)
+        air = fields["air_alpha_rho"].get("values", {}).get(key, math.nan)
+        rhoY_fuel = fields["rhoY_NC12H26"].get("values", {}).get(key, math.nan)
+        if not all(math.isfinite(v) for v in [liquid, vapor, air, rhoY_fuel]):
+            nonfinite_count += 1
+            continue
+        gas_mass = vapor + air
+        if not math.isfinite(gas_mass):
+            nonfinite_count += 1
+            continue
+        # MFC stores rhoY_NC12H26 = (alpha_rho_vap + alpha_rho_air)*Y_NC12H26
+        # per mixture volume, so the full-domain gas parent-fuel inventory is
+        # integral(rhoY_NC12H26) dV with no gas mask.
+        gas_density_sum += rhoY_fuel
+        liquid_density_sum += liquid
+    if not math.isfinite(area):
+        gas_parent = liquid_parent = combined_parent = math.nan
+    else:
+        gas_parent = gas_density_sum * area
+        liquid_parent = liquid_density_sum * area
+        combined_parent = gas_parent + liquid_parent
+    return {
+        "case": case,
+        "case_label": FUEL_CASE_LABEL[case],
+        "diffusion": FUEL_CASE_DIFFUSION[case],
+        "reactions": FUEL_CASE_REACTIONS[case],
+        "save": save,
+        "raw_step": item.raw_step,
+        "origin": item.origin,
+        "run_dir": str(item.run_dir.relative_to(REPO)),
+        "time_s": save * T_SAVE,
+        "time_us": save * T_SAVE * 1e6,
+        "gas_parent_fuel_mass": gas_parent,
+        "liquid_dodecane_mass": liquid_parent,
+        "combined_parent_dodecane_mass": combined_parent,
+        # Backward-compatible aliases for earlier plot/CSV consumers.  These
+        # are parent-dodecane inventories, not closed total-fuel budgets.
+        "gas_fuel_mass": gas_parent,
+        "liquid_fuel_mass": liquid_parent,
+        "total_fuel_mass": combined_parent,
+        "nonfinite_cell_count": nonfinite_count,
+    }
+
+
+def fuel_inventory_rows(common_saves: list[int]) -> list[dict]:
+    available_by_case = {case: fuel_available_saves(case) for case in FUEL_CASE_ORDER}
+    initial: dict[str, float] = {}
+    for case, saves in available_by_case.items():
+        if not saves:
+            initial[case] = math.nan
+            continue
+        initial_row = fuel_inventory_for_save(case, min(saves))
+        initial[case] = ff(initial_row.get("combined_parent_dodecane_mass"))
+    rows: list[dict] = []
+    for save in common_saves:
+        for case in FUEL_CASE_ORDER:
+            row = fuel_inventory_for_save(case, save)
+            base = initial.get(case, math.nan)
+            gas = ff(row.get("gas_parent_fuel_mass"))
+            liquid = ff(row.get("liquid_dodecane_mass"))
+            combined = ff(row.get("combined_parent_dodecane_mass"))
+            if math.isfinite(base) and abs(base) > REL_DENOM_EPS:
+                row["gas_fraction_initial"] = gas / base if math.isfinite(gas) else math.nan
+                row["liquid_fraction_initial"] = liquid / base if math.isfinite(liquid) else math.nan
+                row["combined_parent_change_fraction"] = (combined - base) / base if math.isfinite(combined) else math.nan
+                row["total_conservation_error"] = row["combined_parent_change_fraction"]
+            else:
+                row["gas_fraction_initial"] = math.nan
+                row["liquid_fraction_initial"] = math.nan
+                row["combined_parent_change_fraction"] = math.nan
+                row["total_conservation_error"] = math.nan
+            rows.append(row)
+    return rows
+
+
+def plot_fuel_metric(rows: list[dict], key: str, ylabel: str, filename: str) -> None:
+    fig, ax = plt.subplots(figsize=(7.2, 4.6), constrained_layout=True)
+    for case in FUEL_CASE_ORDER:
+        rr = [r for r in rows if r["case"] == case and math.isfinite(ff(r.get(key)))]
+        ax.plot([ff(r["time_us"]) for r in rr], [ff(r[key]) for r in rr], "o-", ms=3, lw=1.25, label=FUEL_CASE_LABEL[case])
+    ax.set_xlabel("Time [µs]")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.25)
+    ax.legend(fontsize=8)
+    path = FUEL_OUT / "plots" / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+
+
+def plot_fuel_differences(rows: list[dict]) -> None:
+    by = {(r["case"], int(r["save"])): r for r in rows}
+    saves = sorted({int(r["save"]) for r in rows})
+    pairs = [
+        ("ON_NO_DIFF - OFF_NO_DIFF", "ON_NO_DIFF", "OFF_NO_DIFF"),
+        ("ON_WITH_DIFF_C3 - ON_NO_DIFF", "ON_WITH_DIFF_C3", "ON_NO_DIFF"),
+    ]
+    metrics = ["gas_parent_fuel_mass", "liquid_dodecane_mass", "combined_parent_dodecane_mass"]
+    fig, axes = plt.subplots(len(metrics), 1, figsize=(7.4, 7.8), constrained_layout=True, sharex=True)
+    for ax, metric in zip(axes, metrics):
+        for label, case_a, case_b in pairs:
+            xs: list[float] = []
+            ys: list[float] = []
+            for save in saves:
+                a = by.get((case_a, save))
+                b = by.get((case_b, save))
+                if not a or not b:
+                    continue
+                av = ff(a.get(metric))
+                bv = ff(b.get(metric))
+                if math.isfinite(av) and math.isfinite(bv):
+                    xs.append(save * T_SAVE * 1e6)
+                    ys.append(av - bv)
+            ax.plot(xs, ys, "o-", ms=3, lw=1.2, label=label)
+        ax.set_ylabel(metric.replace("_", " "))
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8)
+    axes[-1].set_xlabel("Time [µs]")
+    path = FUEL_OUT / "plots" / "parent_dodecane_inventory_differences.png"
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+
+
+def make_fuel_inventory_plots(rows: list[dict]) -> None:
+    plot_fuel_metric(rows, "gas_parent_fuel_mass", r"Gas NC12H26 parent fuel [kg m$^{-1}$]", "gas_fuel_inventory_vs_time.png")
+    plot_fuel_metric(rows, "liquid_dodecane_mass", r"Liquid dodecane [kg m$^{-1}$]", "liquid_fuel_inventory_vs_time.png")
+    plot_fuel_metric(rows, "combined_parent_dodecane_mass", r"Combined parent-dodecane inventory [kg m$^{-1}$]", "total_dodecane_inventory_vs_time.png")
+    plot_fuel_metric(rows, "combined_parent_change_fraction", "Combined parent-dodecane change from initial", "total_fuel_conservation_error_vs_time.png")
+    plot_fuel_differences(rows)
+
+
+def fuel_row_at(rows: list[dict], case: str, save: int) -> dict | None:
+    return next((r for r in rows if r["case"] == case and int(r["save"]) == save), None)
+
+
+def make_fuel_inventory_summary(rows: list[dict], common_saves: list[int]) -> None:
+    lines = [
+        "# Parent-dodecane inventory budget",
+        "",
+        "This is an offline saved-state inventory over the full physical domain.",
+        "It does not include reaction-source or boundary-flux integrals, so it is not a closed mass budget.",
+        "Gas parent fuel is integrated from stored conservative `rhoY_NC12H26`, equivalent to",
+        "`integral[(alpha_rho_vap + alpha_rho_air) * Y_NC12H26] dV`.",
+        "Liquid dodecane is `integral(alpha_rho_liquid) dV`.",
+        "In chemistry-ON cases, combined parent dodecane is not expected to remain constant because NC12H26 is chemically converted into products.",
+        "Only `OFF_NO_DIFF` directly tests liquid-plus-vapor NC12H26 conservation using this inventory alone.",
+        "C3 versus `ON_NO_DIFF` isolates how diffusion changes evaporation plus chemical consumption, but not those two mechanisms separately.",
+        "",
+        "## Cases",
+    ]
+    for case in FUEL_CASE_ORDER:
+        paths = fuel_case_paths()[case]
+        saves = fuel_available_saves(case)
+        path_text = ", ".join(str(path.relative_to(REPO)) for path in paths)
+        lines.append(f"- `{case}`: {FUEL_CASE_LABEL[case]}; {path_text}; saves={saves[:4]}...{saves[-4:] if saves else []}")
+    if common_saves:
+        lines += [
+            "",
+            "## Common time range",
+            f"Common saves: {common_saves[:4]}...{common_saves[-4:]} ({len(common_saves)} saves)",
+            f"Common time range: {common_saves[0]*T_SAVE*1e6:.2f} to {common_saves[-1]*T_SAVE*1e6:.2f} µs",
+        ]
+    else:
+        lines += ["", "## Common time range", "No common saves with required fuel fields were found."]
+    lines += ["", "## Requested common-time values"]
+    for target in FUEL_REPORT_TIMES_US:
+        if not common_saves:
+            lines.append(f"- {target:.2f} µs: unavailable; no common saves.")
+            continue
+        save = min(common_saves, key=lambda s: abs(s * T_SAVE * 1e6 - target))
+        mismatch = save * T_SAVE * 1e6 - target
+        if abs(mismatch) > 0.5 * T_SAVE * 1e6 + 1e-12:
+            lines.append(f"- {target:.2f} µs: unavailable within one save interval; nearest common save {save} at {save*T_SAVE*1e6:.2f} µs.")
+            continue
+        lines.append(f"- requested {target:.2f} µs; nearest common save {save} at {save*T_SAVE*1e6:.2f} µs:")
+        for case in FUEL_CASE_ORDER:
+            row = fuel_row_at(rows, case, save)
+            if row is None:
+                continue
+            lines.append(
+                f"  - {case}: gas_parent={ff(row['gas_parent_fuel_mass']):.8e}, "
+                f"liquid={ff(row['liquid_dodecane_mass']):.8e}, "
+                f"combined_parent={ff(row['combined_parent_dodecane_mass']):.8e}, "
+                f"combined_change={ff(row['combined_parent_change_fraction']):.8e}"
+            )
+        off = fuel_row_at(rows, "OFF_NO_DIFF", save)
+        on = fuel_row_at(rows, "ON_NO_DIFF", save)
+        c3 = fuel_row_at(rows, "ON_WITH_DIFF_C3", save)
+        if off and on:
+            lines.append(
+                f"  - OFF_NO_DIFF parent drift: {ff(off['combined_parent_change_fraction']):.8e}; "
+                f"ON_NO_DIFF - OFF_NO_DIFF gas={ff(on['gas_parent_fuel_mass']) - ff(off['gas_parent_fuel_mass']):.8e}, "
+                f"liquid={ff(on['liquid_dodecane_mass']) - ff(off['liquid_dodecane_mass']):.8e}."
+            )
+        if c3 and on:
+            gas_diff = ff(c3["gas_parent_fuel_mass"]) - ff(on["gas_parent_fuel_mass"])
+            liquid_diff = ff(c3["liquid_dodecane_mass"]) - ff(on["liquid_dodecane_mass"])
+            combined_diff = ff(c3["combined_parent_dodecane_mass"]) - ff(on["combined_parent_dodecane_mass"])
+            if math.isfinite(gas_diff) and gas_diff < 0.0:
+                if math.isfinite(liquid_diff) and liquid_diff > 0.0 and math.isfinite(combined_diff) and combined_diff < 0.0:
+                    accompaniment = "both more remaining liquid and less combined parent dodecane"
+                elif math.isfinite(liquid_diff) and liquid_diff > 0.0:
+                    accompaniment = "more remaining liquid"
+                elif math.isfinite(combined_diff) and combined_diff < 0.0:
+                    accompaniment = "less combined parent dodecane"
+                else:
+                    accompaniment = "neither more liquid nor less combined parent dodecane"
+            else:
+                accompaniment = "C3 gas parent fuel is not lower than ON_NO_DIFF at this time"
+            lines.append(
+                f"  - ON_WITH_DIFF_C3 - ON_NO_DIFF gas={gas_diff:.8e}, liquid={liquid_diff:.8e}, "
+                f"combined_parent={combined_diff:.8e}; lower-C3-gas assessment: {accompaniment}."
+            )
+    lines += [
+        "",
+        "## Interpretation rules",
+        "- Do not call gas-parent-fuel reduction `fuel loss` if combined parent dodecane remains conserved.",
+        "- In chemistry-ON cases, combined parent dodecane can decrease through conversion of NC12H26 into products.",
+        "- Material `OFF_NO_DIFF` combined-parent drift flags a conservation, boundary, clipping, or source-coupling issue.",
+        "- C3 versus `ON_NO_DIFF` mixes diffusion effects on evaporation and chemical consumption unless source and boundary integrals are added.",
+    ]
+    FUEL_OUT.mkdir(parents=True, exist_ok=True)
+    (FUEL_OUT / "fuel_inventory_budget_summary.md").write_text("\n".join(lines) + "\n")
+
+
+def fuel_inventory_dry_run() -> None:
+    all_species = species_names()
+    ensure_species_fields(all_species)
+    validate_fuel_cases()
+    print("fuel inventory case paths:")
+    for case, paths in fuel_case_paths().items():
+        saves = fuel_available_saves(case)
+        preview = f"{saves[:4]}...{saves[-4:]}" if len(saves) > 8 else str(saves)
+        print(f"  {case}: {FUEL_CASE_LABEL[case]}")
+        for run_dir in paths:
+            settings = case_assignment_preview(
+                run_dir / "case.py",
+                ["chem_params%diffusion", "chem_params%reactions", "chem_reaction_heat_enable", "t_stop", "t_save"],
+            )
+            print(f"    path: {run_dir}")
+            print(f"      exists={run_dir.is_dir()} D_exists={(run_dir / 'D').is_dir()}")
+            for key, value in settings.items():
+                print(f"      case.py {key}: {value}")
+        print(f"    stitched_by_existing_item_for={FUEL_CASE_TO_COMPARISON[case]}")
+        print(f"    saves_with_required={preview}")
+    print("field mappings:")
+    for name, mapping in fuel_field_mappings().items():
+        print(f"  {name}: {mapping}")
+    common = fuel_common_saves()
+    print("all_three_cases_present: T")
+    print(f"chemistry_ON_no_diff_stitched: {SOURCE_ON} + {RESTART_ON}")
+    print(f"common saves with required fields ({len(common)}): {common}")
+    if common:
+        t_min = common[0] * T_SAVE * 1e6
+        t_max = common[-1] * T_SAVE * 1e6
+        print(f"common time range: {t_min:.2f} to {t_max:.2f} us")
+        print(f"common_times_extend_to_1p90us: {'T' if t_max >= 1.90 - 1.0e-12 else 'F'}")
+    else:
+        print("common time range: unavailable")
+        print("common_times_extend_to_1p90us: F")
+    print("formula: gas parent fuel = integral(rhoY_NC12H26) dV")
+    print("liquid parent fuel = integral(alpha_rho_liquid) dV")
+    print("combined parent dodecane = gas NC12H26 + liquid dodecane")
+    print("no gas mask is applied to the full-domain gas parent-fuel integral")
+    print("C3 raw saves are read from the C3 HPC case path when present on that filesystem")
+
+
+def export_fuel_inventory_budget(dry_run_only: bool = False) -> None:
+    all_species = species_names()
+    ensure_species_fields(all_species)
+    if dry_run_only:
+        fuel_inventory_dry_run()
+        return
+    validate_fuel_cases()
+    common = fuel_common_saves()
+    if not common:
+        raise RuntimeError("no common saves with fuel-inventory fields available in all three cases")
+    rows = fuel_inventory_rows(common)
+    FUEL_OUT.mkdir(parents=True, exist_ok=True)
+    write_csv(FUEL_OUT / "fuel_inventory_budget.csv", rows)
+    make_fuel_inventory_plots(rows)
+    make_fuel_inventory_summary(rows, common)
+
+
 DIFFUSION_SPECIES = ["NC12H26", "O2"]
 DIFFUSION_TOTAL_DESCRIPTION = "sqrt(sum_k J_k^2) after zero-net correction and model-3 alpha-face weighting"
 
@@ -2449,10 +2838,12 @@ def main() -> None:
     parser.add_argument("--c3-export", type=Path, help="C3 compact export directory for --make-difference-frames")
     parser.add_argument("--export-diffusion-diagnostics", action="store_true", help="Reconstruct C3 saved-state model-3 chemistry-diffusion masks and species fluxes")
     parser.add_argument("--export-diffusion-mask-only", action="store_true", help="Export C3 saved-state model-3 chemistry-diffusion active masks without Cantera")
+    parser.add_argument("--export-fuel-inventory-budget", action="store_true", help="Export full-domain C1/C2/C3 dodecane fuel-inventory budgets")
     parser.add_argument("--c3-raw-case", type=Path, default=C3_RUN, help="Raw C3 case directory for diffusion exports")
     parser.add_argument("--saves", type=int, nargs="+", default=[30, 38], help="C3 save indices for diffusion exports")
     parser.add_argument("--output-dir", type=Path, default=OUT, help="Output directory for diffusion exports")
     parser.add_argument("--diffusion-dry-run", action="store_true", help="Check diffusion diagnostic arguments/mapping without requiring HPC raw fields")
+    parser.add_argument("--fuel-inventory-dry-run", action="store_true", help="Check fuel-inventory case paths, mappings, and common saves without exporting")
     args = parser.parse_args()
     modes = sum(bool(v) for v in [
         args.dry_run,
@@ -2461,6 +2852,7 @@ def main() -> None:
         args.make_difference_frames,
         args.export_diffusion_diagnostics,
         args.export_diffusion_mask_only,
+        args.export_fuel_inventory_budget,
     ])
     if modes > 1:
         parser.error("choose only one primary mode")
@@ -2478,9 +2870,13 @@ def main() -> None:
         export_diffusion_diagnostics(args.c3_raw_case, args.saves, args.output_dir, args.diffusion_dry_run)
     elif args.export_diffusion_mask_only:
         export_diffusion_mask_only(args.c3_raw_case, args.saves, args.output_dir, args.diffusion_dry_run)
+    elif args.export_fuel_inventory_budget:
+        export_fuel_inventory_budget(args.fuel_inventory_dry_run)
     else:
         if args.diffusion_dry_run:
             parser.error("--diffusion-dry-run requires --export-diffusion-diagnostics or --export-diffusion-mask-only")
+        if args.fuel_inventory_dry_run:
+            parser.error("--fuel-inventory-dry-run requires --export-fuel-inventory-budget")
         run_full()
 
 
