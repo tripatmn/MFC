@@ -1946,30 +1946,81 @@ def fuel_inventory_for_save(case: str, save: int) -> dict:
     }
 
 
+def c3_parent_inventory_grid(fields: dict[str, dict], save: int) -> dict:
+    x_liq, y_liq, liquid = grid_required(fields["liquid_alpha_rho"], "liquid_alpha_rho")
+    x_fuel, y_fuel, rhoY_fuel = grid_required(fields["rhoY_NC12H26"], "rhoY_NC12H26")
+    if not same_grid(x_liq, y_liq, x_fuel, y_fuel):
+        raise RuntimeError(f"C3 fuel inventory save {save}: cons.1 and cons.58 grids do not match")
+    if x_liq.size < 2 or y_liq.size < 2:
+        raise RuntimeError(f"C3 fuel inventory save {save}: need at least two x/y coordinates to estimate cell area")
+    dx_values = np.diff(x_liq)
+    dy_values = np.diff(y_liq)
+    finite_dx = dx_values[np.isfinite(dx_values) & (dx_values > 0.0)]
+    finite_dy = dy_values[np.isfinite(dy_values) & (dy_values > 0.0)]
+    if finite_dx.size == 0 or finite_dy.size == 0:
+        raise RuntimeError(f"C3 fuel inventory save {save}: no finite positive coordinate spacing")
+    dx = float(np.median(finite_dx))
+    dy = float(np.median(finite_dy))
+    area = dx * dy
+    cell_area_weights = np.full(liquid.shape, area)
+    if not np.all(np.isfinite(cell_area_weights)) or area <= 0.0:
+        raise RuntimeError(f"C3 fuel inventory save {save}: invalid cell-area weights from dx={dx} dy={dy}")
+    return {
+        "x": x_liq,
+        "y": y_liq,
+        "liquid": liquid,
+        "rhoY_fuel": rhoY_fuel,
+        "dx_values": dx_values,
+        "dy_values": dy_values,
+        "dx": dx,
+        "dy": dy,
+        "cell_area_weights": cell_area_weights,
+    }
+
+
+def print_c3_inventory_grid_diagnostics(save: int, data: dict) -> None:
+    x = data["x"]
+    y = data["y"]
+    liquid = data["liquid"]
+    rhoY_fuel = data["rhoY_fuel"]
+    dx_values = data["dx_values"]
+    dy_values = data["dy_values"]
+    weights = data["cell_area_weights"]
+    finite_liq = int(np.count_nonzero(np.isfinite(liquid)))
+    finite_fuel = int(np.count_nonzero(np.isfinite(rhoY_fuel)))
+    finite_dx = dx_values[np.isfinite(dx_values)]
+    finite_dy = dy_values[np.isfinite(dy_values)]
+    finite_weights = weights[np.isfinite(weights)]
+    print(
+        f"C3_FUEL_INVENTORY_DIAG save={save} "
+        f"liquid_shape={liquid.shape} rhoY_shape={rhoY_fuel.shape} "
+        f"finite_liquid={finite_liq}/{liquid.size} finite_rhoY={finite_fuel}/{rhoY_fuel.size} "
+        f"x_range=({float(np.nanmin(x)):.8e},{float(np.nanmax(x)):.8e}) "
+        f"y_range=({float(np.nanmin(y)):.8e},{float(np.nanmax(y)):.8e}) "
+        f"dx_minmax=({float(np.min(finite_dx)):.8e},{float(np.max(finite_dx)):.8e}) "
+        f"dy_minmax=({float(np.min(finite_dy)):.8e},{float(np.max(finite_dy)):.8e}) "
+        f"cell_area_minmax=({float(np.min(finite_weights)):.8e},{float(np.max(finite_weights)):.8e})"
+    )
+
+
 def c3_parent_inventory_for_save(run_dir: Path, save: int) -> dict:
     item = SaveItem("ON_WITH_DIFF_C3", run_dir, save, save, "fresh")
     fields = read_fields(item, ["liquid_alpha_rho", "rhoY_NC12H26"])
-    _dx, _dy, area = gas_metrics.estimate_cell_area(fields)
-    keys: set[tuple[float, float]] = set()
-    keys.update(fields["liquid_alpha_rho"].get("values", {}).keys())
-    keys.update(fields["rhoY_NC12H26"].get("values", {}).keys())
-    gas_density_sum = 0.0
-    liquid_density_sum = 0.0
-    nonfinite_count = 0
-    for key in keys:
-        liquid = fields["liquid_alpha_rho"].get("values", {}).get(key, math.nan)
-        rhoY_fuel = fields["rhoY_NC12H26"].get("values", {}).get(key, math.nan)
-        if not math.isfinite(liquid) or not math.isfinite(rhoY_fuel):
-            nonfinite_count += 1
-            continue
-        gas_density_sum += rhoY_fuel
-        liquid_density_sum += liquid
-    if not math.isfinite(area):
-        gas_parent = liquid_parent = combined_parent = math.nan
-    else:
-        gas_parent = gas_density_sum * area
-        liquid_parent = liquid_density_sum * area
-        combined_parent = gas_parent + liquid_parent
+    data = c3_parent_inventory_grid(fields, save)
+    print_c3_inventory_grid_diagnostics(save, data)
+    liquid = data["liquid"]
+    rhoY_fuel = data["rhoY_fuel"]
+    weights = data["cell_area_weights"]
+    finite_pair = np.isfinite(liquid) & np.isfinite(rhoY_fuel) & np.isfinite(weights)
+    nonfinite_count = int(liquid.size - np.count_nonzero(finite_pair))
+    gas_parent = float(np.sum(rhoY_fuel[finite_pair] * weights[finite_pair]))
+    liquid_parent = float(np.sum(liquid[finite_pair] * weights[finite_pair]))
+    combined_parent = gas_parent + liquid_parent
+    if not all(math.isfinite(v) for v in [gas_parent, liquid_parent, combined_parent]):
+        raise RuntimeError(
+            f"C3 fuel inventory save {save}: nonfinite integrated mass "
+            f"gas={gas_parent} liquid={liquid_parent} combined={combined_parent}"
+        )
     return {
         "save": save,
         "time_s": save * T_SAVE,
@@ -1989,7 +2040,12 @@ def c3_fuel_inventory_saves(run_dir: Path) -> list[int]:
     return saves
 
 
-def export_c3_fuel_inventory(c3_raw_case: Path, output_file: Path, dry_run_only: bool = False) -> None:
+def export_c3_fuel_inventory(
+    c3_raw_case: Path,
+    output_file: Path,
+    dry_run_only: bool = False,
+    save_filter: int | None = None,
+) -> None:
     all_species = species_names()
     ensure_species_fields(all_species)
     mappings = {
@@ -1997,10 +2053,13 @@ def export_c3_fuel_inventory(c3_raw_case: Path, output_file: Path, dry_run_only:
         "rhoY_NC12H26": raw.FIELDS.get("rhoY_NC12H26"),
     }
     saves = c3_fuel_inventory_saves(c3_raw_case) if (c3_raw_case / "D").is_dir() else []
+    if save_filter is not None:
+        saves = [save for save in saves if save == save_filter]
     print("C3 parent-dodecane inventory export")
     print(f"  c3_raw_case: {c3_raw_case}")
     print(f"  D_exists: {(c3_raw_case / 'D').is_dir()}")
     print(f"  output_file: {output_file}")
+    print(f"  save_filter: {save_filter if save_filter is not None else 'all'}")
     print("  mappings:")
     for name, mapping in mappings.items():
         print(f"    {name}: {mapping}")
@@ -2031,6 +2090,16 @@ def export_c3_fuel_inventory(c3_raw_case: Path, output_file: Path, dry_run_only:
             row["gas_fraction_of_initial_combined"] = math.nan
             row["liquid_fraction_of_initial_combined"] = math.nan
             row["combined_fraction_of_initial"] = math.nan
+        for key in [
+            "gas_parent_fuel_mass",
+            "liquid_dodecane_mass",
+            "combined_parent_dodecane_mass",
+            "gas_fraction_of_initial_combined",
+            "liquid_fraction_of_initial_combined",
+            "combined_fraction_of_initial",
+        ]:
+            if not math.isfinite(ff(row.get(key))):
+                raise RuntimeError(f"C3 fuel inventory save {row['save']}: refusing to write nonfinite {key}")
     write_csv(output_file, rows)
     print(f"  wrote: {output_file}")
     print("  label: C3 parent-dodecane inventory only; not a closed conservation budget")
@@ -2938,6 +3007,7 @@ def main() -> None:
     parser.add_argument("--diffusion-dry-run", action="store_true", help="Check diffusion diagnostic arguments/mapping without requiring HPC raw fields")
     parser.add_argument("--fuel-inventory-dry-run", action="store_true", help="Check fuel-inventory case paths, mappings, and common saves without exporting")
     parser.add_argument("--c3-fuel-inventory-dry-run", action="store_true", help="Check C3-only fuel inventory inputs without writing CSV")
+    parser.add_argument("--c3-fuel-inventory-save", type=int, help="Restrict --export-c3-fuel-inventory to one save for lightweight testing")
     args = parser.parse_args()
     modes = sum(bool(v) for v in [
         args.dry_run,
@@ -2968,7 +3038,12 @@ def main() -> None:
     elif args.export_fuel_inventory_budget:
         export_fuel_inventory_budget(args.fuel_inventory_dry_run)
     elif args.export_c3_fuel_inventory:
-        export_c3_fuel_inventory(args.c3_raw_case, args.output_file, args.c3_fuel_inventory_dry_run)
+        export_c3_fuel_inventory(
+            args.c3_raw_case,
+            args.output_file,
+            args.c3_fuel_inventory_dry_run,
+            args.c3_fuel_inventory_save,
+        )
     else:
         if args.diffusion_dry_run:
             parser.error("--diffusion-dry-run requires --export-diffusion-diagnostics or --export-diffusion-mask-only")
