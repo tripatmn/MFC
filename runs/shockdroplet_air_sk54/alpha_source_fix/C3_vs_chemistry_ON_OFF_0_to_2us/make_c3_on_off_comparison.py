@@ -82,6 +82,8 @@ FRAME_VARIABLES = [
     "CO2",
     "H2O",
 ]
+DIFFERENCE_FRAME_TIMES_US = [1.50, 1.90]
+DIFFERENCE_FRAME_VARIABLES = ["NC12H26", "O2", "OH", "valid_gas_temperature", "liquid_alpha"]
 BASE_FIELDS = [
     "liquid_alpha_rho",
     "vapor_alpha_rho",
@@ -1569,23 +1571,748 @@ def dry_run() -> None:
         )
 
 
+def c3_npz_records(export_path: Path, variable: str) -> list[dict]:
+    records: list[dict] = []
+    for path in sorted((export_path / "field_data").rglob("*.npz")):
+        try:
+            data = np.load(path, allow_pickle=False)
+            var = str(np.asarray(data["variable"]).item())
+            if var != variable:
+                continue
+            records.append({
+                "path": path,
+                "variable": var,
+                "time_us": float(np.asarray(data["time"]).item()) * 1.0e6,
+                "save": int(np.asarray(data["save"]).item()),
+                "raw_step": int(np.asarray(data["raw_step"]).item()),
+            })
+        except Exception:
+            continue
+    return records
+
+
+def nearest_c3_npz(export_path: Path, variable: str, requested_time_us: float) -> dict | None:
+    records = c3_npz_records(export_path, variable)
+    if not records:
+        return None
+    return min(records, key=lambda row: abs(row["time_us"] - requested_time_us))
+
+
+def load_npz_grid(path: Path) -> dict:
+    data = np.load(path, allow_pickle=False)
+    return {
+        "x": np.array(data["x"], dtype=float),
+        "y": np.array(data["y"], dtype=float),
+        "values": np.array(data["values"], dtype=float),
+        "valid_mask": np.array(data["valid_mask"], dtype=bool),
+        "alpha_liq": np.array(data["alpha_liq"], dtype=float),
+        "time_us": float(np.asarray(data["time"]).item()) * 1.0e6,
+        "save": int(np.asarray(data["save"]).item()),
+        "raw_step": int(np.asarray(data["raw_step"]).item()),
+        "variable": str(np.asarray(data["variable"]).item()),
+        "mask_description": str(np.asarray(data["mask_description"]).item()) if "mask_description" in data else "",
+    }
+
+
+def on_saves_with_variable(variable: str) -> list[int]:
+    saves = sorted(available_d_steps(SOURCE_ON) | available_d_steps(RESTART_ON))
+    out: list[int] = []
+    for save in saves:
+        item = item_for("CHEM_ON_DIFF_OFF", save)
+        if variable == "valid_gas_temperature":
+            needed = ["pressure", "liquid_alpha", "vapor_alpha", "air_alpha", "vapor_alpha_rho", "air_alpha_rho"]
+            ok, _missing = save_has_fields(item, needed)
+        elif variable == "liquid_alpha":
+            ok = field_available(item.run_dir, "liquid_alpha", item.raw_step)
+        else:
+            ok = field_available(item.run_dir, f"rhoY_{variable}", item.raw_step)
+        if ok:
+            out.append(save)
+    return out
+
+
+def nearest_on_item(variable: str, reference_time_us: float) -> SaveItem | None:
+    saves = on_saves_with_variable(variable)
+    if not saves:
+        return None
+    save = min(saves, key=lambda idx: abs(idx * T_SAVE * 1.0e6 - reference_time_us))
+    return item_for("CHEM_ON_DIFF_OFF", save)
+
+
+def same_grid(x0: np.ndarray, y0: np.ndarray, x1: np.ndarray, y1: np.ndarray) -> bool:
+    return (
+        x0.shape == x1.shape and y0.shape == y1.shape and
+        np.allclose(x0, x1, rtol=0.0, atol=1.0e-14) and
+        np.allclose(y0, y1, rtol=0.0, atol=1.0e-14)
+    )
+
+
+def interpolate_array(src_x: np.ndarray, src_y: np.ndarray, src: np.ndarray, dst_x: np.ndarray, dst_y: np.ndarray) -> np.ndarray:
+    if same_grid(src_x, src_y, dst_x, dst_y):
+        return np.array(src, copy=True)
+    tmp = np.full((src_y.size, dst_x.size), np.nan)
+    for iy in range(src_y.size):
+        row = src[iy, :]
+        finite = np.isfinite(row)
+        if np.count_nonzero(finite) >= 2:
+            tmp[iy, :] = np.interp(dst_x, src_x[finite], row[finite], left=np.nan, right=np.nan)
+    out = np.full((dst_y.size, dst_x.size), np.nan)
+    for ix in range(dst_x.size):
+        col = tmp[:, ix]
+        finite = np.isfinite(col)
+        if np.count_nonzero(finite) >= 2:
+            out[:, ix] = np.interp(dst_y, src_y[finite], col[finite], left=np.nan, right=np.nan)
+    return out
+
+
+def nearest_index_map(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    return np.array([int(np.argmin(np.abs(src - value))) for value in dst], dtype=int)
+
+
+def interpolate_mask(src_x: np.ndarray, src_y: np.ndarray, src: np.ndarray, dst_x: np.ndarray, dst_y: np.ndarray) -> np.ndarray:
+    if same_grid(src_x, src_y, dst_x, dst_y):
+        return np.array(src, copy=True)
+    xi = nearest_index_map(src_x, dst_x)
+    yi = nearest_index_map(src_y, dst_y)
+    out = np.zeros((dst_y.size, dst_x.size), dtype=bool)
+    for j, src_j in enumerate(yi):
+        for i, src_i in enumerate(xi):
+            out[j, i] = bool(src[src_j, src_i])
+    return out
+
+
+def on_full_domain_arrays(item: SaveItem, variable: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    field, _label, _unit, _is_species = load_frame_field(item, variable)
+    alpha = liquid_alpha_field(item)
+    if not field.get("available") or not alpha.get("available"):
+        return None
+    return full_domain_arrays(field, alpha, valid_by_presence=(variable == "valid_gas_temperature"))
+
+
+def draw_difference_frame(
+    variable: str,
+    requested_time_us: float,
+    c3: dict,
+    on_item: SaveItem,
+    on_arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    out_path: Path,
+) -> tuple[bool, str, bool]:
+    on_x, on_y, on_values, on_mask, on_alpha = on_arrays
+    c3_x = c3["x"]
+    c3_y = c3["y"]
+    interpolation_used = not same_grid(on_x, on_y, c3_x, c3_y)
+    on_values_i = interpolate_array(on_x, on_y, on_values, c3_x, c3_y)
+    on_alpha_i = interpolate_array(on_x, on_y, on_alpha, c3_x, c3_y)
+    on_mask_i = interpolate_mask(on_x, on_y, on_mask, c3_x, c3_y)
+    c3_values = c3["values"]
+    c3_mask = c3["valid_mask"]
+    if variable == "valid_gas_temperature":
+        mask = c3_mask & on_mask_i & np.isfinite(c3_values) & np.isfinite(on_values_i)
+    else:
+        mask = np.isfinite(c3_values) & np.isfinite(on_values_i) & c3_mask & on_mask_i
+    diff = np.where(mask, c3_values - on_values_i, np.nan)
+    finite = diff[np.isfinite(diff)]
+    if finite.size == 0:
+        return False, "no finite overlapping difference values", interpolation_used
+    vmax = float(np.nanmax(np.abs(finite)))
+    if not math.isfinite(vmax) or vmax <= 0.0:
+        vmax = 1.0
+    fig, ax = plt.subplots(figsize=(9.4, 4.8), constrained_layout=True)
+    mesh = ax.pcolormesh(
+        edges(c3_x * 1.0e6),
+        edges(c3_y * 1.0e6),
+        diff,
+        shading="auto",
+        cmap="coolwarm",
+        norm=colors.TwoSlopeNorm(vcenter=0.0, vmin=-vmax, vmax=vmax),
+    )
+    cb = fig.colorbar(mesh, ax=ax, pad=0.02)
+    cb.set_label(f"C3 - chemistry ON/diffusion OFF {variable}")
+    if np.nanmin(c3["alpha_liq"]) <= 0.5 <= np.nanmax(c3["alpha_liq"]):
+        ax.contour(c3_x * 1.0e6, c3_y * 1.0e6, c3["alpha_liq"], levels=[0.5], colors="black", linewidths=1.0)
+    if np.nanmin(on_alpha_i) <= 0.5 <= np.nanmax(on_alpha_i):
+        ax.contour(c3_x * 1.0e6, c3_y * 1.0e6, on_alpha_i, levels=[0.5], colors="white", linewidths=1.0, linestyles="--")
+    c3_time = c3["time_us"]
+    on_time = on_item.global_save * T_SAVE * 1.0e6
+    ax.set_title(
+        f"{variable}: C3 - chemistry ON/diffusion OFF\n"
+        f"C3 save {c3['save']} t={c3_time:.3f} µs; "
+        f"ON save {on_item.global_save} t={on_time:.3f} µs; "
+        f"Δt={on_time - c3_time:+.3e} µs"
+    )
+    ax.set_xlabel("x [µm]")
+    ax.set_ylabel("y [µm]")
+    ax.set_aspect("equal", adjustable="box")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+    return True, "", interpolation_used
+
+
+def make_difference_frames(export_path: Path) -> None:
+    export_path = export_path.resolve()
+    out_dir = OUT / "difference_frames"
+    manifest: list[dict] = []
+    for requested_time_us in DIFFERENCE_FRAME_TIMES_US:
+        for variable in DIFFERENCE_FRAME_VARIABLES:
+            record = nearest_c3_npz(export_path, variable, requested_time_us)
+            row = {"variable": variable, "requested_time_us": requested_time_us}
+            if record is None:
+                row.update({"status": "skipped", "source_c3_npz": "", "output_png": "", "interpolation_used": ""})
+                manifest.append(row)
+                continue
+            c3 = load_npz_grid(record["path"])
+            on_item = nearest_on_item(variable, c3["time_us"])
+            row.update({
+                "c3_actual_time_us": c3["time_us"],
+                "c3_save": c3["save"],
+                "source_c3_npz": str(record["path"]),
+            })
+            if on_item is None:
+                row.update({"status": "skipped", "reason": "no matching chemistry-ON raw save", "output_png": "", "interpolation_used": ""})
+                manifest.append(row)
+                continue
+            on_arrays = on_full_domain_arrays(on_item, variable)
+            on_time_us = on_item.global_save * T_SAVE * 1.0e6
+            row.update({
+                "on_actual_time_us": on_time_us,
+                "on_save": on_item.global_save,
+                "time_mismatch_us": on_time_us - c3["time_us"],
+            })
+            if on_arrays is None:
+                row.update({"status": "skipped", "reason": "chemistry-ON field unavailable", "output_png": "", "interpolation_used": ""})
+                manifest.append(row)
+                continue
+            output = out_dir / variable / f"{variable}_C3_minus_ON_t{requested_time_us:.2f}us.png"
+            ok, reason, used_interp = draw_difference_frame(variable, requested_time_us, c3, on_item, on_arrays, output)
+            row.update({
+                "output_png": str(output.relative_to(OUT)) if ok else "",
+                "interpolation_used": "T" if used_interp else "F",
+                "status": "written" if ok else "skipped",
+                "reason": reason,
+            })
+            manifest.append(row)
+    write_csv(OUT / "difference_frame_manifest.csv", manifest)
+
+
+
+DIFFUSION_SPECIES = ["NC12H26", "O2"]
+DIFFUSION_TOTAL_DESCRIPTION = "sqrt(sum_k J_k^2) after zero-net correction and model-3 alpha-face weighting"
+
+
+@dataclass(frozen=True)
+class DiffusionVariableMap:
+    liquid_alpha: tuple[str, int]
+    vapor_alpha: tuple[str, int]
+    air_alpha: tuple[str, int]
+    vapor_alpha_rho: tuple[str, int]
+    air_alpha_rho: tuple[str, int]
+    pressure: tuple[str, int]
+    species_prim_start: int
+    species_indices: dict[str, int]
+
+
+def c3_case_dict(case_path: Path) -> dict:
+    namespace: dict = {}
+    code = compile(case_path.read_text(), str(case_path), "exec")
+    exec(code, namespace)
+    case = namespace.get("case")
+    if not isinstance(case, dict):
+        raise RuntimeError(f"{case_path} did not define a case dictionary")
+    return case
+
+
+def diffusion_variable_map(case: dict, all_species: list[str]) -> DiffusionVariableMap:
+    num_fluids = int(case.get("num_fluids", 3))
+    if int(case.get("model_eqns", -1)) != 3:
+        raise RuntimeError("diffusion diagnostic is currently defined for model_eqns == 3")
+    species_indices = {name: all_species.index(name) + 1 for name in all_species}
+    # MFC model-3 primitive layout used by s_compute_chemistry_diffusion_flux:
+    #   1:num_fluids                 alpha_i rho_i
+    #   num_fluids+1:...             velocities/pressure block
+    #   advxb = num_fluids + num_dims + 2; for this 2D case advxb = 7
+    #   chemxb = 12 + species_id     for SK54 primitive Y_i output
+    advxb = num_fluids + int(case.get("num_dims", 2)) + 2
+    chem_prim_start = 12
+    return DiffusionVariableMap(
+        liquid_alpha=("prim", advxb),
+        vapor_alpha=("prim", advxb + 1),
+        air_alpha=("prim", advxb + 2),
+        vapor_alpha_rho=("prim", 2),
+        air_alpha_rho=("prim", 3),
+        pressure=("prim", 6),
+        species_prim_start=chem_prim_start,
+        species_indices=species_indices,
+    )
+
+
+def require_cantera():
+    try:
+        import cantera as ct  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on HPC environment
+        raise RuntimeError("Cantera is required for --export-diffusion-diagnostics") from exc
+    return ct
+
+
+def grid_required(field: dict, name: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    g = grid(field)
+    if g is None:
+        raise RuntimeError(f"field {name} is unavailable or cannot be gridded")
+    return g
+
+
+def read_mapped_field(run_dir: Path, mapping: tuple[str, int], save: int) -> dict:
+    kind, index = mapping
+    temp_name = f"__diffusion_diag_{kind}_{index}"
+    previous = raw.FIELDS.get(temp_name)
+    raw.FIELDS[temp_name] = (kind, index)
+    try:
+        return raw.read_field(run_dir, temp_name, save)
+    finally:
+        if previous is None:
+            raw.FIELDS.pop(temp_name, None)
+        else:
+            raw.FIELDS[temp_name] = previous
+
+
+def diffusion_read_save_fields(run_dir: Path, save: int, fmap: DiffusionVariableMap, all_species: list[str]) -> dict[str, dict]:
+    fields = {
+        "alpha_liq": read_mapped_field(run_dir, fmap.liquid_alpha, save),
+        "alpha_vap": read_mapped_field(run_dir, fmap.vapor_alpha, save),
+        "alpha_air": read_mapped_field(run_dir, fmap.air_alpha, save),
+        "rho_vap": read_mapped_field(run_dir, fmap.vapor_alpha_rho, save),
+        "rho_air": read_mapped_field(run_dir, fmap.air_alpha_rho, save),
+        "pressure": read_mapped_field(run_dir, fmap.pressure, save),
+    }
+    for name in all_species:
+        sid = fmap.species_indices[name]
+        fields[f"Y_{name}"] = read_mapped_field(run_dir, ("prim", fmap.species_prim_start + sid), save)
+    return fields
+
+
+def arrays_from_diffusion_fields(fields: dict[str, dict], all_species: list[str]) -> dict[str, np.ndarray]:
+    x, y, alpha_liq = grid_required(fields["alpha_liq"], "alpha_liq")
+    out: dict[str, np.ndarray] = {"x": x, "y": y, "alpha_liq": alpha_liq}
+    for key in ["alpha_vap", "alpha_air", "rho_vap", "rho_air", "pressure"]:
+        xx, yy, arr = grid_required(fields[key], key)
+        if not same_grid(x, y, xx, yy):
+            raise RuntimeError(f"field {key} grid does not match liquid-alpha grid")
+        out[key] = arr
+    species_arrays = []
+    missing = []
+    for name in all_species:
+        field = fields.get(f"Y_{name}", empty_field())
+        if not field.get("available"):
+            missing.append(name)
+            continue
+        xx, yy, arr = grid_required(field, f"Y_{name}")
+        if not same_grid(x, y, xx, yy):
+            raise RuntimeError(f"species field {name} grid does not match liquid-alpha grid")
+        species_arrays.append(arr)
+    if missing:
+        preview = ", ".join(missing[:10])
+        if len(missing) > 10:
+            preview += f", ... ({len(missing)} total)"
+        raise RuntimeError(f"missing required SK54 species fields: {preview}")
+    out["Y"] = np.stack(species_arrays, axis=0)
+    return out
+
+
+def diffusion_face_coordinates(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    x_face = 0.5*(x[:-1] + x[1:])
+    y_face = 0.5*(y[:-1] + y[1:])
+    return x_face, y, x, y_face
+
+
+def cantera_transport_state(gas, pressure: float, temperature: float, Y: np.ndarray) -> tuple[np.ndarray, float, np.ndarray, np.ndarray, float]:
+    gas.TPY = temperature, pressure, Y
+    diffusivities = np.asarray(gas.mix_diff_coeffs_mass, dtype=float)
+    lambda_mix = float(gas.thermal_conductivity)
+    mole_fractions = np.asarray(gas.X, dtype=float)
+    enthalpies = np.asarray(gas.partial_molar_enthalpies, dtype=float) / np.asarray(gas.molecular_weights, dtype=float)
+    mw = float(gas.mean_molecular_weight)
+    return diffusivities, lambda_mix, mole_fractions, enthalpies, mw
+
+
+def reconstruct_diffusion_fluxes(arr: dict[str, np.ndarray], species: list[str], mechanism: Path, phase: str) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    ct = require_cantera()
+    gas = ct.Solution(str(mechanism), phase)
+    if list(gas.species_names) != species:
+        raise RuntimeError("Cantera mechanism species order does not match parsed SK54 species order")
+    molecular_weights = np.asarray(gas.molecular_weights, dtype=float)
+    gas_constant = float(ct.gas_constant)
+    x = arr["x"]
+    y = arr["y"]
+    alpha_liq = arr["alpha_liq"]
+    alpha_g = arr["alpha_vap"] + arr["alpha_air"]
+    rho_g_stored = arr["rho_vap"] + arr["rho_air"]
+    pressure = arr["pressure"]
+    Y = arr["Y"]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rho_g_intrinsic = rho_g_stored/alpha_g
+    eligible = (
+        np.isfinite(alpha_g) & np.isfinite(alpha_liq) &
+        (alpha_g >= 0.5) & (alpha_liq <= 0.5)
+    )
+    ny, nx = alpha_liq.shape
+    ns = len(species)
+    active_x = eligible[:, :-1] & eligible[:, 1:]
+    active_y = eligible[:-1, :] & eligible[1:, :]
+    Jx = np.zeros((ns, ny, max(nx - 1, 0)), dtype=float)
+    Jy = np.zeros((ns, max(ny - 1, 0), nx), dtype=float)
+    residuals: list[float] = []
+    finite_temperature = []
+    nonfinite_temperature_count = 0
+    nonfinite_pressure_count = int(np.count_nonzero(~np.isfinite(pressure)))
+
+    def compute_face(side0, side1, spacing: float) -> tuple[np.ndarray, float] | None:
+        y0 = Y[:, side0[0], side0[1]]
+        y1 = Y[:, side1[0], side1[1]]
+        p0 = float(pressure[side0])
+        p1 = float(pressure[side1])
+        rho0 = float(rho_g_intrinsic[side0])
+        rho1 = float(rho_g_intrinsic[side1])
+        ag0 = float(alpha_g[side0])
+        ag1 = float(alpha_g[side1])
+        if not (np.all(np.isfinite(y0)) and np.all(np.isfinite(y1)) and math.isfinite(p0) and math.isfinite(p1)):
+            return None
+        if not (math.isfinite(rho0) and math.isfinite(rho1) and rho0 > 0.0 and rho1 > 0.0):
+            return None
+        mw0 = 1.0/np.sum(y0/molecular_weights)
+        mw1 = 1.0/np.sum(y1/molecular_weights)
+        rgas0 = gas_constant/mw0
+        rgas1 = gas_constant/mw1
+        t0 = p0/(rho0*rgas0)
+        t1 = p1/(rho1*rgas1)
+        if not (math.isfinite(t0) and math.isfinite(t1)):
+            return None
+        if t0 <= 1.0e-6 or t1 <= 1.0e-6 or t0 > 1.0e8 or t1 > 1.0e8:
+            return None
+        D0, _lam0, X0, _h0, _mw0_check = cantera_transport_state(gas, p0, t0, y0)
+        D1, _lam1, X1, _h1, _mw1_check = cantera_transport_state(gas, p1, t1, y1)
+        D_face = 0.5*(D0 + D1)
+        X_face_grad = (X1 - X0)/spacing
+        mw_face = 0.5*(mw0 + mw1)
+        rho_face = 0.5*(rho0 + rho1)
+        Y_face = 0.5*(y0 + y1)
+        J = rho_face*D_face*molecular_weights/mw_face*X_face_grad
+        rho_vic = float(np.sum(J))
+        J = J - rho_vic*Y_face
+        J = min(ag0, ag1)*J
+        residuals.append(float(np.sum(J)))
+        finite_temperature.extend([t0, t1])
+        return J, rho_vic
+
+    for j in range(ny):
+        for i in range(nx - 1):
+            if not active_x[j, i]:
+                continue
+            spacing = float(x[i + 1] - x[i])
+            try:
+                result = compute_face((j, i), (j, i + 1), spacing)
+            except Exception:
+                result = None
+            if result is None:
+                nonfinite_temperature_count += 1
+                continue
+            # MFC source-flux sign convention: flux_src_vf(chem_k) -= J_k.
+            Jx[:, j, i] = -result[0]
+    for j in range(ny - 1):
+        for i in range(nx):
+            if not active_y[j, i]:
+                continue
+            spacing = float(y[j + 1] - y[j])
+            try:
+                result = compute_face((j, i), (j + 1, i), spacing)
+            except Exception:
+                result = None
+            if result is None:
+                nonfinite_temperature_count += 1
+                continue
+            Jy[:, j, i] = -result[0]
+    nc12 = species.index("NC12H26")
+    o2 = species.index("O2")
+    out = {
+        "x": x,
+        "y": y,
+        "x_face": 0.5*(x[:-1] + x[1:]),
+        "y_face": 0.5*(y[:-1] + y[1:]),
+        "alpha_liq": alpha_liq,
+        "alpha_g": alpha_g,
+        "rho_g_stored": rho_g_stored,
+        "rho_g_intrinsic": rho_g_intrinsic,
+        "eligible_cell": eligible,
+        "active_x": active_x,
+        "active_y": active_y,
+        "J_NC12H26_x": Jx[nc12],
+        "J_NC12H26_y": Jy[nc12],
+        "J_O2_x": Jx[o2],
+        "J_O2_y": Jy[o2],
+        "J_total_x": np.sqrt(np.sum(Jx*Jx, axis=0)),
+        "J_total_y": np.sqrt(np.sum(Jy*Jy, axis=0)),
+    }
+    sumY = np.sum(Y, axis=0)
+    inactive_x_zero = bool(np.all(out["J_total_x"][~active_x] == 0.0)) if active_x.size else True
+    inactive_y_zero = bool(np.all(out["J_total_y"][~active_y] == 0.0)) if active_y.size else True
+    finite_temperature_array = np.asarray(finite_temperature, dtype=float)
+    stats = {
+        "sumY_min": float(np.nanmin(sumY)),
+        "sumY_max": float(np.nanmax(sumY)),
+        "sumY_max_abs_error": float(np.nanmax(np.abs(sumY - 1.0))),
+        "sumY_violation_count": float(np.count_nonzero(np.abs(sumY - 1.0) > BOUNDS_TOL)),
+        "finite_pressure_fraction": float(np.count_nonzero(np.isfinite(pressure))/pressure.size),
+        "finite_temperature_count": float(len(finite_temperature)),
+        "temperature_min": float(np.min(finite_temperature_array)) if finite_temperature_array.size else math.nan,
+        "temperature_max": float(np.max(finite_temperature_array)) if finite_temperature_array.size else math.nan,
+        "nonfinite_or_invalid_active_face_count": float(nonfinite_temperature_count),
+        "zero_net_J_max_abs_residual": float(max((abs(v) for v in residuals), default=0.0)),
+        "inactive_x_zero_flux": 1.0 if inactive_x_zero else 0.0,
+        "inactive_y_zero_flux": 1.0 if inactive_y_zero else 0.0,
+        "nonfinite_pressure_count": float(nonfinite_pressure_count),
+    }
+    if nonfinite_temperature_count:
+        raise RuntimeError(f"invalid active-face thermochemical state count: {nonfinite_temperature_count}")
+    return out, stats
+
+
+def percentile99p9(arr: np.ndarray) -> float:
+    finite = np.abs(arr[np.isfinite(arr)])
+    if finite.size == 0:
+        return math.nan
+    return float(np.percentile(finite, 99.9))
+
+
+def maxabs(arr: np.ndarray) -> float:
+    finite = np.abs(arr[np.isfinite(arr)])
+    if finite.size == 0:
+        return math.nan
+    return float(np.max(finite))
+
+
+
+def x_face_to_cell_abs(jx: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    accum = np.zeros(shape, dtype=float)
+    count = np.zeros(shape, dtype=float)
+    if jx.size:
+        magx = np.abs(jx)
+        accum[:, :-1] += magx
+        count[:, :-1] += np.isfinite(magx)
+        accum[:, 1:] += magx
+        count[:, 1:] += np.isfinite(magx)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = accum/count
+    out[count == 0.0] = np.nan
+    return out
+
+
+def y_face_to_cell_abs(jy: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    accum = np.zeros(shape, dtype=float)
+    count = np.zeros(shape, dtype=float)
+    if jy.size:
+        magy = np.abs(jy)
+        accum[:-1, :] += magy
+        count[:-1, :] += np.isfinite(magy)
+        accum[1:, :] += magy
+        count[1:, :] += np.isfinite(magy)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = accum/count
+    out[count == 0.0] = np.nan
+    return out
+
+def plot_diffusion_diagnostic(save_dir: Path, save: int, time_us: float, data: dict[str, np.ndarray]) -> Path:
+    x = data["x"]
+    y = data["y"]
+    alpha = data["alpha_liq"]
+    active_cell = np.zeros_like(alpha, dtype=float)
+    if data["active_x"].size:
+        active_cell[:, :-1] += data["active_x"].astype(float)
+        active_cell[:, 1:] += data["active_x"].astype(float)
+    if data["active_y"].size:
+        active_cell[:-1, :] += data["active_y"].astype(float)
+        active_cell[1:, :] += data["active_y"].astype(float)
+    active_cell = np.where(active_cell > 0.0, active_cell, np.nan)
+    nc12_mag = np.hypot(
+        x_face_to_cell_abs(data["J_NC12H26_x"], alpha.shape),
+        y_face_to_cell_abs(data["J_NC12H26_y"], alpha.shape),
+    )
+    o2_mag = np.hypot(
+        x_face_to_cell_abs(data["J_O2_x"], alpha.shape),
+        y_face_to_cell_abs(data["J_O2_y"], alpha.shape),
+    )
+    total_mag = np.hypot(
+        x_face_to_cell_abs(data["J_total_x"], alpha.shape),
+        y_face_to_cell_abs(data["J_total_y"], alpha.shape),
+    )
+    fields = [
+        (active_cell, "cells adjacent to active faces", "viridis"),
+        (nc12_mag, "|NC12H26 diffusion source-flux|", "magma"),
+        (o2_mag, "|O2 diffusion source-flux|", "magma"),
+        (total_mag, "sqrt(sum_k J_k^2) diffusion source-flux", "magma"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(12.0, 6.2), constrained_layout=True, sharex=True, sharey=True)
+    for ax, (arr, title, cmap) in zip(axes.ravel(), fields):
+        vals = arr[np.isfinite(arr)]
+        if vals.size and title != "cells adjacent to active faces":
+            vmax = float(np.nanmax(vals))
+            mesh = ax.pcolormesh(edges(x*1e6), edges(y*1e6), arr, shading="auto", cmap=cmap, vmin=0.0, vmax=vmax)
+        else:
+            mesh = ax.pcolormesh(edges(x*1e6), edges(y*1e6), arr, shading="auto", cmap=cmap)
+        if np.nanmin(alpha) <= 0.5 <= np.nanmax(alpha):
+            ax.contour(x*1e6, y*1e6, alpha, levels=[0.5], colors="white", linewidths=1.0)
+            ax.contour(x*1e6, y*1e6, alpha, levels=[0.5], colors="black", linewidths=0.35)
+        ax.set_title(title)
+        ax.set_aspect("equal", adjustable="box")
+        fig.colorbar(mesh, ax=ax, pad=0.01)
+    for ax in axes[-1, :]:
+        ax.set_xlabel("x [µm]")
+    for ax in axes[:, 0]:
+        ax.set_ylabel("y [µm]")
+    fig.suptitle(f"C3 diffusion diagnostics, save {save:06d}, t={time_us:.2f} µs\ninterior saved-state reconstruction")
+    png = save_dir / f"diffusion_diagnostics_save_{save:06d}.png"
+    fig.savefig(png, dpi=210)
+    plt.close(fig)
+    return png
+
+
+def save_diffusion_npz(save_dir: Path, save: int, time_s: float, data: dict[str, np.ndarray]) -> Path:
+    path = save_dir / f"diffusion_diagnostics_save_{save:06d}.npz"
+    np.savez_compressed(
+        path,
+        x=data["x"],
+        y=data["y"],
+        x_face=data["x_face"],
+        y_face=data["y_face"],
+        active_x=data["active_x"],
+        active_y=data["active_y"],
+        J_NC12H26_x=data["J_NC12H26_x"],
+        J_NC12H26_y=data["J_NC12H26_y"],
+        J_O2_x=data["J_O2_x"],
+        J_O2_y=data["J_O2_y"],
+        J_total_x=data["J_total_x"],
+        J_total_y=data["J_total_y"],
+        alpha_g=data["alpha_g"],
+        alpha_liq=data["alpha_liq"],
+        rho_g_stored=data["rho_g_stored"],
+        rho_g_intrinsic=data["rho_g_intrinsic"],
+        eligible_cell=data["eligible_cell"],
+        time=np.array(time_s),
+        save=np.array(save),
+        description=np.array("interior saved-state reconstruction; boundaries and RK stages excluded; fluxes use MFC source-flux sign"),
+    )
+    return path
+
+
+def export_diffusion_diagnostics(c3_raw_case: Path, saves: list[int], output_dir: Path, dry_run_only: bool = False) -> None:
+    all_species = species_names()
+    ensure_species_fields(all_species)
+    case_path = c3_raw_case / "case.py"
+    case = c3_case_dict(case_path) if case_path.is_file() else {}
+    fmap = diffusion_variable_map(case or {"model_eqns": 3, "num_fluids": 3, "num_dims": 2}, all_species)
+    mechanism = REPO / str(case.get("cantera_file", "examples/chemistry_mechanisms/yao_sk54/yao_sk54.yaml"))
+    phase = str(case.get("cantera_phase", "yao_sk54"))
+    print("diffusion diagnostics argument check")
+    print(f"  c3_raw_case: {c3_raw_case}")
+    print(f"  output_dir: {output_dir}")
+    print(f"  saves: {saves}")
+    print(f"  mechanism: {mechanism} exists={mechanism.is_file()}")
+    print(f"  phase: {phase}")
+    print("  mapping:")
+    print(f"    alpha_liq={fmap.liquid_alpha} alpha_vap={fmap.vapor_alpha} alpha_air={fmap.air_alpha}")
+    print(f"    rho_vap={fmap.vapor_alpha_rho} rho_air={fmap.air_alpha_rho} pressure={fmap.pressure}")
+    print(f"    primitive species Y index = {fmap.species_prim_start} + SK54 species_id")
+    print(f"    NC12H26 species_id={fmap.species_indices['NC12H26']} prim_index={fmap.species_prim_start + fmap.species_indices['NC12H26']}")
+    print(f"    O2 species_id={fmap.species_indices['O2']} prim_index={fmap.species_prim_start + fmap.species_indices['O2']}")
+    if dry_run_only:
+        print("  dry_run_only: no raw fields or Cantera transport properties read")
+        return
+    if not mechanism.is_file():
+        raise RuntimeError(f"missing mechanism file {mechanism}")
+    if not (c3_raw_case / "D").is_dir():
+        raise RuntimeError(f"missing raw D directory under {c3_raw_case}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest: list[dict] = []
+    for save in saves:
+        save_dir = output_dir / "diffusion_diagnostics" / f"save_{save:06d}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        fields = diffusion_read_save_fields(c3_raw_case, save, fmap, all_species)
+        arrays = arrays_from_diffusion_fields(fields, all_species)
+        data, stats = reconstruct_diffusion_fluxes(arrays, all_species, mechanism, phase)
+        time_s = save*T_SAVE
+        npz = save_diffusion_npz(save_dir, save, time_s, data)
+        png = plot_diffusion_diagnostic(save_dir, save, time_s*1e6, data)
+        active_x_fraction = float(np.count_nonzero(data["active_x"])/data["active_x"].size) if data["active_x"].size else math.nan
+        active_y_fraction = float(np.count_nonzero(data["active_y"])/data["active_y"].size) if data["active_y"].size else math.nan
+        manifest.append({
+            "save": save,
+            "physical_time_s": time_s,
+            "physical_time_us": time_s*1e6,
+            "active_x_face_fraction": active_x_fraction,
+            "active_y_face_fraction": active_y_fraction,
+            "max_abs_J_NC12H26_x": maxabs(data["J_NC12H26_x"]),
+            "max_abs_J_NC12H26_y": maxabs(data["J_NC12H26_y"]),
+            "p999_abs_J_NC12H26_x": percentile99p9(data["J_NC12H26_x"]),
+            "p999_abs_J_NC12H26_y": percentile99p9(data["J_NC12H26_y"]),
+            "max_abs_J_O2_x": maxabs(data["J_O2_x"]),
+            "max_abs_J_O2_y": maxabs(data["J_O2_y"]),
+            "p999_abs_J_O2_x": percentile99p9(data["J_O2_x"]),
+            "p999_abs_J_O2_y": percentile99p9(data["J_O2_y"]),
+            "max_J_total_x": maxabs(data["J_total_x"]),
+            "max_J_total_y": maxabs(data["J_total_y"]),
+            "p999_J_total_x": percentile99p9(data["J_total_x"]),
+            "p999_J_total_y": percentile99p9(data["J_total_y"]),
+            "sumY_min": stats["sumY_min"],
+            "sumY_max": stats["sumY_max"],
+            "sumY_max_abs_error": stats["sumY_max_abs_error"],
+            "sumY_violation_count": int(stats["sumY_violation_count"]),
+            "finite_pressure_fraction": stats["finite_pressure_fraction"],
+            "temperature_min": stats["temperature_min"],
+            "temperature_max": stats["temperature_max"],
+            "finite_temperature_evaluation_count": int(stats["finite_temperature_count"]),
+            "invalid_active_face_property_count": int(stats["nonfinite_or_invalid_active_face_count"]),
+            "zero_net_J_max_abs_residual": stats["zero_net_J_max_abs_residual"],
+            "inactive_x_zero_flux": "T" if stats["inactive_x_zero_flux"] == 1.0 else "F",
+            "inactive_y_zero_flux": "T" if stats["inactive_y_zero_flux"] == 1.0 else "F",
+            "mechanism_path": str(mechanism),
+            "transport_model": "Cantera mixture-averaged / MFC chem_params%transport_model=1",
+            "scope": "interior saved-state reconstruction; boundaries and RK stages excluded",
+            "npz": str(npz),
+            "png": str(png),
+        })
+    write_csv(output_dir / "diffusion_diagnostic_manifest.csv", manifest)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="Only validate paths, common saves, and requested frame availability")
     parser.add_argument("--export-c3", action="store_true", help="Export compact C3 CSV/PNG/NPZ artifacts from the HPC C3 raw D/ output")
     parser.add_argument("--c3-export-out", type=Path, default=OUT / "c3_export", help="Output directory for --export-c3")
     parser.add_argument("--compare-from-c3-export", type=Path, help="Compare local ON/OFF raw data against a compact C3 export directory")
+    parser.add_argument("--make-difference-frames", action="store_true", help="Generate C3 minus chemistry-ON/diffusion-OFF difference maps from a C3 export")
+    parser.add_argument("--c3-export", type=Path, help="C3 compact export directory for --make-difference-frames")
+    parser.add_argument("--export-diffusion-diagnostics", action="store_true", help="Reconstruct C3 saved-state model-3 chemistry-diffusion masks and species fluxes")
+    parser.add_argument("--c3-raw-case", type=Path, default=C3_RUN, help="Raw C3 case directory for --export-diffusion-diagnostics")
+    parser.add_argument("--saves", type=int, nargs="+", default=[30, 38], help="C3 save indices for --export-diffusion-diagnostics")
+    parser.add_argument("--output-dir", type=Path, default=OUT, help="Output directory for --export-diffusion-diagnostics")
+    parser.add_argument("--diffusion-dry-run", action="store_true", help="Check diffusion diagnostic arguments/mapping without requiring HPC raw fields")
     args = parser.parse_args()
-    modes = sum(bool(v) for v in [args.dry_run, args.export_c3, args.compare_from_c3_export])
+    modes = sum(bool(v) for v in [args.dry_run, args.export_c3, args.compare_from_c3_export, args.make_difference_frames, args.export_diffusion_diagnostics])
     if modes > 1:
-        parser.error("choose only one of --dry-run, --export-c3, or --compare-from-c3-export")
+        parser.error("choose only one primary mode")
     if args.dry_run:
         dry_run()
     elif args.export_c3:
         c3_export(args.c3_export_out)
     elif args.compare_from_c3_export:
         compare_from_c3_export(args.compare_from_c3_export)
+    elif args.make_difference_frames:
+        if args.c3_export is None:
+            parser.error("--make-difference-frames requires --c3-export PATH")
+        make_difference_frames(args.c3_export)
+    elif args.export_diffusion_diagnostics:
+        export_diffusion_diagnostics(args.c3_raw_case, args.saves, args.output_dir, args.diffusion_dry_run)
     else:
+        if args.diffusion_dry_run:
+            parser.error("--diffusion-dry-run requires --export-diffusion-diagnostics")
         run_full()
 
 
