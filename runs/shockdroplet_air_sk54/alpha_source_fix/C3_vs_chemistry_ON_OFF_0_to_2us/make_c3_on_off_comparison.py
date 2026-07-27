@@ -2202,6 +2202,164 @@ def save_diffusion_npz(save_dir: Path, save: int, time_s: float, data: dict[str,
     return path
 
 
+
+def diffusion_read_mask_fields(run_dir: Path, save: int, fmap: DiffusionVariableMap) -> dict[str, dict]:
+    return {
+        "alpha_liq": read_mapped_field(run_dir, fmap.liquid_alpha, save),
+        "alpha_vap": read_mapped_field(run_dir, fmap.vapor_alpha, save),
+        "alpha_air": read_mapped_field(run_dir, fmap.air_alpha, save),
+    }
+
+
+def arrays_from_mask_fields(fields: dict[str, dict]) -> dict[str, np.ndarray]:
+    x, y, alpha_liq = grid_required(fields["alpha_liq"], "alpha_liq")
+    out: dict[str, np.ndarray] = {"x": x, "y": y, "alpha_liq": alpha_liq}
+    for key in ["alpha_vap", "alpha_air"]:
+        xx, yy, arr = grid_required(fields[key], key)
+        if not same_grid(x, y, xx, yy):
+            raise RuntimeError(f"field {key} grid does not match liquid-alpha grid")
+        out[key] = arr
+    alpha_g = out["alpha_vap"] + out["alpha_air"]
+    eligible = (
+        np.isfinite(alpha_g) & np.isfinite(alpha_liq) &
+        (alpha_g >= 0.5) & (alpha_liq <= 0.5)
+    )
+    out["alpha_g"] = alpha_g
+    out["eligible_cell"] = eligible
+    out["active_x"] = eligible[:, :-1] & eligible[:, 1:]
+    out["active_y"] = eligible[:-1, :] & eligible[1:, :]
+    out["x_face"] = 0.5*(x[:-1] + x[1:])
+    out["y_face"] = 0.5*(y[:-1] + y[1:])
+    return out
+
+
+def x_face_fraction_to_cell(active_x: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    accum = np.zeros(shape, dtype=float)
+    count = np.zeros(shape, dtype=float)
+    if active_x.size:
+        vals = active_x.astype(float)
+        accum[:, :-1] += vals
+        count[:, :-1] += 1.0
+        accum[:, 1:] += vals
+        count[:, 1:] += 1.0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = accum/count
+    out[count == 0.0] = np.nan
+    return out
+
+
+def y_face_fraction_to_cell(active_y: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    accum = np.zeros(shape, dtype=float)
+    count = np.zeros(shape, dtype=float)
+    if active_y.size:
+        vals = active_y.astype(float)
+        accum[:-1, :] += vals
+        count[:-1, :] += 1.0
+        accum[1:, :] += vals
+        count[1:, :] += 1.0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = accum/count
+    out[count == 0.0] = np.nan
+    return out
+
+
+def save_diffusion_mask_npz(save_dir: Path, save: int, time_s: float, data: dict[str, np.ndarray]) -> Path:
+    path = save_dir / f"diffusion_mask_save_{save:06d}.npz"
+    np.savez_compressed(
+        path,
+        x=data["x"],
+        y=data["y"],
+        x_face=data["x_face"],
+        y_face=data["y_face"],
+        alpha_g=data["alpha_g"],
+        alpha_liq=data["alpha_liq"],
+        eligible_cell=data["eligible_cell"],
+        active_x=data["active_x"],
+        active_y=data["active_y"],
+        save=np.array(save),
+        time=np.array(time_s),
+        description=np.array("interior saved-state reconstruction; boundaries and RK stages excluded"),
+    )
+    return path
+
+
+def plot_diffusion_mask(save_dir: Path, save: int, time_us: float, data: dict[str, np.ndarray]) -> Path:
+    x = data["x"]
+    y = data["y"]
+    alpha = data["alpha_liq"]
+    panels = [
+        (data["eligible_cell"].astype(float), "eligible cells", "viridis"),
+        (x_face_fraction_to_cell(data["active_x"], alpha.shape), "active x-face fraction projected to cells", "viridis"),
+        (y_face_fraction_to_cell(data["active_y"], alpha.shape), "active y-face fraction projected to cells", "viridis"),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(14.0, 4.2), constrained_layout=True, sharex=True, sharey=True)
+    for ax, (arr, title, cmap) in zip(axes, panels):
+        mesh = ax.pcolormesh(edges(x*1e6), edges(y*1e6), arr, shading="auto", cmap=cmap, vmin=0.0, vmax=1.0)
+        if np.nanmin(alpha) <= 0.5 <= np.nanmax(alpha):
+            ax.contour(x*1e6, y*1e6, alpha, levels=[0.5], colors="white", linewidths=1.0)
+            ax.contour(x*1e6, y*1e6, alpha, levels=[0.5], colors="black", linewidths=0.35)
+        ax.set_title(title)
+        ax.set_xlabel("x [µm]")
+        ax.set_aspect("equal", adjustable="box")
+        fig.colorbar(mesh, ax=ax, pad=0.01)
+    axes[0].set_ylabel("y [µm]")
+    fig.suptitle(f"C3 diffusion mask, save {save:06d}, t={time_us:.2f} µs\ninterior saved-state reconstruction")
+    png = save_dir / f"diffusion_mask_save_{save:06d}.png"
+    fig.savefig(png, dpi=210)
+    plt.close(fig)
+    return png
+
+
+def export_diffusion_mask_only(c3_raw_case: Path, saves: list[int], output_dir: Path, dry_run_only: bool = False) -> None:
+    all_species = species_names()
+    case_path = c3_raw_case / "case.py"
+    case = c3_case_dict(case_path) if case_path.is_file() else {}
+    fmap = diffusion_variable_map(case or {"model_eqns": 3, "num_fluids": 3, "num_dims": 2}, all_species)
+    print("diffusion mask-only argument check")
+    print(f"  c3_raw_case: {c3_raw_case}")
+    print(f"  output_dir: {output_dir}")
+    print(f"  saves: {saves}")
+    print("  mapping:")
+    print(f"    alpha_liq={fmap.liquid_alpha} alpha_vap={fmap.vapor_alpha} alpha_air={fmap.air_alpha}")
+    print("  no Cantera transport properties are imported or evaluated in this mode")
+    if dry_run_only:
+        print("  dry_run_only: no raw fields read")
+        return
+    if not (c3_raw_case / "D").is_dir():
+        raise RuntimeError(f"missing raw D directory under {c3_raw_case}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest: list[dict] = []
+    for save in saves:
+        save_dir = output_dir / "diffusion_mask_diagnostics" / f"save_{save:06d}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        fields = diffusion_read_mask_fields(c3_raw_case, save, fmap)
+        data = arrays_from_mask_fields(fields)
+        time_s = save*T_SAVE
+        npz = save_diffusion_mask_npz(save_dir, save, time_s, data)
+        png = plot_diffusion_mask(save_dir, save, time_s*1e6, data)
+        cell_count = int(data["eligible_cell"].size)
+        x_face_count = int(data["active_x"].size)
+        y_face_count = int(data["active_y"].size)
+        eligible_count = int(np.count_nonzero(data["eligible_cell"]))
+        active_x_count = int(np.count_nonzero(data["active_x"]))
+        active_y_count = int(np.count_nonzero(data["active_y"]))
+        manifest.append({
+            "save": save,
+            "physical_time_s": time_s,
+            "physical_time_us": time_s*1e6,
+            "eligible_cell_fraction": eligible_count/cell_count if cell_count else math.nan,
+            "active_x_face_fraction": active_x_count/x_face_count if x_face_count else math.nan,
+            "active_y_face_fraction": active_y_count/y_face_count if y_face_count else math.nan,
+            "eligible_cell_count": eligible_count,
+            "active_x_face_count": active_x_count,
+            "active_y_face_count": active_y_count,
+            "scope": "interior saved-state reconstruction; boundaries and RK stages excluded",
+            "npz": str(npz),
+            "png": str(png),
+        })
+    write_csv(output_dir / "diffusion_mask_manifest.csv", manifest)
+
+
 def export_diffusion_diagnostics(c3_raw_case: Path, saves: list[int], output_dir: Path, dry_run_only: bool = False) -> None:
     all_species = species_names()
     ensure_species_fields(all_species)
@@ -2290,12 +2448,20 @@ def main() -> None:
     parser.add_argument("--make-difference-frames", action="store_true", help="Generate C3 minus chemistry-ON/diffusion-OFF difference maps from a C3 export")
     parser.add_argument("--c3-export", type=Path, help="C3 compact export directory for --make-difference-frames")
     parser.add_argument("--export-diffusion-diagnostics", action="store_true", help="Reconstruct C3 saved-state model-3 chemistry-diffusion masks and species fluxes")
-    parser.add_argument("--c3-raw-case", type=Path, default=C3_RUN, help="Raw C3 case directory for --export-diffusion-diagnostics")
-    parser.add_argument("--saves", type=int, nargs="+", default=[30, 38], help="C3 save indices for --export-diffusion-diagnostics")
-    parser.add_argument("--output-dir", type=Path, default=OUT, help="Output directory for --export-diffusion-diagnostics")
+    parser.add_argument("--export-diffusion-mask-only", action="store_true", help="Export C3 saved-state model-3 chemistry-diffusion active masks without Cantera")
+    parser.add_argument("--c3-raw-case", type=Path, default=C3_RUN, help="Raw C3 case directory for diffusion exports")
+    parser.add_argument("--saves", type=int, nargs="+", default=[30, 38], help="C3 save indices for diffusion exports")
+    parser.add_argument("--output-dir", type=Path, default=OUT, help="Output directory for diffusion exports")
     parser.add_argument("--diffusion-dry-run", action="store_true", help="Check diffusion diagnostic arguments/mapping without requiring HPC raw fields")
     args = parser.parse_args()
-    modes = sum(bool(v) for v in [args.dry_run, args.export_c3, args.compare_from_c3_export, args.make_difference_frames, args.export_diffusion_diagnostics])
+    modes = sum(bool(v) for v in [
+        args.dry_run,
+        args.export_c3,
+        args.compare_from_c3_export,
+        args.make_difference_frames,
+        args.export_diffusion_diagnostics,
+        args.export_diffusion_mask_only,
+    ])
     if modes > 1:
         parser.error("choose only one primary mode")
     if args.dry_run:
@@ -2310,9 +2476,11 @@ def main() -> None:
         make_difference_frames(args.c3_export)
     elif args.export_diffusion_diagnostics:
         export_diffusion_diagnostics(args.c3_raw_case, args.saves, args.output_dir, args.diffusion_dry_run)
+    elif args.export_diffusion_mask_only:
+        export_diffusion_mask_only(args.c3_raw_case, args.saves, args.output_dir, args.diffusion_dry_run)
     else:
         if args.diffusion_dry_run:
-            parser.error("--diffusion-dry-run requires --export-diffusion-diagnostics")
+            parser.error("--diffusion-dry-run requires --export-diffusion-diagnostics or --export-diffusion-mask-only")
         run_full()
 
 
