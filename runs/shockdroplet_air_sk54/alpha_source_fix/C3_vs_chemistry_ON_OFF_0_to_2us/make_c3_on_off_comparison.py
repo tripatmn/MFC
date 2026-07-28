@@ -45,6 +45,8 @@ OFF_RUN = RUN_ROOT / "full_2us_evap_only_chemistry_OFF"
 C3_RUN = RUN_ROOT / "C3_diffusion_ON_reactions_ON_2p0us"
 FUEL_OUT = OUT / "fuel_inventory_budget"
 C3_FUEL_OUTPUT = OUT / "c3_fuel_inventory.csv"
+C3_FUEL_INVENTORY_CSV = Path("/mnt/e/Mitansh/Research/Thesis/Coupling/C3_vs_chemistry_ON_OFF_0_to_2us/c3_fuel_inventory.csv")
+C3_COMPACT_EXPORT = Path("/mnt/e/Mitansh/Research/Thesis/Coupling/C3_vs_chemistry_ON_OFF_0_to_2us/c3_export")
 
 sys.path.insert(0, str(REPO / "examples/2D_dodecane_global_reduced"))
 import analyze_shockdroplet_air_sk54 as raw
@@ -88,7 +90,33 @@ FRAME_VARIABLES = [
 ]
 DIFFERENCE_FRAME_TIMES_US = [1.50, 1.90]
 DIFFERENCE_FRAME_VARIABLES = ["NC12H26", "O2", "OH", "valid_gas_temperature", "liquid_alpha"]
-FUEL_REQUIRED_FIELDS = ["liquid_alpha_rho", "vapor_alpha_rho", "air_alpha_rho", "rhoY_NC12H26"]
+HYDRO_WAKE_TIMES_US = [1.50, 1.90]
+HYDRO_WAKE_VARIABLES = ["vorticity", "velocity_magnitude", "pressure", "density"]
+HYDRO_REQUIRED_C3_NPZ = ["u_velocity", "v_velocity", "pressure", "density", "liquid_alpha"]
+HYDRO_DIFFERENTIATION_METHOD = "numpy.gradient with second-order centered interior and one-sided boundary differences"
+MIXING_STATE_TIMES_US = [1.50, 1.90]
+MIXING_STATE_FIELDS = [
+    "NC12H26",
+    "O2",
+    "OH",
+    "HO2",
+    "H2O2",
+    "valid_gas_temperature",
+    "liquid_alpha",
+    "pressure",
+]
+MIXING_RADICALS = ["OH", "HO2", "H2O2"]
+MIXING_PHI_O2_FLOOR = 1.0e-12
+MIXING_PHI_PLOT_CAP = 100.0
+MIXING_PHI_LAYER_LOG_HALF_WIDTH = 0.05
+MIXING_BANDS = [
+    ("very_lean", -math.inf, 0.5, "phi < 0.5"),
+    ("combustible_lean", 0.5, 0.8, "0.5 <= phi < 0.8"),
+    ("near_stoichiometric", 0.8, 1.2, "0.8 <= phi <= 1.2"),
+    ("moderately_rich", 1.2, 2.0, "1.2 < phi <= 2.0"),
+    ("very_rich", 2.0, math.inf, "phi > 2.0"),
+]
+FUEL_REQUIRED_FIELDS = ["liquid_alpha_rho", "rhoY_NC12H26"]
 FUEL_CASE_ORDER = ["OFF_NO_DIFF", "ON_NO_DIFF", "ON_WITH_DIFF_C3"]
 FUEL_CASE_LABEL = {
     "OFF_NO_DIFF": "chemistry OFF / diffusion OFF",
@@ -1590,6 +1618,282 @@ def dry_run() -> None:
         )
 
 
+def ensure_hydro_raw_fields() -> None:
+    # MFC model_eqns=3, num_fluids=3, num_dims=2 primitive layout:
+    # prim.1-3 are fluid partial densities, prim.4/5 are u/v, prim.6 is pressure.
+    # Density for this diagnostic is reconstructed conservatively as cons.1+cons.2+cons.3.
+    raw.FIELDS.setdefault("u_velocity", ("prim", 4))
+    raw.FIELDS.setdefault("v_velocity", ("prim", 5))
+    raw.FIELDS.setdefault("pressure", ("prim", 6))
+    raw.FIELDS.setdefault("liquid_alpha_rho", ("cons", 1))
+    raw.FIELDS.setdefault("vapor_alpha_rho", ("cons", 2))
+    raw.FIELDS.setdefault("air_alpha_rho", ("cons", 3))
+    raw.FIELDS.setdefault("liquid_alpha", ("cons", 7))
+
+
+def hydrodynamic_mappings() -> dict[str, str]:
+    ensure_hydro_raw_fields()
+    return {
+        "u_velocity": "prim.4",
+        "v_velocity": "prim.5",
+        "pressure": "prim.6",
+        "density": "cons.1 + cons.2 + cons.3",
+        "liquid_alpha": "cons.7",
+    }
+
+
+def raw_grid_field(item: SaveItem, field_name: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    field = raw.read_field(item.run_dir, field_name, item.raw_step)
+    return grid_required(field, field_name)
+
+
+def on_saves_with_hydro_fields() -> list[int]:
+    ensure_hydro_raw_fields()
+    out: list[int] = []
+    for save in sorted(available_d_steps(SOURCE_ON) | available_d_steps(RESTART_ON)):
+        item = item_for("CHEM_ON_DIFF_OFF", save)
+        needed = ["u_velocity", "v_velocity", "pressure", "liquid_alpha_rho", "vapor_alpha_rho", "air_alpha_rho", "liquid_alpha"]
+        if all(field_available(item.run_dir, name, item.raw_step) for name in needed):
+            out.append(save)
+    return out
+
+
+def nearest_on_hydro_item(reference_time_us: float) -> SaveItem | None:
+    saves = on_saves_with_hydro_fields()
+    if not saves:
+        return None
+    save = min(saves, key=lambda idx: abs(idx * T_SAVE * 1.0e6 - reference_time_us))
+    return item_for("CHEM_ON_DIFF_OFF", save)
+
+
+def compute_vorticity(x: np.ndarray, y: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    edge_order = 2 if x.size >= 3 and y.size >= 3 else 1
+    dvdx = np.gradient(v, x, axis=1, edge_order=edge_order)
+    dudy = np.gradient(u, y, axis=0, edge_order=edge_order)
+    return dvdx - dudy
+
+
+def on_hydro_state(item: SaveItem) -> dict:
+    ensure_hydro_raw_fields()
+    x_u, y_u, u = raw_grid_field(item, "u_velocity")
+    x_v, y_v, v = raw_grid_field(item, "v_velocity")
+    x_p, y_p, pressure_pa = raw_grid_field(item, "pressure")
+    x_l, y_l, arho_liq = raw_grid_field(item, "liquid_alpha_rho")
+    x_va, y_va, arho_vap = raw_grid_field(item, "vapor_alpha_rho")
+    x_a, y_a, arho_air = raw_grid_field(item, "air_alpha_rho")
+    x_alpha, y_alpha, alpha = raw_grid_field(item, "liquid_alpha")
+    for name, xx, yy in [
+        ("v_velocity", x_v, y_v),
+        ("pressure", x_p, y_p),
+        ("liquid_alpha_rho", x_l, y_l),
+        ("vapor_alpha_rho", x_va, y_va),
+        ("air_alpha_rho", x_a, y_a),
+        ("liquid_alpha", x_alpha, y_alpha),
+    ]:
+        if not same_grid(x_u, y_u, xx, yy):
+            raise RuntimeError(f"ON_NO_DIFF hydro grid mismatch for {name} at save {item.global_save}")
+    density = arho_liq + arho_vap + arho_air
+    return {
+        "x": x_u,
+        "y": y_u,
+        "u_velocity": u,
+        "v_velocity": v,
+        "pressure": pressure_pa / 1.0e6,
+        "density": density,
+        "liquid_alpha": alpha,
+        "velocity_magnitude": np.sqrt(u*u + v*v),
+        "vorticity": compute_vorticity(x_u, y_u, u, v),
+        "save": item.global_save,
+        "time_us": item.global_save * T_SAVE * 1.0e6,
+    }
+
+
+def c3_hydro_npz_by_save(export_path: Path, save: int, variable: str) -> dict | None:
+    for rec in c3_npz_records(export_path, variable):
+        if int(rec["save"]) == int(save):
+            return rec
+    return None
+
+
+def nearest_c3_hydro_reference(export_path: Path, requested_time_us: float) -> dict | None:
+    pressure = nearest_c3_npz(export_path, "pressure", requested_time_us)
+    if pressure is None:
+        return None
+    return pressure
+
+
+def c3_hydro_missing_for_save(export_path: Path, save: int) -> list[str]:
+    return [name for name in HYDRO_REQUIRED_C3_NPZ if c3_hydro_npz_by_save(export_path, save, name) is None]
+
+
+def c3_hydro_state(export_path: Path, save: int) -> dict:
+    records = {name: c3_hydro_npz_by_save(export_path, save, name) for name in HYDRO_REQUIRED_C3_NPZ}
+    missing = [name for name, rec in records.items() if rec is None]
+    if missing:
+        raise RuntimeError(f"C3 compact export is missing hydrodynamic NPZ fields for save {save}: {','.join(missing)}")
+    grids = {name: load_npz_grid(records[name]["path"]) for name in records}
+    base = grids["u_velocity"]
+    x = base["x"]
+    y = base["y"]
+    for name, data in grids.items():
+        if not same_grid(x, y, data["x"], data["y"]):
+            raise RuntimeError(f"C3 compact export hydro grid mismatch for {name} at save {save}")
+    u = grids["u_velocity"]["values"]
+    v = grids["v_velocity"]["values"]
+    return {
+        "x": x,
+        "y": y,
+        "u_velocity": u,
+        "v_velocity": v,
+        "pressure": grids["pressure"]["values"],
+        "density": grids["density"]["values"],
+        "liquid_alpha": grids["liquid_alpha"]["values"],
+        "velocity_magnitude": np.sqrt(u*u + v*v),
+        "vorticity": compute_vorticity(x, y, u, v),
+        "save": save,
+        "time_us": float(base["time_us"]),
+    }
+
+
+def finite_minmax(arr: np.ndarray) -> tuple[float, float]:
+    vals = arr[np.isfinite(arr)]
+    if vals.size == 0:
+        return math.nan, math.nan
+    return float(np.min(vals)), float(np.max(vals))
+
+
+def plot_hydro_variable(requested_time_us: float, variable: str, on_state: dict, c3_state: dict, out_path: Path) -> dict:
+    c3_x = c3_state["x"]
+    c3_y = c3_state["y"]
+    interpolation_used = not same_grid(on_state["x"], on_state["y"], c3_x, c3_y)
+    on_values = interpolate_array(on_state["x"], on_state["y"], on_state[variable], c3_x, c3_y)
+    on_alpha = interpolate_array(on_state["x"], on_state["y"], on_state["liquid_alpha"], c3_x, c3_y)
+    c3_values = c3_state[variable]
+    c3_alpha = c3_state["liquid_alpha"]
+    diff = c3_values - on_values
+    on_min, on_max = finite_minmax(on_values)
+    c3_min, c3_max = finite_minmax(c3_values)
+    diff_min, diff_max = finite_minmax(diff)
+    finite_pair = np.concatenate([on_values[np.isfinite(on_values)], c3_values[np.isfinite(c3_values)]])
+    if finite_pair.size == 0:
+        raise RuntimeError(f"no finite hydrodynamic values for {variable} at {requested_time_us} us")
+    if variable == "vorticity":
+        lim = float(np.nanmax(np.abs(finite_pair)))
+        norm_main = colors.TwoSlopeNorm(vcenter=0.0, vmin=-lim, vmax=lim if lim > 0 else 1.0)
+        cmap_main = "coolwarm"
+    else:
+        vmin = float(np.nanmin(finite_pair))
+        vmax = float(np.nanmax(finite_pair))
+        if not math.isfinite(vmin) or not math.isfinite(vmax) or vmin == vmax:
+            vmin, vmax = 0.0, 1.0
+        norm_main = colors.Normalize(vmin=vmin, vmax=vmax)
+        cmap_main = "viridis"
+    diff_lim = float(np.nanmax(np.abs(diff[np.isfinite(diff)]))) if np.any(np.isfinite(diff)) else 1.0
+    if not math.isfinite(diff_lim) or diff_lim <= 0.0:
+        diff_lim = 1.0
+    titles = ["ON_NO_DIFF", "ON_WITH_DIFF_C3", "C3 - ON_NO_DIFF"]
+    arrays = [on_values, c3_values, diff]
+    alphas = [on_alpha, c3_alpha, c3_alpha]
+    norms = [norm_main, norm_main, colors.TwoSlopeNorm(vcenter=0.0, vmin=-diff_lim, vmax=diff_lim)]
+    cmaps = [cmap_main, cmap_main, "coolwarm"]
+    fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.5), constrained_layout=True, sharex=True, sharey=True)
+    for ax, arr, alpha, title, norm, cmap in zip(axes, arrays, alphas, titles, norms, cmaps):
+        mesh = ax.pcolormesh(edges(c3_x*1e6), edges(c3_y*1e6), arr, shading="auto", cmap=cmap, norm=norm)
+        if np.nanmin(alpha) <= 0.5 <= np.nanmax(alpha):
+            ax.contour(c3_x*1e6, c3_y*1e6, alpha, levels=[0.5], colors="white", linewidths=1.0)
+            ax.contour(c3_x*1e6, c3_y*1e6, alpha, levels=[0.5], colors="black", linewidths=0.35)
+        ax.set_title(title)
+        ax.set_xlabel("x [µm]")
+        ax.set_aspect("equal", adjustable="box")
+        fig.colorbar(mesh, ax=ax, pad=0.01)
+    axes[0].set_ylabel("y [µm]")
+    fig.suptitle(
+        f"Hydrodynamic wake {variable}; requested {requested_time_us:.2f} µs\n"
+        f"ON save {on_state['save']} t={on_state['time_us']:.3f} µs; "
+        f"C3 save {c3_state['save']} t={c3_state['time_us']:.3f} µs; "
+        f"Δt={c3_state['time_us'] - on_state['time_us']:.3e} µs"
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+    return {
+        "requested_time_us": requested_time_us,
+        "c3_time_us": c3_state["time_us"],
+        "on_time_us": on_state["time_us"],
+        "c3_save": c3_state["save"],
+        "on_save": on_state["save"],
+        "time_mismatch_us": c3_state["time_us"] - on_state["time_us"],
+        "variable": variable,
+        "on_min": on_min,
+        "on_max": on_max,
+        "c3_min": c3_min,
+        "c3_max": c3_max,
+        "difference_min": diff_min,
+        "difference_max": diff_max,
+        "interpolation_used": "T" if interpolation_used else "F",
+        "differentiation_method": HYDRO_DIFFERENTIATION_METHOD if variable == "vorticity" else "not_applicable",
+        "output_png": str(out_path),
+        "status": "written",
+        "reason": "",
+    }
+
+
+def hydrodynamic_wake_dry_run(export_path: Path) -> None:
+    ensure_hydro_raw_fields()
+    print("hydrodynamic wake comparison dry-run")
+    print(f"  c3_export: {export_path} exists={export_path.is_dir()}")
+    print("  verified mappings:")
+    for key, value in hydrodynamic_mappings().items():
+        print(f"    {key}: {value}")
+    on_saves = on_saves_with_hydro_fields()
+    print(f"  ON_NO_DIFF hydro saves: {on_saves[:4]}...{on_saves[-4:] if len(on_saves) > 4 else on_saves}")
+    available_vars = sorted({p.parent.name for p in (export_path / "field_data").glob("*/*.npz")}) if (export_path / "field_data").is_dir() else []
+    print(f"  C3 compact field variables: {available_vars}")
+    for target in HYDRO_WAKE_TIMES_US:
+        ref = nearest_c3_hydro_reference(export_path, target)
+        if ref is None:
+            print(f"  requested {target:.2f} us: BLOCKED missing C3 pressure NPZ reference")
+            continue
+        missing = c3_hydro_missing_for_save(export_path, int(ref["save"]))
+        on_item = nearest_on_hydro_item(float(ref["time_us"]))
+        on_status = "available" if on_item else "missing"
+        status = "ready" if not missing and on_item else "blocked"
+        print(
+            f"  requested {target:.2f} us: status={status} c3_save={ref['save']} "
+            f"c3_time={ref['time_us']:.3f} us on_status={on_status} "
+            f"missing_c3_fields={','.join(missing) if missing else 'none'}"
+        )
+
+
+def make_hydrodynamic_wake_frames(export_path: Path, dry_run_only: bool = False) -> None:
+    ensure_hydro_raw_fields()
+    if dry_run_only:
+        hydrodynamic_wake_dry_run(export_path)
+        return
+    manifest: list[dict] = []
+    for target in HYDRO_WAKE_TIMES_US:
+        ref = nearest_c3_hydro_reference(export_path, target)
+        if ref is None:
+            raise RuntimeError(f"missing C3 pressure NPZ reference near {target:.2f} us in {export_path}")
+        missing = c3_hydro_missing_for_save(export_path, int(ref["save"]))
+        if missing:
+            raise RuntimeError(
+                f"cannot make hydrodynamic wake frames for C3 save {ref['save']}: "
+                f"missing compact C3 NPZ fields {','.join(missing)}. "
+                "Regenerate/export C3 u_velocity, v_velocity, density, pressure, and liquid_alpha fields."
+            )
+        on_item = nearest_on_hydro_item(float(ref["time_us"]))
+        if on_item is None:
+            raise RuntimeError(f"missing ON_NO_DIFF hydrodynamic raw fields near C3 time {ref['time_us']:.3f} us")
+        on_state = on_hydro_state(on_item)
+        c3_state = c3_hydro_state(export_path, int(ref["save"]))
+        out_dir = OUT / "hydrodynamic_wake_frames" / f"t{target:.2f}us"
+        for variable in HYDRO_WAKE_VARIABLES:
+            row = plot_hydro_variable(target, variable, on_state, c3_state, out_dir / f"{variable}.png")
+            manifest.append(row)
+    write_csv(OUT / "hydrodynamic_wake_manifest.csv", manifest)
+
+
 def c3_npz_records(export_path: Path, variable: str) -> list[dict]:
     records: list[dict] = []
     for path in sorted((export_path / "field_data").rglob("*.npz")):
@@ -1617,7 +1921,16 @@ def nearest_c3_npz(export_path: Path, variable: str, requested_time_us: float) -
     return min(records, key=lambda row: abs(row["time_us"] - requested_time_us))
 
 
-def load_npz_grid(path: Path) -> dict:
+def load_npz_grid(path: Path, variable: str = "", save: int | None = None) -> dict:
+    if not isinstance(path, (str, os.PathLike)):
+        keys = ",".join(str(key) for key in path.keys()) if isinstance(path, dict) else ""
+        raise TypeError(
+            "load_npz_grid expected a filesystem path"
+            f"; variable={variable or 'unknown'}"
+            f"; save={save if save is not None else 'unknown'}"
+            f"; received_type={type(path).__name__}"
+            f"; metadata_keys={keys or 'unavailable'}"
+        )
     data = np.load(path, allow_pickle=False)
     return {
         "x": np.array(data["x"], dtype=float),
@@ -1631,6 +1944,18 @@ def load_npz_grid(path: Path) -> dict:
         "variable": str(np.asarray(data["variable"]).item()),
         "mask_description": str(np.asarray(data["mask_description"]).item()) if "mask_description" in data else "",
     }
+
+
+def load_c3_npz_record(record: dict, variable: str, save: int) -> dict:
+    if not isinstance(record, dict) or "path" not in record:
+        keys = ",".join(str(key) for key in record.keys()) if isinstance(record, dict) else ""
+        raise TypeError(
+            "C3 NPZ lookup did not return the established metadata record with a path key"
+            f"; variable={variable}; save={save}"
+            f"; received_type={type(record).__name__}"
+            f"; metadata_keys={keys or 'unavailable'}"
+        )
+    return load_npz_grid(record["path"], variable=variable, save=save)
 
 
 def on_saves_with_variable(variable: str) -> list[int]:
@@ -1814,13 +2139,580 @@ def make_difference_frames(export_path: Path) -> None:
     write_csv(OUT / "difference_frame_manifest.csv", manifest)
 
 
+def molecular_weight_from_composition(composition: dict[str, float]) -> float:
+    atomic_weights = {
+        "H": 1.00794,
+        "C": 12.0107,
+        "N": 14.0067,
+        "O": 15.9994,
+        "AR": 39.948,
+        "Ar": 39.948,
+    }
+    total = 0.0
+    for element, count in composition.items():
+        if element not in atomic_weights:
+            raise RuntimeError(f"atomic weight for {element!r} is not defined")
+        total += atomic_weights[element] * float(count)
+    return total
+
+
+def mixing_stoich_coefficient() -> dict:
+    mech = REPO / "examples/chemistry_mechanisms/yao_sk54/yao_sk54.yaml"
+    data = yaml.safe_load(mech.read_text())
+    compositions = {
+        species["name"]: species.get("composition", {})
+        for species in data.get("species", [])
+    }
+    mw_o2 = molecular_weight_from_composition(compositions["O2"])
+    mw_fuel = molecular_weight_from_composition(compositions["NC12H26"])
+    coeff = 18.5 * mw_o2 / mw_fuel
+    return {
+        "mechanism": mech,
+        "MW_O2_g_per_mol": mw_o2,
+        "MW_NC12H26_g_per_mol": mw_fuel,
+        "coefficient": coeff,
+    }
+
+
+def cell_area_from_xy(x: np.ndarray, y: np.ndarray) -> float:
+    if x.size < 2 or y.size < 2:
+        return math.nan
+    dx = np.diff(x)
+    dy = np.diff(y)
+    if not np.all(np.isfinite(dx)) or not np.all(np.isfinite(dy)):
+        return math.nan
+    area = float(abs(np.median(dx)) * abs(np.median(dy)))
+    return area if math.isfinite(area) and area > 0.0 else math.nan
+
+
+def raw_species_full_arrays(item: SaveItem, species: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    field = raw.read_field(item.run_dir, f"rhoY_{species}", item.raw_step)
+    alpha = liquid_alpha_field(item)
+    if not field.get("available") or not alpha.get("available"):
+        return None
+    return full_domain_arrays(field, alpha)
+
+
+def on_mixing_state(item: SaveItem) -> dict | None:
+    fields = read_available_fields(item, [
+        "liquid_alpha",
+        "vapor_alpha",
+        "air_alpha",
+        "vapor_alpha_rho",
+        "air_alpha_rho",
+        "pressure",
+        "rhoY_NC12H26",
+        "rhoY_O2",
+        "rhoY_OH",
+        "rhoY_HO2",
+        "rhoY_H2O2",
+    ])
+    required = [
+        "liquid_alpha",
+        "vapor_alpha",
+        "air_alpha",
+        "vapor_alpha_rho",
+        "air_alpha_rho",
+        "pressure",
+        "rhoY_NC12H26",
+        "rhoY_O2",
+    ]
+    if not all(fields[name].get("available") for name in required):
+        return None
+    x, y, alpha_liq = grid_required(fields["liquid_alpha"], "liquid_alpha")
+    arrays: dict[str, np.ndarray] = {"alpha_liq": alpha_liq}
+    for name in ["vapor_alpha", "air_alpha", "vapor_alpha_rho", "air_alpha_rho", "pressure"]:
+        gx, gy, arr = grid_required(fields[name], name)
+        if not same_grid(x, y, gx, gy):
+            raise RuntimeError(f"ON_NO_DIFF {name} grid does not match liquid_alpha")
+        arrays[name] = arr
+    for species in ["NC12H26", "O2", "OH", "HO2", "H2O2"]:
+        field = fields.get(f"rhoY_{species}", empty_field())
+        if field.get("available"):
+            gx, gy, arr = grid_required(field, f"rhoY_{species}")
+            if not same_grid(x, y, gx, gy):
+                raise RuntimeError(f"ON_NO_DIFF rhoY_{species} grid does not match liquid_alpha")
+            arrays[species] = arr
+        else:
+            arrays[species] = np.full_like(alpha_liq, np.nan)
+    temp_field = valid_gas_temperature(fields)
+    _tx, _ty, temp, temp_mask, _alpha = full_domain_arrays(
+        temp_field,
+        fields["liquid_alpha"],
+        valid_by_presence=True,
+    )
+    gas_mass = arrays["vapor_alpha_rho"] + arrays["air_alpha_rho"]
+    valid_gas = (
+        np.isfinite(alpha_liq)
+        & np.isfinite(arrays["vapor_alpha"])
+        & np.isfinite(arrays["air_alpha"])
+        & np.isfinite(gas_mass)
+        & ((arrays["vapor_alpha"] + arrays["air_alpha"]) > 0.5)
+        & (gas_mass > GAS_MASS_FLOOR)
+        & (alpha_liq < 0.5)
+        & temp_mask
+    )
+    arrays.update({
+        "x": x,
+        "y": y,
+        "valid_gas_mask": valid_gas,
+        "valid_gas_temperature": temp,
+        "gas_mass": gas_mass,
+        "pressure": arrays["pressure"] / 1.0e6,
+        "time_us": item.global_save * T_SAVE * 1.0e6,
+        "save": item.global_save,
+    })
+    return arrays
+
+
+def c3_mixing_state(export_path: Path, save: int) -> dict:
+    loaded = {}
+    missing = []
+    for variable in MIXING_STATE_FIELDS:
+        record = c3_hydro_npz_by_save(export_path, save, variable)
+        if record is None:
+            missing.append(variable)
+            continue
+        loaded[variable] = load_c3_npz_record(record, variable, save)
+    if missing:
+        raise RuntimeError(f"C3 compact export is missing mixing-state fields for save {save}: {','.join(missing)}")
+    base = loaded["liquid_alpha"]
+    x = base["x"]
+    y = base["y"]
+    alpha_liq = base["alpha_liq"]
+    out = {
+        "x": x,
+        "y": y,
+        "alpha_liq": alpha_liq,
+        "time_us": base["time_us"],
+        "save": int(base["save"]),
+    }
+    for variable, data in loaded.items():
+        if not same_grid(x, y, data["x"], data["y"]):
+            raise RuntimeError(f"C3 {variable} grid does not match liquid_alpha grid")
+        if data["alpha_liq"].shape != alpha_liq.shape:
+            raise RuntimeError(f"C3 {variable} alpha_liq shape does not match liquid_alpha")
+        out[variable] = data["values"]
+    temp_data = loaded["valid_gas_temperature"]
+    out["valid_gas_mask"] = temp_data["valid_mask"] & np.isfinite(temp_data["values"])
+    out["gas_mass"] = None
+    out["pressure"] = loaded["pressure"]["values"]
+    return out
+
+
+def compute_phi(state: dict, coeff: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    fuel = state["NC12H26"]
+    o2 = state["O2"]
+    mask = (
+        np.array(state["valid_gas_mask"], dtype=bool)
+        & np.isfinite(fuel)
+        & np.isfinite(o2)
+        & (fuel >= 0.0)
+        & (o2 > MIXING_PHI_O2_FLOOR)
+    )
+    phi = np.full(fuel.shape, np.nan)
+    phi[mask] = coeff * fuel[mask] / o2[mask]
+    log_phi = np.full(fuel.shape, np.nan)
+    finite_phi = np.isfinite(phi) & (phi > 0.0)
+    log_phi[finite_phi] = np.log10(phi[finite_phi])
+    return phi, log_phi, mask
+
+
+def phi_band_mask(phi: np.ndarray, name: str) -> np.ndarray:
+    for band_name, lo, hi, _label in MIXING_BANDS:
+        if band_name != name:
+            continue
+        if band_name == "near_stoichiometric":
+            return np.isfinite(phi) & (phi >= lo) & (phi <= hi)
+        return np.isfinite(phi) & (phi >= lo) & (phi < hi)
+    raise ValueError(name)
+
+
+def mixing_band_stats(case: str, requested_time_us: float, state: dict, coeff: float) -> tuple[list[dict], np.ndarray, np.ndarray, np.ndarray]:
+    phi, log_phi, mask = compute_phi(state, coeff)
+    area = cell_area_from_xy(state["x"], state["y"])
+    valid_area = float(np.count_nonzero(mask) * area) if math.isfinite(area) else math.nan
+    rows: list[dict] = []
+    radicals = {name: state.get(name, np.full_like(phi, np.nan)) for name in MIXING_RADICALS}
+    for band_name, _lo, _hi, label in MIXING_BANDS:
+        band = phi_band_mask(phi, band_name) & mask
+        band_area = float(np.count_nonzero(band) * area) if math.isfinite(area) else math.nan
+        row = {
+            "case": case,
+            "requested_time_us": requested_time_us,
+            "actual_time_us": state["time_us"],
+            "save": state["save"],
+            "band": band_name,
+            "band_definition": label,
+            "cell_count": int(np.count_nonzero(band)),
+            "area_m2": band_area,
+            "area_fraction_of_valid_gas": band_area / valid_area if valid_area and math.isfinite(valid_area) else math.nan,
+            "gas_mass_weighted_fraction": math.nan,
+            "gas_mass_weighted_status": "unavailable_without_C3_gas_density",
+            "mean_temperature_K": float(np.nanmean(state["valid_gas_temperature"][band])) if np.any(band) else math.nan,
+        }
+        for radical, values in radicals.items():
+            row[f"integrated_{radical}"] = (
+                float(np.nansum(np.where(band, values, 0.0)) * area)
+                if math.isfinite(area) else math.nan
+            )
+        rows.append(row)
+    finite_phi = phi[mask & np.isfinite(phi)]
+    summary = {
+        "case": case,
+        "requested_time_us": requested_time_us,
+        "actual_time_us": state["time_us"],
+        "save": state["save"],
+        "valid_phi_cell_count": int(finite_phi.size),
+        "valid_phi_area_m2": valid_area,
+        "phi_0p5_to_2_area_m2": float(np.count_nonzero(mask & (phi >= 0.5) & (phi <= 2.0)) * area) if math.isfinite(area) else math.nan,
+        "phi_0p8_to_1p2_area_m2": float(np.count_nonzero(mask & (phi >= 0.8) & (phi <= 1.2)) * area) if math.isfinite(area) else math.nan,
+        "phi_max": float(np.nanmax(finite_phi)) if finite_phi.size else math.nan,
+        "phi_p99p9": float(np.nanpercentile(finite_phi, 99.9)) if finite_phi.size else math.nan,
+    }
+    rows.append({**summary, "band": "all_valid_phi", "band_definition": "all finite valid-gas phi"})
+    return rows, phi, log_phi, mask
+
+
+def radical_phi_overlap_stats(
+    case: str,
+    requested_time_us: float,
+    state: dict,
+    phi: np.ndarray,
+    mask: np.ndarray,
+) -> list[dict]:
+    area = cell_area_from_xy(state["x"], state["y"])
+    xx, yy = np.meshgrid(state["x"], state["y"])
+    log_phi = np.full(phi.shape, np.nan)
+    positive_phi = mask & np.isfinite(phi) & (phi > 0.0)
+    log_phi[positive_phi] = np.log10(phi[positive_phi])
+    phi_layer = positive_phi & (np.abs(log_phi) <= MIXING_PHI_LAYER_LOG_HALF_WIDTH)
+    layer_points = np.column_stack((xx[phi_layer], yy[phi_layer]))
+    out = []
+    for radical in MIXING_RADICALS:
+        values = state.get(radical, np.full_like(phi, np.nan))
+        finite = values[mask & np.isfinite(values)]
+        if finite.size == 0:
+            threshold = math.nan
+            rich = np.zeros(phi.shape, dtype=bool)
+        else:
+            threshold = float(np.nanpercentile(finite, 99.0))
+            rich = mask & np.isfinite(values) & (values >= threshold)
+        rich_points = np.column_stack((xx[rich], yy[rich]))
+        if rich_points.size and layer_points.size:
+            distances = []
+            for start in range(0, rich_points.shape[0], 256):
+                diff = rich_points[start:start + 256, None, :] - layer_points[None, :, :]
+                distances.append(np.sqrt(np.min(np.sum(diff * diff, axis=2), axis=1)))
+            dist = np.concatenate(distances)
+            min_dist = float(np.min(dist))
+            mean_dist = float(np.mean(dist))
+        else:
+            min_dist = math.nan
+            mean_dist = math.nan
+        out.append({
+            "case": case,
+            "requested_time_us": requested_time_us,
+            "actual_time_us": state["time_us"],
+            "save": state["save"],
+            "radical": radical,
+            "radical_99th_percentile_threshold": threshold,
+            "radical_rich_cell_count": int(np.count_nonzero(rich)),
+            "phi_layer_cell_count": int(np.count_nonzero(phi_layer)),
+            "overlap_area_m2": float(np.count_nonzero(rich & phi_layer) * area) if math.isfinite(area) else math.nan,
+            "min_distance_to_phi1_layer_m": min_dist,
+            "mean_distance_to_phi1_layer_m": mean_dist,
+            "phi_layer_definition": f"|log10(phi)| <= {MIXING_PHI_LAYER_LOG_HALF_WIDTH}",
+        })
+    return out
+
+
+def draw_mixing_three_panel(
+    out_path: Path,
+    title: str,
+    on_state: dict,
+    c3_state: dict,
+    on_values: np.ndarray,
+    c3_values: np.ndarray,
+    diff_values: np.ndarray,
+    on_alpha: np.ndarray,
+    c3_alpha: np.ndarray,
+    cmap: str = "viridis",
+    diverging: bool = False,
+    contours: tuple[np.ndarray, list[float], str] | None = None,
+    c3_contours: tuple[np.ndarray, list[float], str] | None = None,
+    colorbar_label: str = "",
+) -> None:
+    finite_main = np.concatenate([
+        on_values[np.isfinite(on_values)],
+        c3_values[np.isfinite(c3_values)],
+    ]) if np.isfinite(on_values).any() or np.isfinite(c3_values).any() else np.array([])
+    if finite_main.size == 0:
+        raise RuntimeError(f"no finite values for {title}")
+    vmin = float(np.nanmin(finite_main))
+    vmax = float(np.nanmax(finite_main))
+    if not math.isfinite(vmin) or not math.isfinite(vmax) or vmax <= vmin:
+        vmax = vmin + 1.0
+    finite_diff = diff_values[np.isfinite(diff_values)]
+    dmax = float(np.nanmax(np.abs(finite_diff))) if finite_diff.size else 1.0
+    if not math.isfinite(dmax) or dmax <= 0.0:
+        dmax = 1.0
+    fig, axes = plt.subplots(1, 3, figsize=(16.2, 4.8), sharex=True, sharey=True, constrained_layout=True)
+    panels = [
+        ("ON_NO_DIFF", on_state, on_values, on_alpha, vmin, vmax, cmap),
+        ("ON_WITH_DIFF_C3", c3_state, c3_values, c3_alpha, vmin, vmax, cmap),
+        ("C3 - ON_NO_DIFF", c3_state, diff_values, c3_alpha, -dmax, dmax, "coolwarm"),
+    ]
+    meshes = []
+    for ax, (label, state, values, alpha, lo, hi, cm) in zip(axes, panels):
+        norm = colors.TwoSlopeNorm(vcenter=0.0, vmin=lo, vmax=hi) if cm == "coolwarm" else None
+        mesh = ax.pcolormesh(
+            edges(state["x"] * 1.0e6),
+            edges(state["y"] * 1.0e6),
+            values,
+            shading="auto",
+            cmap=cm,
+            vmin=None if norm else lo,
+            vmax=None if norm else hi,
+            norm=norm,
+        )
+        meshes.append(mesh)
+        if np.nanmin(alpha) <= 0.5 <= np.nanmax(alpha):
+            ax.contour(state["x"] * 1.0e6, state["y"] * 1.0e6, alpha, levels=[0.5], colors="white", linewidths=1.0)
+            ax.contour(state["x"] * 1.0e6, state["y"] * 1.0e6, alpha, levels=[0.5], colors="black", linewidths=0.3)
+        if contours is not None and label == "ON_NO_DIFF":
+            field, levels, color = contours
+            ax.contour(state["x"] * 1.0e6, state["y"] * 1.0e6, field, levels=levels, colors=color, linewidths=0.9)
+        if c3_contours is not None and label != "ON_NO_DIFF":
+            field, levels, color = c3_contours
+            ax.contour(state["x"] * 1.0e6, state["y"] * 1.0e6, field, levels=levels, colors=color, linewidths=0.9)
+        ax.set_title(f"{label}\nsave {state['save']}, t={state['time_us']:.3f} µs", fontsize=9)
+        ax.set_xlabel("x [µm]")
+        ax.set_aspect("equal", adjustable="box")
+    axes[0].set_ylabel("y [µm]")
+    fig.colorbar(meshes[0], ax=axes[:2], pad=0.015, label=colorbar_label)
+    fig.colorbar(meshes[2], ax=axes[2], pad=0.015, label=f"C3 - ON {colorbar_label}")
+    fig.suptitle(title)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def mixing_plot_set(
+    out_dir: Path,
+    requested_time_us: float,
+    on_state: dict,
+    c3_state: dict,
+    coeff: float,
+) -> list[dict]:
+    on_phi, on_log_phi, on_mask = compute_phi(on_state, coeff)
+    c3_phi, c3_log_phi, c3_mask = compute_phi(c3_state, coeff)
+    on_interp = {
+        "phi": interpolate_array(on_state["x"], on_state["y"], on_phi, c3_state["x"], c3_state["y"]),
+        "log_phi": interpolate_array(on_state["x"], on_state["y"], on_log_phi, c3_state["x"], c3_state["y"]),
+        "alpha": interpolate_array(on_state["x"], on_state["y"], on_state["alpha_liq"], c3_state["x"], c3_state["y"]),
+        "mask": interpolate_mask(on_state["x"], on_state["y"], on_mask, c3_state["x"], c3_state["y"]),
+    }
+    rows = []
+    plot_specs = [
+        ("log10_phi", on_log_phi, c3_log_phi, "magma", r"log$_{10}(\phi)$"),
+        ("phi_contours", np.minimum(on_phi, MIXING_PHI_PLOT_CAP), np.minimum(c3_phi, MIXING_PHI_PLOT_CAP), "viridis", "phi"),
+        ("valid_gas_temperature", on_state["valid_gas_temperature"], c3_state["valid_gas_temperature"], "inferno", "K"),
+        ("OH", on_state["OH"], c3_state["OH"], "magma", r"kg m$^{-3}$"),
+        ("HO2", on_state["HO2"], c3_state["HO2"], "magma", r"kg m$^{-3}$"),
+        ("H2O2", on_state["H2O2"], c3_state["H2O2"], "magma", r"kg m$^{-3}$"),
+    ]
+    for variable, on_values, c3_values, cmap, label in plot_specs:
+        on_values_i = interpolate_array(on_state["x"], on_state["y"], on_values, c3_state["x"], c3_state["y"])
+        if variable == "valid_gas_temperature":
+            combined_mask = c3_mask & on_interp["mask"] & np.isfinite(c3_values) & np.isfinite(on_values_i)
+        elif variable in MIXING_RADICALS:
+            combined_mask = c3_mask & on_interp["mask"] & np.isfinite(c3_values) & np.isfinite(on_values_i)
+        else:
+            combined_mask = c3_mask & on_interp["mask"] & np.isfinite(c3_values) & np.isfinite(on_values_i)
+        diff = np.where(combined_mask, c3_values - on_values_i, np.nan)
+        on_plot = np.where(on_mask, on_values, np.nan)
+        c3_plot = np.where(c3_mask, c3_values, np.nan)
+        path = out_dir / f"{variable}.png"
+        phi_levels = [0.5, 1.0, 2.0] if variable == "phi_contours" else [1.0]
+        draw_mixing_three_panel(
+            path,
+            f"{variable} mixing-state comparison at requested t={requested_time_us:.2f} µs",
+            on_state,
+            c3_state,
+            on_plot,
+            c3_plot,
+            diff,
+            on_state["alpha_liq"],
+            c3_state["alpha_liq"],
+            cmap=cmap,
+            contours=(on_phi, phi_levels, "cyan"),
+            c3_contours=(c3_phi, phi_levels, "cyan"),
+            colorbar_label=label,
+        )
+        rows.append({
+            "requested_time_us": requested_time_us,
+            "variable": variable,
+            "output_png": str(path.relative_to(OUT)),
+            "status": "written",
+            "on_time_us": on_state["time_us"],
+            "on_save": on_state["save"],
+            "c3_time_us": c3_state["time_us"],
+            "c3_save": c3_state["save"],
+            "time_mismatch_us": on_state["time_us"] - c3_state["time_us"],
+            "interpolation_used": "T" if not same_grid(on_state["x"], on_state["y"], c3_state["x"], c3_state["y"]) else "F",
+        })
+    return rows
+
+
+def mixing_state_dry_run(export_path: Path) -> None:
+    ensure_species_fields(species_names())
+    coeff = mixing_stoich_coefficient()
+    print("mixing-state analysis dry-run")
+    print(f"repo_from_parents4: {REPO}")
+    print(f"C3 export: {export_path} exists={export_path.is_dir()}")
+    print(f"stoich coefficient s=18.5*MW_O2/MW_NC12H26 = {coeff['coefficient']:.10f}")
+    print(f"MW_O2={coeff['MW_O2_g_per_mol']:.8f} g/mol")
+    print(f"MW_NC12H26={coeff['MW_NC12H26_g_per_mol']:.8f} g/mol")
+    print(f"O2 floor for phi denominator: {MIXING_PHI_O2_FLOOR:.3e}")
+    print(f"phi plot cap: {MIXING_PHI_PLOT_CAP:.3e}")
+    variables = sorted({record["variable"] for record in c3_npz_records(export_path, "NC12H26")})
+    field_vars = sorted({path.parent.name for path in (export_path / "field_data").rglob("*.npz")})
+    print(f"C3 field variables discovered: {field_vars}")
+    for target in MIXING_STATE_TIMES_US:
+        ref = nearest_c3_npz(export_path, "NC12H26", target)
+        if ref is None:
+            print(f"  t={target:.2f} us: missing C3 NC12H26 reference")
+            continue
+        missing = [var for var in MIXING_STATE_FIELDS if c3_hydro_npz_by_save(export_path, ref["save"], var) is None]
+        validation_status = "not_checked"
+        if not missing:
+            try:
+                sample_record = c3_hydro_npz_by_save(export_path, ref["save"], "NC12H26")
+                sample = load_c3_npz_record(sample_record, "NC12H26", int(ref["save"]))
+                validation_status = (
+                    f"opened_NC12H26_npz shape={sample['values'].shape} "
+                    f"path={sample_record['path']}"
+                )
+            except Exception as exc:
+                validation_status = f"failed_to_open_required_npz: {exc}"
+        on_item = nearest_on_item("NC12H26", ref["time_us"])
+        print(
+            f"  t={target:.2f} us: C3 save={ref['save']} time={ref['time_us']:.3f} us "
+            f"missing_c3={','.join(missing) if missing else 'none'}"
+        )
+        print(f"    C3 NPZ validation: {validation_status}")
+        if on_item is None:
+            print("    ON_NO_DIFF: no matching save")
+        else:
+            print(
+                f"    ON_NO_DIFF save={on_item.global_save} time={on_item.global_save * T_SAVE * 1e6:.3f} us "
+                f"origin={on_item.origin}"
+            )
+    if variables:
+        print(f"NC12H26 records discovered for variables: {variables}")
+    print("gas-mass-weighted phi-band fractions: unavailable for compact C3 export without gas density")
+
+
+def make_mixing_state_analysis(export_path: Path, dry_run_only: bool = False) -> None:
+    export_path = export_path.resolve()
+    if dry_run_only:
+        mixing_state_dry_run(export_path)
+        return
+    ensure_species_fields(species_names())
+    coeff = mixing_stoich_coefficient()
+    out_root = OUT / "mixing_state_analysis"
+    stats_rows: list[dict] = []
+    manifest: list[dict] = []
+    summary_lines = [
+        "# Local mixing-state comparison",
+        "",
+        f"C3 compact export: `{export_path}`",
+        f"Stoichiometric coefficient `s = 18.5 * MW_O2 / MW_NC12H26 = {coeff['coefficient']:.10f}`.",
+        f"MW_O2 = {coeff['MW_O2_g_per_mol']:.8f} g/mol.",
+        f"MW_NC12H26 = {coeff['MW_NC12H26_g_per_mol']:.8f} g/mol.",
+        f"O2 floor for phi denominator: `{MIXING_PHI_O2_FLOOR:.3e}`.",
+        f"Phi plotting cap: `{MIXING_PHI_PLOT_CAP:.3e}`; quantitative statistics use uncapped phi.",
+        "",
+        "Caveats:",
+        "- This uses existing local data only; no new cluster export is required.",
+        "- C3 compact export lacks gas-density fields, so gas-mass-weighted mixture-band fractions are unavailable.",
+        "- Species fields are stored parent/species partial densities; phi uses their ratio, equivalent to Y_fuel/Y_O2 where both share the same gas mass.",
+        "- Full Bilger mixture fraction and scalar dissipation are not calculated here; they require additional elemental/species and transport information.",
+        "",
+    ]
+    for target in MIXING_STATE_TIMES_US:
+        ref = nearest_c3_npz(export_path, "NC12H26", target)
+        if ref is None:
+            manifest.append({"requested_time_us": target, "status": "skipped", "reason": "missing C3 NC12H26"})
+            continue
+        c3_state = c3_mixing_state(export_path, int(ref["save"]))
+        on_item = nearest_on_item("NC12H26", c3_state["time_us"])
+        if on_item is None:
+            manifest.append({"requested_time_us": target, "status": "skipped", "reason": "missing ON_NO_DIFF save"})
+            continue
+        on_state = on_mixing_state(on_item)
+        if on_state is None:
+            manifest.append({"requested_time_us": target, "status": "skipped", "reason": "missing ON_NO_DIFF fields"})
+            continue
+        out_dir = out_root / f"t{target:.2f}us"
+        plot_rows = mixing_plot_set(out_dir, target, on_state, c3_state, coeff["coefficient"])
+        manifest.extend(plot_rows)
+        for case, state in [("ON_NO_DIFF", on_state), ("ON_WITH_DIFF_C3", c3_state)]:
+            band_rows, phi, _log_phi, mask = mixing_band_stats(case, target, state, coeff["coefficient"])
+            stats_rows.extend(band_rows)
+            stats_rows.extend(radical_phi_overlap_stats(case, target, state, phi, mask))
+        summary_lines.append(f"## Requested {target:.2f} µs")
+        summary_lines.append("")
+        summary_lines.append(
+            f"- C3: save {c3_state['save']}, t={c3_state['time_us']:.3f} µs; "
+            f"ON_NO_DIFF: save {on_state['save']}, t={on_state['time_us']:.3f} µs."
+        )
+        for case in ["ON_NO_DIFF", "ON_WITH_DIFF_C3"]:
+            all_row = next(
+                row for row in stats_rows
+                if row.get("case") == case and row.get("requested_time_us") == target and row.get("band") == "all_valid_phi"
+            )
+            near = next(
+                row for row in stats_rows
+                if row.get("case") == case and row.get("requested_time_us") == target and row.get("band") == "near_stoichiometric"
+            )
+            useful = sum(
+                ff(row.get("area_m2")) for row in stats_rows
+                if row.get("case") == case
+                and row.get("requested_time_us") == target
+                and row.get("band") in {"combustible_lean", "near_stoichiometric", "moderately_rich"}
+                and math.isfinite(ff(row.get("area_m2")))
+            )
+            summary_lines.append(
+                f"- {case}: phi_p99.9={ff(all_row.get('phi_p99p9')):.6e}, "
+                f"area(0.5<=phi<=2)={useful:.6e} m^2, "
+                f"near-stoich area={ff(near.get('area_m2')):.6e} m^2."
+            )
+        summary_lines.append("")
+    write_csv(out_root / "mixing_state_statistics.csv", stats_rows)
+    write_csv(out_root / "mixing_state_manifest.csv", manifest)
+    summary_lines.extend([
+        "## Summary question framing",
+        "",
+        "- Does diffusion reduce very-rich fuel pockets? Compare the `very_rich` area fractions and phi percentiles.",
+        "- Does diffusion increase the area of 0.5 <= phi <= 2.0 gas? Use the reported combustible/near/rich band areas.",
+        "- Does diffusion broaden or shrink the near-stoichiometric layer? Use the near-stoich area and phi=1 contour frames.",
+        "- Are OH, HO2, and H2O2 closer to phi=1 in C3? Use the radical 99th-percentile overlap and distance rows.",
+        "- A visually weaker fuel wake can indicate dilution into a broader mixing layer; use phi bands rather than fuel field alone.",
+        "",
+        "All three comparisons use temporary evap-only gates and C3 uses a provisional diffusion mask; this is a local diagnostic, not final physical validation.",
+    ])
+    (out_root / "mixing_state_summary.md").write_text("\n".join(summary_lines) + "\n")
+
+
 
 
 def fuel_case_paths() -> dict[str, list[Path]]:
     return {
         "OFF_NO_DIFF": [OFF_RUN],
         "ON_NO_DIFF": [SOURCE_ON, RESTART_ON],
-        "ON_WITH_DIFF_C3": [C3_RUN],
+        "ON_WITH_DIFF_C3": [],
     }
 
 
@@ -1862,11 +2754,17 @@ def validate_fuel_cases() -> None:
                 missing.append(f"{case}: missing run directory {run_dir}")
             elif not (run_dir / "D").is_dir():
                 missing.append(f"{case}: missing raw D directory {run_dir / 'D'}")
+    if not C3_FUEL_INVENTORY_CSV.is_file():
+        missing.append(f"ON_WITH_DIFF_C3: missing compact C3 CSV {C3_FUEL_INVENTORY_CSV}")
     if missing:
         raise RuntimeError("fuel-inventory case unavailable:\n" + "\n".join(missing))
 
 
 def fuel_available_saves(case: str) -> list[int]:
+    if case == "ON_WITH_DIFF_C3":
+        if not C3_FUEL_INVENTORY_CSV.is_file():
+            return []
+        return sorted(c3_parent_inventory_by_save().keys())
     candidates: set[int] = set()
     for run_dir in fuel_case_paths()[case]:
         candidates.update(available_d_steps(run_dir))
@@ -1890,39 +2788,79 @@ def fuel_field_mappings() -> dict[str, tuple[str, int] | None]:
     return {name: raw.FIELDS.get(name) for name in FUEL_REQUIRED_FIELDS}
 
 
+def load_c3_parent_inventory_csv(path: Path = C3_FUEL_INVENTORY_CSV) -> list[dict]:
+    required = [
+        "save",
+        "time_s",
+        "time_us",
+        "gas_parent_fuel_mass",
+        "liquid_dodecane_mass",
+        "combined_parent_dodecane_mass",
+    ]
+    if not path.is_file():
+        raise RuntimeError(f"missing compact C3 fuel inventory CSV {path}")
+    rows: list[dict] = []
+    with path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        missing = [name for name in required if name not in (reader.fieldnames or [])]
+        if missing:
+            raise RuntimeError(f"C3 fuel inventory CSV {path} is missing columns: {','.join(missing)}")
+        for raw_row in reader:
+            row = {
+                "case": "ON_WITH_DIFF_C3",
+                "case_label": FUEL_CASE_LABEL["ON_WITH_DIFF_C3"],
+                "diffusion": FUEL_CASE_DIFFUSION["ON_WITH_DIFF_C3"],
+                "reactions": FUEL_CASE_REACTIONS["ON_WITH_DIFF_C3"],
+                "save": int(float(raw_row["save"])),
+                "raw_step": int(float(raw_row["save"])),
+                "origin": "compact_c3_csv",
+                "run_dir": str(path),
+                "time_s": ff(raw_row["time_s"]),
+                "time_us": ff(raw_row["time_us"]),
+                "gas_parent_fuel_mass": ff(raw_row["gas_parent_fuel_mass"]),
+                "liquid_dodecane_mass": ff(raw_row["liquid_dodecane_mass"]),
+                "combined_parent_dodecane_mass": ff(raw_row["combined_parent_dodecane_mass"]),
+                "nonfinite_cell_count": int(ff(raw_row.get("nonfinite_cell_count", 0)) or 0),
+            }
+            row["gas_fuel_mass"] = row["gas_parent_fuel_mass"]
+            row["liquid_fuel_mass"] = row["liquid_dodecane_mass"]
+            row["total_fuel_mass"] = row["combined_parent_dodecane_mass"]
+            if not all(math.isfinite(ff(row[key])) for key in [
+                "gas_parent_fuel_mass",
+                "liquid_dodecane_mass",
+                "combined_parent_dodecane_mass",
+            ]):
+                raise RuntimeError(f"C3 fuel inventory CSV {path} contains nonfinite inventory at save {row['save']}")
+            rows.append(row)
+    return sorted(rows, key=lambda r: int(r["save"]))
+
+
+def c3_parent_inventory_by_save(path: Path = C3_FUEL_INVENTORY_CSV) -> dict[int, dict]:
+    return {int(row["save"]): row for row in load_c3_parent_inventory_csv(path)}
+
+
 def fuel_inventory_for_save(case: str, save: int) -> dict:
+    if case == "ON_WITH_DIFF_C3":
+        try:
+            return dict(c3_parent_inventory_by_save()[save])
+        except KeyError as exc:
+            raise RuntimeError(f"C3 compact fuel inventory CSV has no save {save}") from exc
     item = fuel_item_for(case, save)
     fields = read_fields(item, FUEL_REQUIRED_FIELDS)
-    _dx, _dy, area = gas_metrics.estimate_cell_area(fields)
-    keys: set[tuple[float, float]] = set()
-    for field in fields.values():
-        keys.update(field.get("values", {}).keys())
-    gas_density_sum = 0.0
-    liquid_density_sum = 0.0
-    nonfinite_count = 0
-    for key in keys:
-        liquid = fields["liquid_alpha_rho"].get("values", {}).get(key, math.nan)
-        vapor = fields["vapor_alpha_rho"].get("values", {}).get(key, math.nan)
-        air = fields["air_alpha_rho"].get("values", {}).get(key, math.nan)
-        rhoY_fuel = fields["rhoY_NC12H26"].get("values", {}).get(key, math.nan)
-        if not all(math.isfinite(v) for v in [liquid, vapor, air, rhoY_fuel]):
-            nonfinite_count += 1
-            continue
-        gas_mass = vapor + air
-        if not math.isfinite(gas_mass):
-            nonfinite_count += 1
-            continue
-        # MFC stores rhoY_NC12H26 = (alpha_rho_vap + alpha_rho_air)*Y_NC12H26
-        # per mixture volume, so the full-domain gas parent-fuel inventory is
-        # integral(rhoY_NC12H26) dV with no gas mask.
-        gas_density_sum += rhoY_fuel
-        liquid_density_sum += liquid
-    if not math.isfinite(area):
-        gas_parent = liquid_parent = combined_parent = math.nan
-    else:
-        gas_parent = gas_density_sum * area
-        liquid_parent = liquid_density_sum * area
-        combined_parent = gas_parent + liquid_parent
+    data = c3_parent_inventory_grid(fields, save)
+    liquid = data["liquid"]
+    rhoY_fuel = data["rhoY_fuel"]
+    weights = data["cell_area_weights"]
+    finite_pair = np.isfinite(liquid) & np.isfinite(rhoY_fuel) & np.isfinite(weights)
+    nonfinite_count = int(liquid.size - np.count_nonzero(finite_pair))
+    gas_parent = float(np.sum(rhoY_fuel[finite_pair] * weights[finite_pair]))
+    liquid_parent = float(np.sum(liquid[finite_pair] * weights[finite_pair]))
+    combined_parent = gas_parent + liquid_parent
+    if not all(math.isfinite(v) for v in [gas_parent, liquid_parent, combined_parent]):
+        raise RuntimeError(
+            f"{case} fuel inventory save {save}: nonfinite integrated mass "
+            f"gas={gas_parent} liquid={liquid_parent} combined={combined_parent}"
+        )
     return {
         "case": case,
         "case_label": FUEL_CASE_LABEL[case],
@@ -2214,7 +3152,10 @@ def make_fuel_inventory_summary(rows: list[dict], common_saves: list[int]) -> No
     for case in FUEL_CASE_ORDER:
         paths = fuel_case_paths()[case]
         saves = fuel_available_saves(case)
-        path_text = ", ".join(str(path.relative_to(REPO)) for path in paths)
+        if case == "ON_WITH_DIFF_C3":
+            path_text = str(C3_FUEL_INVENTORY_CSV)
+        else:
+            path_text = ", ".join(str(path.relative_to(REPO)) for path in paths)
         lines.append(f"- `{case}`: {FUEL_CASE_LABEL[case]}; {path_text}; saves={saves[:4]}...{saves[-4:] if saves else []}")
     if common_saves:
         lines += [
@@ -2295,6 +3236,10 @@ def fuel_inventory_dry_run() -> None:
         saves = fuel_available_saves(case)
         preview = f"{saves[:4]}...{saves[-4:]}" if len(saves) > 8 else str(saves)
         print(f"  {case}: {FUEL_CASE_LABEL[case]}")
+        if case == "ON_WITH_DIFF_C3":
+            print(f"    compact_csv: {C3_FUEL_INVENTORY_CSV}")
+            print(f"      exists={C3_FUEL_INVENTORY_CSV.is_file()}")
+            print("      source: copied HPC C3 parent-dodecane inventory CSV")
         for run_dir in paths:
             settings = case_assignment_preview(
                 run_dir / "case.py",
@@ -2325,7 +3270,7 @@ def fuel_inventory_dry_run() -> None:
     print("liquid parent fuel = integral(alpha_rho_liquid) dV")
     print("combined parent dodecane = gas NC12H26 + liquid dodecane")
     print("no gas mask is applied to the full-domain gas parent-fuel integral")
-    print("C3 raw saves are read from the C3 HPC case path when present on that filesystem")
+    print("C3 values are read from the compact HPC CSV; local C3 raw files are not required for this budget")
 
 
 def export_fuel_inventory_budget(dry_run_only: bool = False) -> None:
@@ -2995,7 +3940,9 @@ def main() -> None:
     parser.add_argument("--c3-export-out", type=Path, default=OUT / "c3_export", help="Output directory for --export-c3")
     parser.add_argument("--compare-from-c3-export", type=Path, help="Compare local ON/OFF raw data against a compact C3 export directory")
     parser.add_argument("--make-difference-frames", action="store_true", help="Generate C3 minus chemistry-ON/diffusion-OFF difference maps from a C3 export")
-    parser.add_argument("--c3-export", type=Path, help="C3 compact export directory for --make-difference-frames")
+    parser.add_argument("--make-hydrodynamic-wake-frames", action="store_true", help="Generate ON_NO_DIFF vs C3 hydrodynamic wake frames from compact C3 export")
+    parser.add_argument("--make-mixing-state-analysis", action="store_true", help="Generate local ON_NO_DIFF vs C3 parent-fuel/O2 mixing-state analysis")
+    parser.add_argument("--c3-export", type=Path, help="C3 compact export directory for C3 export-based frame modes")
     parser.add_argument("--export-diffusion-diagnostics", action="store_true", help="Reconstruct C3 saved-state model-3 chemistry-diffusion masks and species fluxes")
     parser.add_argument("--export-diffusion-mask-only", action="store_true", help="Export C3 saved-state model-3 chemistry-diffusion active masks without Cantera")
     parser.add_argument("--export-fuel-inventory-budget", action="store_true", help="Export full-domain C1/C2/C3 dodecane fuel-inventory budgets")
@@ -3007,6 +3954,8 @@ def main() -> None:
     parser.add_argument("--diffusion-dry-run", action="store_true", help="Check diffusion diagnostic arguments/mapping without requiring HPC raw fields")
     parser.add_argument("--fuel-inventory-dry-run", action="store_true", help="Check fuel-inventory case paths, mappings, and common saves without exporting")
     parser.add_argument("--c3-fuel-inventory-dry-run", action="store_true", help="Check C3-only fuel inventory inputs without writing CSV")
+    parser.add_argument("--hydrodynamic-wake-dry-run", action="store_true", help="Check hydrodynamic wake frame inputs without rendering")
+    parser.add_argument("--mixing-state-dry-run", action="store_true", help="Check mixing-state inputs without rendering")
     parser.add_argument("--c3-fuel-inventory-save", type=int, help="Restrict --export-c3-fuel-inventory to one save for lightweight testing")
     args = parser.parse_args()
     modes = sum(bool(v) for v in [
@@ -3014,6 +3963,8 @@ def main() -> None:
         args.export_c3,
         args.compare_from_c3_export,
         args.make_difference_frames,
+        args.make_hydrodynamic_wake_frames,
+        args.make_mixing_state_analysis,
         args.export_diffusion_diagnostics,
         args.export_diffusion_mask_only,
         args.export_fuel_inventory_budget,
@@ -3031,6 +3982,10 @@ def main() -> None:
         if args.c3_export is None:
             parser.error("--make-difference-frames requires --c3-export PATH")
         make_difference_frames(args.c3_export)
+    elif args.make_hydrodynamic_wake_frames:
+        make_hydrodynamic_wake_frames(args.c3_export or C3_COMPACT_EXPORT, args.hydrodynamic_wake_dry_run)
+    elif args.make_mixing_state_analysis:
+        make_mixing_state_analysis(args.c3_export or C3_COMPACT_EXPORT, args.mixing_state_dry_run)
     elif args.export_diffusion_diagnostics:
         export_diffusion_diagnostics(args.c3_raw_case, args.saves, args.output_dir, args.diffusion_dry_run)
     elif args.export_diffusion_mask_only:
@@ -3051,6 +4006,10 @@ def main() -> None:
             parser.error("--fuel-inventory-dry-run requires --export-fuel-inventory-budget")
         if args.c3_fuel_inventory_dry_run:
             parser.error("--c3-fuel-inventory-dry-run requires --export-c3-fuel-inventory")
+        if args.hydrodynamic_wake_dry_run:
+            parser.error("--hydrodynamic-wake-dry-run requires --make-hydrodynamic-wake-frames")
+        if args.mixing_state_dry_run:
+            parser.error("--mixing-state-dry-run requires --make-mixing-state-analysis")
         run_full()
 
 
