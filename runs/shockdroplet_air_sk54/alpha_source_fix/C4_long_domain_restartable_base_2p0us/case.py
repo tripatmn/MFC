@@ -3,7 +3,7 @@
 
 Based directly on C3_diffusion_ON_reactions_ON_2p0us/case.py, with the
 same physics/numerics and a shifted shock-droplet near field plus a
-supported MFC tanh-stretched downstream x grid. Imports only json and has
+uniform long-domain x grid. Imports only json and has
 no dependency on sibling run folders.
 """
 
@@ -17,12 +17,8 @@ case = {
     'x_domain%end': 0.02,
     'y_domain%beg': 0.0,
     'y_domain%end': 0.0006000000000000001,
-    'stretch_x': 'T',
-    'a_x': 0.2,
-    'x_a': -0.0001,
-    'x_b': 0.002,
-    'loops_x': 3,
-    'm': 4377,
+    'stretch_x': 'F',
+    'm': 4343,
     'n': 128,
     'p': 0,
     'cfl_adap_dt': 'T',
