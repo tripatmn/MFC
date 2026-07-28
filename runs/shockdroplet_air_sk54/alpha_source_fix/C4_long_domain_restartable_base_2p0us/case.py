@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""C4: standalone SK54 Mach-3 shock/droplet case on a long restartable domain.
+"""C4: standalone SK54 Mach-3 shock/droplet case on a restartable extended domain.
 
 Based directly on C3_diffusion_ON_reactions_ON_2p0us/case.py, with the
-same physics/numerics and a shifted shock-droplet near field plus a
-uniform long-domain x grid. Imports only json and has
+same physics/numerics, shock/droplet x positions, and a uniform extended
+x grid. Imports only json and has
 no dependency on sibling run folders.
 """
 
@@ -13,12 +13,12 @@ case = {
     'chemistry': 'T',
     'cantera_file': 'examples/chemistry_mechanisms/yao_sk54/yao_sk54.yaml',
     'cantera_phase': 'yao_sk54',
-    'x_domain%beg': -0.0003,
-    'x_domain%end': 0.02,
+    'x_domain%beg': 0.0,
+    'x_domain%end': 0.0055,
     'y_domain%beg': 0.0,
     'y_domain%end': 0.0006000000000000001,
     'stretch_x': 'F',
-    'm': 4343,
+    'm': 1176,
     'n': 128,
     'p': 0,
     'cfl_adap_dt': 'T',
@@ -71,9 +71,9 @@ case = {
     'fluid_pp(3)%qv': 0.0,
     'fluid_pp(3)%qvp': 0.0,
     'patch_icpp(1)%geometry': 3,
-    'patch_icpp(1)%x_centroid': 0.00995,
+    'patch_icpp(1)%x_centroid': 0.00295,
     'patch_icpp(1)%y_centroid': 0.00030000000000000003,
-    'patch_icpp(1)%length_x': 0.0201,
+    'patch_icpp(1)%length_x': 0.0051,
     'patch_icpp(1)%length_y': 0.0006000000000000001,
     'patch_icpp(1)%vel(1)': 0.0,
     'patch_icpp(1)%vel(2)': 0.0,
@@ -86,9 +86,9 @@ case = {
     'patch_icpp(1)%alpha_rho(3)': 0.7170860221179817,
     'patch_icpp(2)%geometry': 3,
     'patch_icpp(2)%alter_patch(1)': 'T',
-    'patch_icpp(2)%x_centroid': -0.0002,
+    'patch_icpp(2)%x_centroid': 0.0002,
     'patch_icpp(2)%y_centroid': 0.00030000000000000003,
-    'patch_icpp(2)%length_x': 0.0002,
+    'patch_icpp(2)%length_x': 0.0004,
     'patch_icpp(2)%length_y': 0.0006000000000000001,
     'patch_icpp(2)%vel(1)': 988.3657042978061,
     'patch_icpp(2)%vel(2)': 0.0,
@@ -101,7 +101,7 @@ case = {
     'patch_icpp(2)%alpha_rho(3)': 2.765903228169358,
     'patch_icpp(3)%geometry': 2,
     'patch_icpp(3)%alter_patch(1)': 'T',
-    'patch_icpp(3)%x_centroid': 0.0,
+    'patch_icpp(3)%x_centroid': 0.0005,
     'patch_icpp(3)%y_centroid': 0.00030000000000000003,
     'patch_icpp(3)%radius': 5e-05,
     'patch_icpp(3)%vel(1)': 0.0,
