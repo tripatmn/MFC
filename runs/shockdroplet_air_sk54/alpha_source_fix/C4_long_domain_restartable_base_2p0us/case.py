@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""C4: standalone SK54 Mach-3 shock/droplet case on a restartable extended domain.
+"""C3: standalone SK54 Mach-3 shock/droplet case, diffusion ON, reactions ON, 2.0 us.
 
-Based directly on C3_diffusion_ON_reactions_ON_2p0us/case.py, with the
-same physics/numerics, shock/droplet x positions, and a uniform extended
-x grid. Imports only json and has
-no dependency on sibling run folders.
+Resolved from the successful C2 generated inputs; imports only json and
+has no dependency on sibling run folders.
 """
 
 import json
@@ -17,7 +15,6 @@ case = {
     'x_domain%end': 0.0055,
     'y_domain%beg': 0.0,
     'y_domain%end': 0.0006000000000000001,
-    'stretch_x': 'F',
     'm': 1176,
     'n': 128,
     'p': 0,
@@ -54,7 +51,7 @@ case = {
     'bc_y%beg': -3,
     'bc_y%end': -3,
     'precision': 2,
-    'parallel_io': 'T',
+    'parallel_io': 'F',
     'fluid_pp(1)%gamma': 0.7407407407407407,
     'fluid_pp(1)%pi_inf': 835555555.5555555,
     'fluid_pp(1)%cv': 1077.0,
