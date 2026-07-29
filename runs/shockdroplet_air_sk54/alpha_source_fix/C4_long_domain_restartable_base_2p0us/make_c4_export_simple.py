@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib.util
-import json
 import math
 import os
 import re
@@ -26,6 +25,7 @@ import runpy
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-mfc-c4-export-simple")
 
@@ -46,6 +46,8 @@ T_SAVE = 5.0e-8
 GAS_MASS_FLOOR = 1.0e-8
 BOUNDS_TOL = 1.0e-12
 REL_DENOM_EPS = 1.0e-300
+SGM_EPS = 1.0e-16
+PRESSURE_FLOOR_PA = 1.0e2
 LUSTRE_RE = re.compile(r"^lustre_(\d+)\.dat$")
 
 # 0-based conservative variable positions for model_eqns=3, 3 fluids, 2-D.
@@ -64,26 +66,27 @@ VAR_EINT_AIR = 11
 SPECIES_OFFSET = 12
 
 SPECIES_OF_INTEREST = ["NC12H26", "O2", "OH", "HO2", "H2O2", "H2O", "CO", "CO2"]
+RHOY_VARIABLES = [f"rhoY_{species}" for species in SPECIES_OF_INTEREST]
 FRAME_TIMES_US = [0.50, 0.85, 1.00, 1.50, 1.90, 1.95, 2.00, 3.00, 4.00, 5.00]
 FRAME_VARIABLES = [
     "pressure",
     "valid_gas_temperature",
+    "T_intrinsic_gas",
+    "T_proxy_phasic_internal_energy",
     "liquid_alpha",
-    "NC12H26",
-    "O2",
-    "OH",
-    "HO2",
-    "H2O2",
-    "H2O",
-    "CO",
-    "CO2",
+    *SPECIES_OF_INTEREST,
+    *RHOY_VARIABLES,
 ]
 TREND_GROUPS = [
     ("liquid_mass_loss_fraction", "Liquid mass-loss fraction", "liquid_mass_loss_fraction.png"),
     ("vapor_mass", r"Vapor mass [kg m$^{-1}$]", "vapor_mass.png"),
     ("liquid_alpha_area_m2", r"Liquid area [m$^2$]", "liquid_area.png"),
-    ("valid_gas_Tmax_K", "Valid-gas Tmax proxy [K]", "valid_gas_Tmax.png"),
-    ("valid_gas_Tmean_K", "Valid-gas mean temperature proxy [K]", "valid_gas_Tmean.png"),
+    ("pressure_valid_gas_max_Pa", "Valid-gas pressure max [Pa]", "pressure_valid_gas_max.png"),
+    ("pressure_valid_gas_min_Pa", "Valid-gas pressure min [Pa]", "pressure_valid_gas_min.png"),
+    ("valid_gas_Tmax_K", "Valid-gas Tmax, MFC primitive [K]", "valid_gas_Tmax.png"),
+    ("valid_gas_Tmean_K", "Valid-gas mean temperature, MFC primitive [K]", "valid_gas_Tmean.png"),
+    ("valid_gas_T_intrinsic_max_K", "Valid-gas intrinsic Tmax [K]", "valid_gas_T_intrinsic_max.png"),
+    ("valid_gas_T_proxy_max_K", "Valid-gas proxy Tmax [K]", "valid_gas_T_proxy_max.png"),
     ("integrated_NC12H26", r"Integrated NC12H26 [kg m$^{-1}$]", "integrated_NC12H26.png"),
     ("integrated_O2", r"Integrated O2 [kg m$^{-1}$]", "integrated_O2.png"),
     ("integrated_OH", r"Integrated OH [kg m$^{-1}$]", "integrated_OH.png"),
@@ -95,13 +98,9 @@ TREND_GROUPS = [
     ("mass_consistency_relative_error", "Integrated species/gas mass relative error", "mass_consistency.png"),
 ]
 
-# These match the gas constants used by the existing raw shock-droplet analyzer.
-AIR_GAMMA = 1.4
+# Retained only for the explicitly labeled phasic-internal-energy proxy.
 AIR_CV = 739.0
-VAPOR_GAMMA = 1.025
 VAPOR_CV = 1956.0
-R_AIR = (AIR_GAMMA - 1.0) * AIR_CV
-R_VAPOR = (VAPOR_GAMMA - 1.0) * VAPOR_CV
 
 
 @dataclass(frozen=True)
@@ -119,6 +118,66 @@ class C4State:
     time_s: float
     arr: np.ndarray
     grid: C4Grid
+
+
+@dataclass(frozen=True)
+class GasConfig:
+    fluid_ids: tuple[int, ...]
+    alpha_indices: tuple[int, ...]
+    alpha_rho_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class EosConfig:
+    gammas: np.ndarray
+    pi_infs: np.ndarray
+    qvs: np.ndarray
+    mpp_lim: bool
+
+
+@dataclass(frozen=True)
+class ChemistryConstants:
+    molecular_weights: np.ndarray
+    gas_constant: float
+    mechanism: Path
+    phase: str
+    source: str
+
+
+@dataclass(frozen=True)
+class DerivedFields:
+    rho: np.ndarray
+    rho_g: np.ndarray
+    alpha_g: np.ndarray
+    pressure: np.ndarray
+    y_raw: np.ndarray
+    y_primitive: np.ndarray
+    sum_y_raw: np.ndarray
+    T_mfc_primitive: np.ndarray
+    T_intrinsic_gas: np.ndarray
+    T_proxy_phasic_internal_energy: np.ndarray
+    valid_gas: np.ndarray
+
+
+@dataclass
+class ScaleStats:
+    min: float = math.inf
+    max: float = -math.inf
+    pos_min: float = math.inf
+    pos_max: float = -math.inf
+    count: int = 0
+
+    def add(self, values: np.ndarray) -> None:
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            return
+        self.min = min(self.min, float(np.min(finite)))
+        self.max = max(self.max, float(np.max(finite)))
+        positive = finite[finite > 0.0]
+        if positive.size:
+            self.pos_min = min(self.pos_min, float(np.min(positive)))
+            self.pos_max = max(self.pos_max, float(np.max(positive)))
+        self.count += int(finite.size)
 
 
 def load_c3_helper():
@@ -141,6 +200,10 @@ def ff(value) -> float:
         return math.nan
 
 
+def truthy(value: Any) -> bool:
+    return str(value).strip().upper() in {"T", "TRUE", "1", ".TRUE."}
+
+
 def load_case(case_dir: Path) -> dict:
     case_py = case_dir / "case.py"
     ns = runpy.run_path(str(case_py), run_name="__c4_case__")
@@ -159,6 +222,10 @@ def species_index_0based(all_species: list[str], name: str) -> int:
         return SPECIES_OFFSET + all_species.index(name)
     except ValueError as exc:
         raise RuntimeError(f"species {name!r} not found in SK54 mechanism") from exc
+
+
+def species_id_1based(all_species: list[str], name: str) -> int:
+    return all_species.index(name) + 1
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -244,6 +311,58 @@ def read_lustre_file(path: Path, case: dict, grid: C4Grid, all_species: list[str
     return raw_values.reshape((nvars, ny, nx))
 
 
+def gas_config_from_case(case: dict) -> GasConfig:
+    num_fluids = int(case.get("num_fluids", 3))
+    num_gas = int(case.get("chem_gas_num_fluids", 0) or 0)
+    if num_gas > 0:
+        ids = tuple(int(case[f"chem_gas_fluid_ids({idx})"]) for idx in range(1, num_gas + 1))
+    else:
+        ids = (int(case.get("chem_gas_fluid_id", 1)),)
+    if not ids or any(fluid_id < 1 or fluid_id > num_fluids for fluid_id in ids):
+        raise RuntimeError(f"invalid chemistry gas fluid ids {ids}; num_fluids={num_fluids}")
+    alpha_rho = tuple(fluid_id - 1 for fluid_id in ids)
+    alpha = tuple(VAR_ALPHA_LIQ + fluid_id - 1 for fluid_id in ids)
+    return GasConfig(fluid_ids=ids, alpha_indices=alpha, alpha_rho_indices=alpha_rho)
+
+
+def eos_config_from_case(case: dict) -> EosConfig:
+    num_fluids = int(case.get("num_fluids", 3))
+    gammas = np.array([float(case[f"fluid_pp({idx})%gamma"]) for idx in range(1, num_fluids + 1)], dtype=float)
+    pi_infs = np.array([float(case[f"fluid_pp({idx})%pi_inf"]) for idx in range(1, num_fluids + 1)], dtype=float)
+    qvs = np.array([float(case.get(f"fluid_pp({idx})%qv", 0.0)) for idx in range(1, num_fluids + 1)], dtype=float)
+    return EosConfig(gammas=gammas, pi_infs=pi_infs, qvs=qvs, mpp_lim=truthy(case.get("mpp_lim", "F")))
+
+
+def require_cantera_constants(case: dict, all_species: list[str]) -> ChemistryConstants:
+    try:
+        import cantera as ct  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "Cantera is required for exact T_mfc_primitive and T_intrinsic_gas export. "
+            "Install/load the project Cantera environment or run only --dry-run."
+        ) from exc
+    mechanism = REPO / str(case.get("cantera_file", "examples/chemistry_mechanisms/yao_sk54/yao_sk54.yaml"))
+    phase = str(case.get("cantera_phase", "yao_sk54"))
+    gas = ct.Solution(str(mechanism), phase)
+    if list(gas.species_names) != list(all_species):
+        raise RuntimeError("Cantera mechanism species order does not match parsed SK54 species order")
+    return ChemistryConstants(
+        molecular_weights=np.asarray(gas.molecular_weights, dtype=float),
+        gas_constant=float(ct.gas_constant),
+        mechanism=mechanism,
+        phase=phase,
+        source="Cantera",
+    )
+
+
+def cantera_status(case: dict, all_species: list[str]) -> str:
+    try:
+        constants = require_cantera_constants(case, all_species)
+    except Exception as exc:
+        return f"unavailable: {exc}"
+    return f"available: {constants.mechanism} phase={constants.phase}, species={len(constants.molecular_weights)}"
+
+
 def finite_integral(values: np.ndarray, area: np.ndarray) -> tuple[float, int]:
     mask = np.isfinite(values)
     if not np.any(mask):
@@ -251,7 +370,21 @@ def finite_integral(values: np.ndarray, area: np.ndarray) -> tuple[float, int]:
     return float(np.sum(values[mask] * area[mask])), int(values.size - np.count_nonzero(mask))
 
 
-def gas_temperature_proxy(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def species_stack(arr: np.ndarray, all_species: list[str]) -> np.ndarray:
+    return arr[SPECIES_OFFSET:SPECIES_OFFSET + len(all_species)]
+
+
+def chemistry_gas_fields(arr: np.ndarray, gas_cfg: GasConfig) -> tuple[np.ndarray, np.ndarray]:
+    rho_g = np.zeros_like(arr[VAR_ALPHA_RHO_LIQ], dtype=float)
+    alpha_g = np.zeros_like(arr[VAR_ALPHA_LIQ], dtype=float)
+    for idx in gas_cfg.alpha_rho_indices:
+        rho_g = rho_g + arr[idx]
+    for idx in gas_cfg.alpha_indices:
+        alpha_g = alpha_g + arr[idx]
+    return rho_g, alpha_g
+
+
+def gas_temperature_proxy(arr: np.ndarray) -> np.ndarray:
     arho_v = arr[VAR_ALPHA_RHO_VAP]
     arho_a = arr[VAR_ALPHA_RHO_AIR]
     eint_v = arr[VAR_EINT_VAP]
@@ -269,33 +402,103 @@ def gas_temperature_proxy(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     t_g = np.full_like(rho_g, np.nan, dtype=float)
     mask = np.isfinite(weighted) & np.isfinite(rho_g) & (rho_g > 0.0)
     t_g[mask] = weighted[mask] / rho_g[mask]
-    return t_g, rho_g
+    return t_g
 
 
-def valid_gas_mask(arr: np.ndarray, t_gas: np.ndarray) -> np.ndarray:
-    alpha_liq = arr[VAR_ALPHA_LIQ]
-    alpha_g = arr[VAR_ALPHA_VAP] + arr[VAR_ALPHA_AIR]
-    gas_mass = arr[VAR_ALPHA_RHO_VAP] + arr[VAR_ALPHA_RHO_AIR]
-    return (
-        np.isfinite(alpha_liq)
+def mfc_style_primitive_y(stack: np.ndarray, rho_g: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    rho_ref = np.maximum(rho_g, SGM_EPS)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        y_raw = stack / rho_g[None, :, :]
+        y_prim = stack / rho_ref[None, :, :]
+    y_raw[:, ~(np.isfinite(rho_g) & (rho_g > 0.0))] = np.nan
+    y_prim = np.clip(y_prim, 0.0, 1.0)
+    sum_prim = np.sum(y_prim, axis=0)
+    normalize = np.isfinite(sum_prim) & (sum_prim > 1.0)
+    y_prim[:, normalize] = y_prim[:, normalize] / sum_prim[normalize]
+    return y_raw, y_prim
+
+
+def mixture_molecular_weight(y_primitive: np.ndarray, molecular_weights: np.ndarray) -> np.ndarray:
+    with np.errstate(divide="ignore", invalid="ignore"):
+        denom = np.sum(y_primitive / molecular_weights[:, None, None], axis=0)
+        mw = 1.0 / denom
+    mw[~(np.isfinite(mw) & (mw > 0.0))] = np.nan
+    return mw
+
+
+def reconstruct_pressure(arr: np.ndarray, eos: EosConfig) -> tuple[np.ndarray, np.ndarray]:
+    alpha_rho = arr[0:len(eos.gammas)].astype(float, copy=True)
+    alpha = arr[VAR_ALPHA_LIQ:VAR_ALPHA_LIQ + len(eos.gammas)].astype(float, copy=True)
+    if eos.mpp_lim:
+        alpha_rho = np.maximum(alpha_rho, 0.0)
+        alpha = np.clip(alpha, 0.0, 1.0)
+        alpha_sum = np.sum(alpha, axis=0)
+        good_alpha = np.isfinite(alpha_sum) & (alpha_sum > SGM_EPS)
+        alpha[:, good_alpha] = alpha[:, good_alpha] / alpha_sum[good_alpha]
+    rho = np.sum(alpha_rho, axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u = arr[VAR_MOM_X] / rho
+        v = arr[VAR_MOM_Y] / rho
+    dyn_p = 0.5 * (arr[VAR_MOM_X] * u + arr[VAR_MOM_Y] * v)
+    gamma_mix = np.sum(alpha * eos.gammas[:, None, None], axis=0)
+    pi_inf_mix = np.sum(alpha * eos.pi_infs[:, None, None], axis=0)
+    qv_mix = np.sum(alpha_rho * eos.qvs[:, None, None], axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pressure = (arr[VAR_ENERGY] - dyn_p - pi_inf_mix - qv_mix) / gamma_mix
+    pressure = np.where(np.isfinite(pressure), np.maximum(pressure, PRESSURE_FLOOR_PA), np.nan)
+    return pressure, rho
+
+
+def derive_fields(
+    state: C4State,
+    all_species: list[str],
+    gas_cfg: GasConfig,
+    eos: EosConfig,
+    chem: ChemistryConstants,
+) -> DerivedFields:
+    arr = state.arr
+    rho_g, alpha_g = chemistry_gas_fields(arr, gas_cfg)
+    pressure, rho = reconstruct_pressure(arr, eos)
+    stack = species_stack(arr, all_species)
+    y_raw, y_primitive = mfc_style_primitive_y(stack, rho_g)
+    sum_y_raw = np.nansum(y_raw, axis=0)
+    mw = mixture_molecular_weight(y_primitive, chem.molecular_weights)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        T_mfc = pressure * mw / (chem.gas_constant * rho_g)
+        rho_g_intrinsic = rho_g / alpha_g
+        T_intrinsic = pressure * mw / (chem.gas_constant * rho_g_intrinsic)
+    T_mfc[~(np.isfinite(T_mfc) & (T_mfc > 0.0))] = np.nan
+    T_intrinsic[~(np.isfinite(T_intrinsic) & (T_intrinsic > 0.0))] = np.nan
+    T_proxy = gas_temperature_proxy(arr)
+    valid = (
+        np.isfinite(arr[VAR_ALPHA_LIQ])
         & np.isfinite(alpha_g)
-        & np.isfinite(gas_mass)
-        & np.isfinite(t_gas)
+        & np.isfinite(rho_g)
+        & np.isfinite(T_mfc)
         & (alpha_g > 0.5)
-        & (gas_mass > GAS_MASS_FLOOR)
-        & (alpha_liq < 0.5)
+        & (rho_g > GAS_MASS_FLOOR)
+        & (arr[VAR_ALPHA_LIQ] < 0.5)
+    )
+    return DerivedFields(
+        rho=rho,
+        rho_g=rho_g,
+        alpha_g=alpha_g,
+        pressure=pressure,
+        y_raw=y_raw,
+        y_primitive=y_primitive,
+        sum_y_raw=sum_y_raw,
+        T_mfc_primitive=T_mfc,
+        T_intrinsic_gas=T_intrinsic,
+        T_proxy_phasic_internal_energy=T_proxy,
+        valid_gas=valid,
     )
 
 
-def species_stack(arr: np.ndarray, all_species: list[str]) -> np.ndarray:
-    return arr[SPECIES_OFFSET:SPECIES_OFFSET + len(all_species)]
-
-
-def compute_metrics(state: C4State, all_species: list[str]) -> dict:
+def compute_metrics(state: C4State, all_species: list[str], gas_cfg: GasConfig, eos: EosConfig, chem: ChemistryConstants) -> dict:
     arr = state.arr
     area = state.grid.area
-    t_gas, gas_mass = gas_temperature_proxy(arr)
-    valid = valid_gas_mask(arr, t_gas)
+    derived = derive_fields(state, all_species, gas_cfg, eos, chem)
+    valid = derived.valid_gas
     row: dict = {
         "case": "C4_EXPORT",
         "save": state.save,
@@ -305,7 +508,9 @@ def compute_metrics(state: C4State, all_species: list[str]) -> dict:
         "time_s": state.time_s,
         "time_us": state.time_s * 1.0e6,
         "source_layout": "parallel_lustre_direct",
-        "temperature_note": "valid-gas temperature proxy from phasic internal energies in restart save",
+        "temperature_note": "T_mfc_primitive reconstructed from pressure, MW(Y_primitive), and configured chemistry gas density; proxy retained separately",
+        "chemistry_gas_fluid_ids": ",".join(str(i) for i in gas_cfg.fluid_ids),
+        "pressure_floor_Pa": PRESSURE_FLOOR_PA,
         "cell_area_min_m2": float(np.nanmin(area)),
         "cell_area_max_m2": float(np.nanmax(area)),
     }
@@ -315,6 +520,9 @@ def compute_metrics(state: C4State, all_species: list[str]) -> dict:
     row["vapor_mass"] = vapor_mass
     row["nonfinite_liquid_alpha_rho_cells"] = liquid_nonfinite
     row["nonfinite_vapor_alpha_rho_cells"] = vapor_nonfinite
+    gas_mass, gas_nonfinite = finite_integral(derived.rho_g, area)
+    row["integrated_chemistry_gas_mass_full_domain"] = gas_mass
+    row["nonfinite_chemistry_gas_mass_cells"] = gas_nonfinite
     liquid_mask = np.isfinite(arr[VAR_ALPHA_LIQ]) & (arr[VAR_ALPHA_LIQ] >= 0.5)
     row["liquid_alpha_area_m2"] = float(np.sum(area[liquid_mask])) if np.any(liquid_mask) else 0.0
     if np.any(liquid_mask):
@@ -324,27 +532,40 @@ def compute_metrics(state: C4State, all_species: list[str]) -> dict:
     else:
         row["liquid_extent_x_m"] = math.nan
         row["liquid_extent_y_m"] = math.nan
-    tvals = t_gas[valid]
-    row["valid_gas_cell_count"] = int(tvals.size)
-    row["valid_gas_Tmax_K"] = float(np.nanmax(tvals)) if tvals.size else math.nan
-    row["valid_gas_Tmean_K"] = float(np.nanmean(tvals)) if tvals.size else math.nan
+    row["valid_gas_cell_count"] = int(np.count_nonzero(valid))
+    for label, values in [
+        ("pressure_valid_gas", derived.pressure),
+        ("valid_gas_T_mfc", derived.T_mfc_primitive),
+        ("valid_gas_T_intrinsic", derived.T_intrinsic_gas),
+        ("valid_gas_T_proxy", derived.T_proxy_phasic_internal_energy),
+    ]:
+        vals = values[valid]
+        row[f"{label}_min_{'Pa' if 'pressure' in label else 'K'}"] = float(np.nanmin(vals)) if vals.size else math.nan
+        row[f"{label}_max_{'Pa' if 'pressure' in label else 'K'}"] = float(np.nanmax(vals)) if vals.size else math.nan
+        row[f"{label}_mean_{'Pa' if 'pressure' in label else 'K'}"] = float(np.nanmean(vals)) if vals.size else math.nan
+    row["valid_gas_Tmax_K"] = row["valid_gas_T_mfc_max_K"]
+    row["valid_gas_Tmean_K"] = row["valid_gas_T_mfc_mean_K"]
     for species in SPECIES_OF_INTEREST:
-        idx = species_index_0based(all_species, species)
-        mass, _nonfinite = finite_integral(arr[idx], area)
+        sidx = all_species.index(species)
+        cidx = SPECIES_OFFSET + sidx
+        mass, _nonfinite = finite_integral(arr[cidx], area)
         row[f"integrated_{species}"] = mass
-        vals = arr[idx]
+        vals = arr[cidx]
         finite = vals[np.isfinite(vals)]
-        row[f"max_{species}"] = float(np.max(finite)) if finite.size else math.nan
+        row[f"max_rhoY_{species}"] = float(np.max(finite)) if finite.size else math.nan
+        yvals = derived.y_raw[sidx][valid]
+        row[f"max_Y_raw_{species}"] = float(np.nanmax(yvals)) if yvals.size else math.nan
+        row[f"min_Y_raw_{species}"] = float(np.nanmin(yvals)) if yvals.size else math.nan
+        row[f"max_{species}"] = row[f"max_Y_raw_{species}"]
     stack = species_stack(arr, all_species)
-    gas_valid = np.isfinite(gas_mass) & (gas_mass > GAS_MASS_FLOOR) & valid
+    gas_valid = np.isfinite(derived.rho_g) & (derived.rho_g > GAS_MASS_FLOOR) & valid
     if np.any(gas_valid):
-        y = np.full_like(stack, np.nan, dtype=float)
-        y[:, gas_valid] = stack[:, gas_valid] / gas_mass[gas_valid]
-        sum_rhoY = np.nansum(stack[:, gas_valid], axis=0)
-        sumY = sum_rhoY / gas_mass[gas_valid]
+        y = derived.y_raw[:, gas_valid]
+        sum_rhoY = np.sum(stack[:, gas_valid], axis=0)
+        sumY = sum_rhoY / derived.rho_g[gas_valid]
         row["species_negative_rhoY_count"] = int(np.count_nonzero(stack[:, gas_valid] < -BOUNDS_TOL))
-        row["species_negative_Y_count"] = int(np.count_nonzero(y[:, gas_valid] < -BOUNDS_TOL))
-        row["species_Y_above_one_count"] = int(np.count_nonzero(y[:, gas_valid] > 1.0 + BOUNDS_TOL))
+        row["species_negative_Y_count"] = int(np.count_nonzero(y < -BOUNDS_TOL))
+        row["species_Y_above_one_count"] = int(np.count_nonzero(y > 1.0 + BOUNDS_TOL))
         row["species_sumY_min"] = float(np.nanmin(sumY))
         row["species_sumY_max"] = float(np.nanmax(sumY))
         row["species_sumY_max_abs_error"] = float(np.nanmax(np.abs(sumY - 1.0)))
@@ -353,12 +574,12 @@ def compute_metrics(state: C4State, all_species: list[str]) -> dict:
         species_i, _cell_i = np.unravel_index(min_flat, stack[:, gas_valid].shape)
         row["species_min_rhoY"] = float(np.nanmin(stack[:, gas_valid]))
         row["species_min_rhoY_name"] = all_species[species_i]
-        max_y_flat = int(np.nanargmax(y[:, gas_valid]))
-        max_y_species_i, _ = np.unravel_index(max_y_flat, y[:, gas_valid].shape)
-        row["species_max_Y"] = float(np.nanmax(y[:, gas_valid]))
+        max_y_flat = int(np.nanargmax(y))
+        max_y_species_i, _ = np.unravel_index(max_y_flat, y.shape)
+        row["species_max_Y"] = float(np.nanmax(y))
         row["species_max_Y_name"] = all_species[max_y_species_i]
-        row["species_min_Y"] = float(np.nanmin(y[:, gas_valid]))
-        row["integrated_valid_gas_mass"] = float(np.sum(gas_mass[gas_valid] * area[gas_valid]))
+        row["species_min_Y"] = float(np.nanmin(y))
+        row["integrated_valid_gas_mass"] = float(np.sum(derived.rho_g[gas_valid] * area[gas_valid]))
         row["integrated_valid_gas_sum_rhoY"] = float(np.sum(sum_rhoY * area[gas_valid]))
         row["mass_consistency_integrated_diff"] = row["integrated_valid_gas_sum_rhoY"] - row["integrated_valid_gas_mass"]
         row["mass_consistency_relative_error"] = (
@@ -435,20 +656,54 @@ def fuel_inventory_rows(rows: list[dict]) -> list[dict]:
     return out
 
 
-def field_array(state: C4State, variable: str, all_species: list[str]) -> tuple[np.ndarray | None, np.ndarray, str, str, np.ndarray]:
+def field_array(
+    state: C4State,
+    variable: str,
+    all_species: list[str],
+    derived: DerivedFields,
+) -> tuple[np.ndarray | None, np.ndarray, str, str, np.ndarray, str]:
     arr = state.arr
-    t_gas, _gas_mass = gas_temperature_proxy(arr)
-    valid = valid_gas_mask(arr, t_gas)
+    valid = derived.valid_gas
     alpha = arr[VAR_ALPHA_LIQ]
     if variable == "pressure":
-        return None, valid, "Pressure unavailable in conservative Lustre restart save", "Pa", alpha
-    if variable == "valid_gas_temperature":
-        return np.where(valid, t_gas, np.nan), valid, "Valid-gas temperature proxy", "K", alpha
+        return derived.pressure, np.isfinite(derived.pressure), "Pressure reconstructed from model-3 conservative EOS", "Pa", alpha, "finite reconstructed pressure"
+    if variable in {"valid_gas_temperature", "T_mfc_primitive"}:
+        return (
+            np.where(valid, derived.T_mfc_primitive, np.nan),
+            valid,
+            "T_mfc_primitive: p*MW(Y_primitive)/(R*rho_g)",
+            "K",
+            alpha,
+            "valid gas mask",
+        )
+    if variable == "T_intrinsic_gas":
+        return (
+            np.where(valid, derived.T_intrinsic_gas, np.nan),
+            valid,
+            "T_intrinsic_gas: p*MW(Y_primitive)/(R*(rho_g/alpha_g))",
+            "K",
+            alpha,
+            "valid gas mask",
+        )
+    if variable == "T_proxy_phasic_internal_energy":
+        return (
+            np.where(valid, derived.T_proxy_phasic_internal_energy, np.nan),
+            valid,
+            "Proxy gas temperature from phasic internal energies",
+            "K",
+            alpha,
+            "valid gas mask; proxy quantity",
+        )
     if variable == "liquid_alpha":
-        return alpha, np.isfinite(alpha), "Liquid alpha", "dimensionless", alpha
+        return alpha, np.isfinite(alpha), "Liquid alpha", "dimensionless", alpha, "finite full-domain field mask"
+    if variable.startswith("rhoY_"):
+        species = variable[5:]
+        values = arr[species_index_0based(all_species, species)]
+        return values, np.isfinite(values), f"rhoY_{species} conservative partial density", r"kg m$^{-3}$", alpha, "finite full-domain rhoY mask"
     if variable in SPECIES_OF_INTEREST:
-        values = arr[species_index_0based(all_species, variable)]
-        return values, np.isfinite(values), f"{variable} partial density", r"kg m$^{-3}$", alpha
+        sidx = all_species.index(variable)
+        values = np.where(valid, derived.y_raw[sidx], np.nan)
+        return values, valid, f"Y_{variable} raw mass fraction", "dimensionless", alpha, "valid gas mask; raw rhoY/rho_g"
     raise ValueError(variable)
 
 
@@ -456,33 +711,49 @@ def edges(values: np.ndarray) -> np.ndarray:
     return base.edges(values)
 
 
-def choose_scale(values: np.ndarray, variable: str) -> dict:
-    finite = values[np.isfinite(values)]
-    if finite.size == 0:
-        return {"available": False, "log": False, "vmin": 0.0, "vmax": 1.0}
+def choose_scale_from_stats(variable: str, stats: ScaleStats | None) -> dict | None:
+    if stats is None or stats.count == 0:
+        return None
     if variable == "liquid_alpha":
-        return {"available": True, "log": False, "vmin": 0.0, "vmax": 1.0}
+        return {"available": True, "log": False, "vmin": 0.0, "vmax": 1.0, "shared": True}
     use_log = False
-    vmin = float(np.nanmin(finite))
-    vmax = float(np.nanmax(finite))
-    if variable in SPECIES_OF_INTEREST:
-        pos = finite[finite > 0.0]
-        if pos.size:
-            pmin = float(np.min(pos))
-            pmax = float(np.max(pos))
-            if pmax / max(pmin, 1.0e-300) >= 1.0e4 and pmax > 0.0:
+    vmin = stats.min
+    vmax = stats.max
+    if variable in SPECIES_OF_INTEREST or variable.startswith("rhoY_"):
+        if math.isfinite(stats.pos_min) and math.isfinite(stats.pos_max):
+            if stats.pos_max / max(stats.pos_min, 1.0e-300) >= 1.0e4 and stats.pos_max > 0.0:
                 use_log = True
-                vmin = max(pmin, pmax * 1.0e-10)
-                vmax = pmax
+                vmin = max(stats.pos_min, stats.pos_max * 1.0e-10)
+                vmax = stats.pos_max
             else:
                 vmin = min(0.0, vmin)
-                vmax = pmax
+                vmax = stats.pos_max
     if not math.isfinite(vmin) or not math.isfinite(vmax) or vmax <= vmin:
         vmax = vmin + 1.0
-    return {"available": True, "log": use_log, "vmin": vmin, "vmax": vmax}
+    return {"available": True, "log": use_log, "vmin": vmin, "vmax": vmax, "shared": True}
 
 
-def save_npz(path: Path, state: C4State, variable: str, values: np.ndarray, valid_mask: np.ndarray, alpha: np.ndarray) -> None:
+def choose_scale(values: np.ndarray, variable: str, scale_override: dict | None = None) -> dict:
+    if scale_override is not None:
+        return scale_override
+    stats = ScaleStats()
+    stats.add(values)
+    scale = choose_scale_from_stats(variable, stats)
+    if scale is None:
+        return {"available": False, "log": False, "vmin": 0.0, "vmax": 1.0, "shared": False}
+    scale["shared"] = False
+    return scale
+
+
+def save_npz(
+    path: Path,
+    state: C4State,
+    variable: str,
+    values: np.ndarray,
+    valid_mask: np.ndarray,
+    alpha: np.ndarray,
+    mask_description: str,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         path,
@@ -494,18 +765,27 @@ def save_npz(path: Path, state: C4State, variable: str, values: np.ndarray, vali
         raw_step=np.array(state.save),
         variable=np.array(variable),
         valid_mask=valid_mask,
-        mask_description=np.array("valid gas mask" if variable == "valid_gas_temperature" else "finite full-domain field mask"),
+        mask_description=np.array(mask_description),
         alpha_liq=alpha,
     )
 
 
-def draw_field(path: Path, state: C4State, variable: str, values: np.ndarray, alpha: np.ndarray, label: str, unit: str) -> bool:
+def draw_field(
+    path: Path,
+    state: C4State,
+    variable: str,
+    values: np.ndarray,
+    alpha: np.ndarray,
+    label: str,
+    unit: str,
+    scale_override: dict | None = None,
+) -> tuple[bool, dict]:
     finite = values[np.isfinite(values)]
     if finite.size == 0:
-        return False
-    scale = choose_scale(values, variable)
+        return False, {"available": False, "log": False, "vmin": math.nan, "vmax": math.nan, "shared": False}
+    scale = choose_scale(values, variable, scale_override)
     if not scale["available"]:
-        return False
+        return False, scale
     fig, ax = plt.subplots(figsize=(9.2, 4.5), constrained_layout=True)
     if scale["log"]:
         mesh = ax.pcolormesh(
@@ -526,7 +806,7 @@ def draw_field(path: Path, state: C4State, variable: str, values: np.ndarray, al
             vmin=scale["vmin"],
             vmax=scale["vmax"],
         )
-    if np.nanmin(alpha) <= 0.5 <= np.nanmax(alpha):
+    if np.any(np.isfinite(alpha)) and np.nanmin(alpha) <= 0.5 <= np.nanmax(alpha):
         ax.contour(state.grid.x * 1.0e6, state.grid.y * 1.0e6, alpha, levels=[0.5], colors="white", linewidths=1.1)
         ax.contour(state.grid.x * 1.0e6, state.grid.y * 1.0e6, alpha, levels=[0.5], colors="black", linewidths=0.35)
     cb = fig.colorbar(mesh, ax=ax, pad=0.02)
@@ -534,17 +814,46 @@ def draw_field(path: Path, state: C4State, variable: str, values: np.ndarray, al
     ax.set_xlabel("x [µm]")
     ax.set_ylabel("y [µm]")
     ax.set_aspect("equal", adjustable="box")
-    ax.set_title(f"C4 {variable}, save {state.save}, t={state.time_s * 1e6:.2f} µs")
+    shared = "shared scale" if scale.get("shared") else "frame scale"
+    ax.set_title(f"C4 {variable}, save {state.save}, t={state.time_s * 1e6:.2f} µs ({shared})")
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=190)
     plt.close(fig)
-    return True
+    return True, scale
 
 
 def nearest_save(target_us: float, saves: list[int]) -> int | None:
     if not saves:
         return None
     return min(saves, key=lambda save: abs(save * T_SAVE * 1.0e6 - target_us))
+
+
+def collect_frame_scales(
+    files: list[tuple[int, Path]],
+    frame_saves: set[int],
+    case: dict,
+    grid: C4Grid,
+    all_species: list[str],
+    gas_cfg: GasConfig,
+    eos: EosConfig,
+    chem: ChemistryConstants,
+) -> dict[str, dict]:
+    by_save = dict(files)
+    stats = {variable: ScaleStats() for variable in FRAME_VARIABLES}
+    for save in sorted(frame_saves):
+        if save not in by_save:
+            continue
+        state = C4State(save=save, time_s=save * T_SAVE, arr=read_lustre_file(by_save[save], case, grid, all_species), grid=grid)
+        derived = derive_fields(state, all_species, gas_cfg, eos, chem)
+        for variable in FRAME_VARIABLES:
+            values, _valid_mask, _label, _unit, _alpha, _mask_desc = field_array(state, variable, all_species, derived)
+            if values is not None:
+                stats[variable].add(values)
+    return {
+        variable: scale
+        for variable, stat in stats.items()
+        if (scale := choose_scale_from_stats(variable, stat)) is not None
+    }
 
 
 def make_trend_plots(rows: list[dict], out_dir: Path) -> None:
@@ -567,6 +876,9 @@ def export_case(args: argparse.Namespace) -> None:
     out = args.c3_export_out.resolve()
     case = load_case(case_dir)
     all_species = species_names()
+    gas_cfg = gas_config_from_case(case)
+    eos = eos_config_from_case(case)
+    chem = require_cantera_constants(case, all_species)
     files = selected_files(find_lustre_files(case_dir), args.saves)
     if not files:
         raise RuntimeError("zero saves selected")
@@ -577,10 +889,12 @@ def export_case(args: argparse.Namespace) -> None:
     frame_saves = {save for save, _ in files} if args.saves else {
         save for target in FRAME_TIMES_US for save in [nearest_save(target, [s for s, _ in files])] if save is not None
     }
+    shared_scales = collect_frame_scales(files, frame_saves, case, grid, all_species, gas_cfg, eos, chem)
     for save, path in files:
         print(f"[info] reading save {save}: {path}")
         state = C4State(save=save, time_s=save * T_SAVE, arr=read_lustre_file(path, case, grid, all_species), grid=grid)
-        rows.append(compute_metrics(state, all_species))
+        derived = derive_fields(state, all_species, gas_cfg, eos, chem)
+        rows.append(compute_metrics(state, all_species, gas_cfg, eos, chem))
         time_rows.append({
             "case": "C4_EXPORT",
             "save": save,
@@ -592,7 +906,7 @@ def export_case(args: argparse.Namespace) -> None:
         })
         if save in frame_saves:
             for variable in FRAME_VARIABLES:
-                values, valid_mask, label, unit, alpha = field_array(state, variable, all_species)
+                values, valid_mask, label, unit, alpha, mask_desc = field_array(state, variable, all_species, derived)
                 row = {
                     "save": save,
                     "raw_step": save,
@@ -611,13 +925,18 @@ def export_case(args: argparse.Namespace) -> None:
                 stem = f"{variable}_save{save:03d}_t{state.time_s * 1e6:.2f}us"
                 npz = out / "field_data" / variable / f"{stem}.npz"
                 png = out / "field_frames" / variable / f"{stem}.png"
-                save_npz(npz, state, variable, values, valid_mask, alpha)
-                png_ok = draw_field(png, state, variable, values, alpha, label, unit)
+                save_npz(npz, state, variable, values, valid_mask, alpha, mask_desc)
+                png_ok, scale = draw_field(png, state, variable, values, alpha, label, unit, shared_scales.get(variable))
                 row.update({
                     "status": "written" if png_ok else "partial",
                     "reason": "" if png_ok else "PNG write failed",
                     "npz": str(npz.relative_to(out)),
                     "png": str(png.relative_to(out)) if png_ok else "",
+                    "scale_shared": "T" if scale.get("shared") else "F",
+                    "scale_log": "T" if scale.get("log") else "F",
+                    "scale_vmin": scale.get("vmin", math.nan),
+                    "scale_vmax": scale.get("vmax", math.nan),
+                    "mask_description": mask_desc,
                 })
                 frame_manifest.append(row)
     add_liquid_loss(rows)
@@ -655,10 +974,16 @@ def export_case(args: argparse.Namespace) -> None:
         f"saves: {[save for save, _ in files]}",
         f"timeseries_rows: {len(rows)}",
         f"frame_manifest_rows: {len(frame_manifest)}",
+        f"chemistry_gas_fluid_ids: {gas_cfg.fluid_ids}",
+        f"Cantera mechanism: {chem.mechanism}",
+        f"Cantera phase: {chem.phase}",
         "",
         "Reader reused from git history commit 26f832d3: find_lustre_files/read_lustre_file pattern from analyze_tanabe_restart_lustre.py.",
-        "Pressure is unavailable in conservative Lustre restart saves and is skipped.",
-        "Valid-gas temperature is a proxy reconstructed from phasic internal energies, as in the prior Lustre analyzer.",
+        "Pressure is exactly reconstructed from the model-3 conservative EOS using case fluid gamma/pi_inf/qv parameters and MFC's 100 Pa pressure floor.",
+        "T_mfc_primitive is reconstructed as p*MW(Y_primitive)/(R*rho_g), where Y_primitive follows MFC clip-to-[0,1] and normalize-only-if-sum>1 behavior.",
+        "T_intrinsic_gas uses p*MW(Y_primitive)/(R*(rho_g/alpha_g)) for gas-phase interpretation in diffuse-interface cells.",
+        "T_proxy_phasic_internal_energy is retained as a labeled proxy only.",
+        "Bare species frame variables are raw mass fractions Y_k=rhoY_k/rho_g; rhoY_<species> frame variables retain conservative partial-density exports.",
         "No MFC post_process, temporary cases, or shell-outs are used.",
     ]
     (out / "c4_export_summary.txt").write_text("\n".join(summary) + "\n")
@@ -669,28 +994,60 @@ def dry_run(args: argparse.Namespace) -> None:
     case_dir = args.raw_case.resolve()
     case = load_case(case_dir)
     all_species = species_names()
+    gas_cfg = gas_config_from_case(case)
+    eos = eos_config_from_case(case)
     print(f"repo: {REPO}")
     print(f"raw_case: {case_dir}")
     print(f"output: {args.c3_export_out.resolve()}")
     print("prior reader: commit 26f832d3 analyze_tanabe_restart_lustre.py")
     print(f"case m,n,p: {case.get('m')}, {case.get('n')}, {case.get('p')}")
+    print(f"model_eqns: {case.get('model_eqns')} num_fluids: {case.get('num_fluids')}")
     print(f"expected nvars: {expected_nvars(case, all_species)}")
+    print(f"chemistry gas fluid ids: {gas_cfg.fluid_ids}")
+    print(f"chemistry gas alpha indices 1-based conservative: {[idx + 1 for idx in gas_cfg.alpha_indices]}")
+    print(f"chemistry gas alpha_rho indices 1-based conservative: {[idx + 1 for idx in gas_cfg.alpha_rho_indices]}")
+    print(f"mpp_lim: {eos.mpp_lim}")
+    print("fluid EOS parameters:")
+    for i, (gamma, pi_inf, qv) in enumerate(zip(eos.gammas, eos.pi_infs, eos.qvs), start=1):
+        print(f"  fluid {i}: gamma={gamma:.16g} pi_inf={pi_inf:.16g} qv={qv:.16g}")
     print("verified mappings:")
     print("  alpha_rho_liquid = conservative variable 1 -> lustre index 0")
     print("  vapor_alpha_rho  = conservative variable 2 -> lustre index 1")
     print("  air_alpha_rho    = conservative variable 3 -> lustre index 2")
+    print("  momentum_x       = conservative variable 4 -> lustre index 3")
+    print("  momentum_y       = conservative variable 5 -> lustre index 4")
+    print("  total_energy     = conservative variable 6 -> lustre index 5")
     print("  alpha_liquid     = conservative variable 7 -> lustre index 6")
     print("  alpha_vapor      = conservative variable 8 -> lustre index 7")
     print("  alpha_air        = conservative variable 9 -> lustre index 8")
-    print(f"  rhoY_NC12H26     = conservative variable {species_index_0based(all_species, 'NC12H26') + 1}")
-    print(f"  rhoY_O2          = conservative variable {species_index_0based(all_species, 'O2') + 1}")
-    files = find_lustre_files(case_dir)
-    selected = selected_files(files, args.saves)
-    print(f"discovered_saves_count: {len(files)}")
-    print(f"discovered_save_range: {files[0][0]}..{files[-1][0]}")
-    print(f"selected_saves: {[save for save, _ in selected]}")
-    grid = make_grid(case_dir, case)
-    print(f"grid: nx={grid.x.size}, ny={grid.y.size}, dx=[{grid.dx.min():.8e},{grid.dx.max():.8e}], dy=[{grid.dy.min():.8e},{grid.dy.max():.8e}]")
+    for species in SPECIES_OF_INTEREST:
+        print(
+            f"  rhoY_{species:<8} = species id {species_id_1based(all_species, species):2d} "
+            f"-> conservative variable {species_index_0based(all_species, species) + 1}"
+        )
+    print(f"Cantera exact-temperature support: {cantera_status(case, all_species)}")
+    try:
+        files = find_lustre_files(case_dir)
+    except RuntimeError as exc:
+        print(f"restart_data discovery: unavailable in this environment ({exc})")
+        files = []
+    if files:
+        selected = selected_files(files, args.saves)
+        print(f"discovered_saves_count: {len(files)}")
+        print(f"discovered_save_range: {files[0][0]}..{files[-1][0]}")
+        print(f"selected_saves: {[save for save, _ in selected]}")
+        try:
+            grid = make_grid(case_dir, case)
+        except RuntimeError as exc:
+            print(f"grid: unavailable ({exc})")
+        else:
+            print(
+                f"grid: nx={grid.x.size}, ny={grid.y.size}, "
+                f"dx=[{grid.dx.min():.8e},{grid.dx.max():.8e}], "
+                f"dy=[{grid.dy.min():.8e},{grid.dy.max():.8e}]"
+            )
+    else:
+        print("discovered_saves_count: 0 (dry-run still verified case parsing and variable mappings)")
 
 
 def parse_args() -> argparse.Namespace:
