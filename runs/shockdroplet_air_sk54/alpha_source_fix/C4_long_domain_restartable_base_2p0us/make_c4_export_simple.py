@@ -48,6 +48,7 @@ BOUNDS_TOL = 1.0e-12
 REL_DENOM_EPS = 1.0e-300
 SGM_EPS = 1.0e-16
 PRESSURE_FLOOR_PA = 1.0e2
+GAS_CONSTANT_J_PER_KMOL_K = 8314.46261815324
 LUSTRE_RE = re.compile(r"^lustre_(\d+)\.dat$")
 
 # 0-based conservative variable positions for model_eqns=3, 3 fluids, 2-D.
@@ -333,34 +334,138 @@ def eos_config_from_case(case: dict) -> EosConfig:
     return EosConfig(gammas=gammas, pi_infs=pi_infs, qvs=qvs, mpp_lim=truthy(case.get("mpp_lim", "F")))
 
 
-def require_cantera_constants(case: dict, all_species: list[str]) -> ChemistryConstants:
+def molecular_weight_from_composition(composition: dict[str, float]) -> float:
+    # Atomic weights in kg/kmol numerically match g/mol; this is the unit
+    # convention used with the universal gas constant below.
+    atomic_weights = {
+        "H": 1.00794,
+        "C": 12.0107,
+        "O": 15.9994,
+        "N": 14.0067,
+        "Ar": 39.948,
+    }
+    total = 0.0
+    for element, count in composition.items():
+        if element not in atomic_weights:
+            raise RuntimeError(f"unsupported element {element!r} in mechanism composition")
+        total += atomic_weights[element] * float(count)
+    return total
+
+
+def parse_inline_composition(text: str) -> dict[str, float]:
+    text = text.strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        raise RuntimeError(f"unsupported inline composition format: {text!r}")
+    out: dict[str, float] = {}
+    body = text[1:-1].strip()
+    if not body:
+        return out
+    for part in body.split(","):
+        key, value = part.split(":", 1)
+        out[key.strip()] = float(value.strip())
+    return out
+
+
+def parse_mechanism_without_yaml(mechanism: Path, phase: str) -> tuple[list[str], dict[str, dict[str, float]]]:
+    lines = mechanism.read_text().splitlines()
+    phase_species: list[str] | None = None
+    for idx, line in enumerate(lines):
+        if line.strip() == f"- name: {phase}":
+            collected: list[str] = []
+            for subline in lines[idx + 1:]:
+                stripped = subline.strip()
+                if stripped.startswith("kinetics:") or stripped.startswith("transport:"):
+                    break
+                if stripped.startswith("species:"):
+                    collected.append(stripped.split("[", 1)[1] if "[" in stripped else "")
+                    if "]" in stripped:
+                        break
+                    continue
+                if collected:
+                    collected.append(stripped)
+                    if "]" in stripped:
+                        break
+            joined = " ".join(collected).replace("[", "").replace("]", "")
+            phase_species = [item.strip() for item in joined.split(",") if item.strip()]
+            break
+    if phase_species is None:
+        raise RuntimeError(f"could not find phase {phase!r} in {mechanism}")
+
+    compositions: dict[str, dict[str, float]] = {}
+    in_species = False
+    current: str | None = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "species:":
+            in_species = True
+            continue
+        if not in_species:
+            continue
+        if stripped.startswith("- name:"):
+            current = stripped.split(":", 1)[1].strip()
+            continue
+        if current and stripped.startswith("composition:"):
+            compositions[current] = parse_inline_composition(stripped.split(":", 1)[1].strip())
+            current = None
+    return phase_species, compositions
+
+
+def load_mechanism_species_and_compositions(
+    mechanism: Path,
+    phase: str,
+) -> tuple[list[str], dict[str, dict[str, float]], str]:
     try:
-        import cantera as ct  # type: ignore
-    except Exception as exc:
-        raise RuntimeError(
-            "Cantera is required for exact T_mfc_primitive and T_intrinsic_gas export. "
-            "Install/load the project Cantera environment or run only --dry-run."
-        ) from exc
+        import yaml  # type: ignore
+    except Exception:
+        phase_species, compositions = parse_mechanism_without_yaml(mechanism, phase)
+        return phase_species, compositions, "mechanism YAML fallback parser"
+
+    data = yaml.safe_load(mechanism.read_text())
+    phase_species = None
+    for phase_entry in data.get("phases", []):
+        if phase_entry.get("name") == phase:
+            phase_species = list(phase_entry.get("species", []))
+            break
+    if phase_species is None:
+        raise RuntimeError(f"could not find phase {phase!r} in {mechanism}")
+    compositions = {
+        entry["name"]: dict(entry.get("composition", {}))
+        for entry in data.get("species", [])
+    }
+    return phase_species, compositions, "mechanism YAML via yaml.safe_load"
+
+
+def load_chemistry_constants(case: dict, all_species: list[str]) -> ChemistryConstants:
     mechanism = REPO / str(case.get("cantera_file", "examples/chemistry_mechanisms/yao_sk54/yao_sk54.yaml"))
     phase = str(case.get("cantera_phase", "yao_sk54"))
-    gas = ct.Solution(str(mechanism), phase)
-    if list(gas.species_names) != list(all_species):
-        raise RuntimeError("Cantera mechanism species order does not match parsed SK54 species order")
+    phase_species, compositions, source = load_mechanism_species_and_compositions(mechanism, phase)
+    if list(phase_species) != list(all_species):
+        raise RuntimeError("mechanism YAML species order does not match parsed SK54 species order")
+    missing = [species for species in all_species if species not in compositions]
+    if missing:
+        raise RuntimeError(f"mechanism YAML is missing species definitions: {missing}")
+    molecular_weights = np.array(
+        [molecular_weight_from_composition(compositions[species]) for species in all_species],
+        dtype=float,
+    )
     return ChemistryConstants(
-        molecular_weights=np.asarray(gas.molecular_weights, dtype=float),
-        gas_constant=float(ct.gas_constant),
+        molecular_weights=molecular_weights,
+        gas_constant=GAS_CONSTANT_J_PER_KMOL_K,
         mechanism=mechanism,
         phase=phase,
-        source="Cantera",
+        source=source,
     )
 
 
-def cantera_status(case: dict, all_species: list[str]) -> str:
+def chemistry_constants_status(case: dict, all_species: list[str]) -> str:
     try:
-        constants = require_cantera_constants(case, all_species)
+        constants = load_chemistry_constants(case, all_species)
     except Exception as exc:
         return f"unavailable: {exc}"
-    return f"available: {constants.mechanism} phase={constants.phase}, species={len(constants.molecular_weights)}"
+    return (
+        f"available: {constants.mechanism} phase={constants.phase}, "
+        f"species={len(constants.molecular_weights)}, source={constants.source}"
+    )
 
 
 def finite_integral(values: np.ndarray, area: np.ndarray) -> tuple[float, int]:
@@ -878,7 +983,7 @@ def export_case(args: argparse.Namespace) -> None:
     all_species = species_names()
     gas_cfg = gas_config_from_case(case)
     eos = eos_config_from_case(case)
-    chem = require_cantera_constants(case, all_species)
+    chem = load_chemistry_constants(case, all_species)
     files = selected_files(find_lustre_files(case_dir), args.saves)
     if not files:
         raise RuntimeError("zero saves selected")
@@ -975,8 +1080,9 @@ def export_case(args: argparse.Namespace) -> None:
         f"timeseries_rows: {len(rows)}",
         f"frame_manifest_rows: {len(frame_manifest)}",
         f"chemistry_gas_fluid_ids: {gas_cfg.fluid_ids}",
-        f"Cantera mechanism: {chem.mechanism}",
-        f"Cantera phase: {chem.phase}",
+        f"Mechanism YAML: {chem.mechanism}",
+        f"Mechanism phase: {chem.phase}",
+        f"Molecular-weight source: {chem.source}",
         "",
         "Reader reused from git history commit 26f832d3: find_lustre_files/read_lustre_file pattern from analyze_tanabe_restart_lustre.py.",
         "Pressure is exactly reconstructed from the model-3 conservative EOS using case fluid gamma/pi_inf/qv parameters and MFC's 100 Pa pressure floor.",
@@ -1025,7 +1131,7 @@ def dry_run(args: argparse.Namespace) -> None:
             f"  rhoY_{species:<8} = species id {species_id_1based(all_species, species):2d} "
             f"-> conservative variable {species_index_0based(all_species, species) + 1}"
         )
-    print(f"Cantera exact-temperature support: {cantera_status(case, all_species)}")
+    print(f"mechanism molecular-weight support: {chemistry_constants_status(case, all_species)}")
     try:
         files = find_lustre_files(case_dir)
     except RuntimeError as exc:
