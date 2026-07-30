@@ -44,6 +44,8 @@ module m_time_steppers
 
     use m_chemistry, only: s_compute_chemistry_gas_density
 
+    use m_phase_change, only: phase_change_fuel_mass_coupling_fix_enabled
+
     use m_variables_conversion, only: s_convert_conservative_to_primitive_variables
 
     use m_body_forces
@@ -1080,6 +1082,7 @@ contains
         if (.not. relax) return
         if (.not. chemistry) return
         if (.not. evap_species_source) return
+        if (phase_change_fuel_mass_coupling_fix_enabled) return
         if (fuel_species_id < 1 .or. fuel_species_id > (chemxe - chemxb + 1)) return
 
         fuel_species_eqn = chemxb + fuel_species_id - 1

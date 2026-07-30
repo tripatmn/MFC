@@ -5,6 +5,8 @@
 !> @brief Reads and validates user inputs, loads existing grid/IC data, and initializes pre-process modules
 module m_start_up
 
+    use iso_fortran_env, only: output_unit
+
     use m_derived_types         !< Definitions of the derived types
 
     use m_global_parameters     !< Global parameters for the code
@@ -103,6 +105,67 @@ module m_start_up
     procedure(s_read_abstract_ic_data_files), pointer :: s_read_ic_data_files => null()
 
 contains
+
+    logical function f_temp_init_species_rhoy_rescale_enabled()
+
+        character(len=32) :: env_value
+        integer :: env_status
+
+        env_value = ""
+        call get_environment_variable("TEMP_INIT_SPECIES_RHOY_RESCALE", env_value, status=env_status)
+        f_temp_init_species_rhoy_rescale_enabled = env_status == 0 .and. trim(env_value) == "1"
+
+    end function f_temp_init_species_rhoy_rescale_enabled
+
+    impure subroutine s_temp_init_species_rhoy_rescale(q_cons)
+
+        type(scalar_field), dimension(sys_size), intent(inout) :: q_cons
+
+        integer :: j, k, l, species_eqn, gas_idx, fluid_id
+        real(wp) :: rho_g, sum_rhoY, scale_factor
+
+        if (.not. chemistry) return
+        if (.not. f_temp_init_species_rhoy_rescale_enabled()) return
+
+        if (proc_rank == 0) then
+            write (output_unit, '(A)') "TEMP_INIT_SPECIES_RHOY_RESCALE enabled"
+            call flush(output_unit)
+        end if
+
+        do l = 0, p
+            do k = 0, n
+                do j = 0, m
+                    rho_g = 0._wp
+                    if (num_fluids == 1) then
+                        rho_g = q_cons(contxe)%sf(j, k, l)
+                    elseif (chem_gas_num_fluids <= 0) then
+                        fluid_id = chem_gas_fluid_id
+                        if (fluid_id >= 1 .and. fluid_id <= num_fluids) &
+                            rho_g = q_cons(contxb + fluid_id - 1)%sf(j, k, l)
+                    else
+                        do gas_idx = 1, chem_gas_num_fluids
+                            fluid_id = chem_gas_fluid_ids(gas_idx)
+                            if (fluid_id >= 1 .and. fluid_id <= num_fluids) &
+                                rho_g = rho_g + q_cons(contxb + fluid_id - 1)%sf(j, k, l)
+                        end do
+                    end if
+                    if (rho_g <= verysmall) cycle
+
+                    sum_rhoY = 0._wp
+                    do species_eqn = chemxb, chemxe
+                        sum_rhoY = sum_rhoY + q_cons(species_eqn)%sf(j, k, l)
+                    end do
+                    if (abs(sum_rhoY) <= verysmall) cycle
+
+                    scale_factor = rho_g/sum_rhoY
+                    do species_eqn = chemxb, chemxe
+                        q_cons(species_eqn)%sf(j, k, l) = scale_factor*q_cons(species_eqn)%sf(j, k, l)
+                    end do
+                end do
+            end do
+        end do
+
+    end subroutine s_temp_init_species_rhoy_rescale
 
     !>  Reads the configuration file pre_process.inp, in order to
         !!      populate the parameters in module m_global_parameters.f90
@@ -809,6 +872,8 @@ contains
 
             call s_infinite_relaxation_k(q_cons_vf)
         end if
+
+        call s_temp_init_species_rhoy_rescale(q_cons_vf)
 
         call s_write_data_files(q_cons_vf, q_prim_vf, bc_type)
 

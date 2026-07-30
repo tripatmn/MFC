@@ -28,7 +28,8 @@ module m_phase_change
     public :: s_initialize_phasechange_module, &
               s_relaxation_solver, &
               s_infinite_relaxation_k, &
-              s_finalize_relaxation_solver_module
+              s_finalize_relaxation_solver_module, &
+              phase_change_fuel_mass_coupling_fix_enabled
 
     !> @name Parameters for the first order transition phase change
     !> @{
@@ -44,8 +45,10 @@ module m_phase_change
     !> @{
     real(wp) :: A, B, C, D
     !> @}
+    logical :: phase_change_fuel_mass_coupling_fix_enabled = .false.
+    real(wp), parameter :: phase_change_fuel_mass_tolerance = 1.e-12_wp
 
-    $:GPU_DECLARE(create='[A,B,C,D]')
+    $:GPU_DECLARE(create='[A,B,C,D,phase_change_fuel_mass_coupling_fix_enabled]')
 
 contains
 
@@ -97,6 +100,10 @@ contains
         !!      selecting the phase change module that will be used
         !!      (pT- or pTg-equilibrium)
     impure subroutine s_initialize_phasechange_module
+#ifdef MFC_SIMULATION
+        character(len=32) :: env_value
+        integer :: env_status
+#endif
         ! variables used in the calculation of the saturation curves for fluids 1 and 2
         A = (gs_min(lp)*cvs(lp) - gs_min(vp)*cvs(vp) &
              + qvps(vp) - qvps(lp))/((gs_min(vp) - 1.0_wp)*cvs(vp))
@@ -108,6 +115,17 @@ contains
 
         D = ((gs_min(lp) - 1.0_wp)*cvs(lp)) &
             /((gs_min(vp) - 1.0_wp)*cvs(vp))
+
+#ifdef MFC_SIMULATION
+        env_value = ""
+        call get_environment_variable("TEMP_PHASE_CHANGE_FUEL_MASS_COUPLING_FIX", env_value, status=env_status)
+        phase_change_fuel_mass_coupling_fix_enabled = env_status == 0 .and. trim(env_value) == "1"
+        $:GPU_UPDATE(device='[phase_change_fuel_mass_coupling_fix_enabled]')
+        if (phase_change_fuel_mass_coupling_fix_enabled .and. proc_rank == 0) then
+            write (output_unit, '(A)') "TEMP_PHASE_CHANGE_FUEL_MASS_COUPLING_FIX enabled"
+            call flush(output_unit)
+        end if
+#endif
 
     end subroutine s_initialize_phasechange_module
 
@@ -131,7 +149,8 @@ contains
         real(wp) :: pS, pSOV, pSSL !< equilibrium pressure for mixture, overheated vapor, and subcooled liquid
         real(wp) :: TS, TSOV, TSSL, TSatOV, TSatSL !< equilibrium temperature for mixture, overheated vapor, and subcooled liquid. Saturation Temperatures at overheated vapor and subcooled liquid
         real(wp) :: rhoe, dynE, rhos !< total internal energy, kinetic energy, and total entropy
-        real(wp) :: rho, rM, m1, m2, m2_after, MCT !< total density, total reacting mass, individual reacting masses
+        real(wp) :: rho, rM, m1, m2, m2_after, delta_m_vapor, MCT !< total density, total reacting mass, individual reacting masses
+        real(wp) :: fuel_before_coupling, fuel_candidate
         real(wp) :: TvF !< total volume fraction
         logical :: pt_state_ok, ptg_state_ok
 
@@ -148,6 +167,14 @@ contains
         integer :: i, j, k, l
 
 #ifdef MFC_SIMULATION
+        integer :: insufficient_fuel_count, report_step, report_stage
+
+        insufficient_fuel_count = 0
+        report_step = -1
+        report_stage = -1
+        if (present(t_step_diag)) report_step = t_step_diag
+        if (present(stage_diag)) report_stage = stage_diag
+
         if (present(t_step_diag)) then
             if (present(stage_diag)) then
                 call s_zhang_evap_hang_trace(t_step_diag, stage_diag, "S_INFINITE_RELAXATION_K_BEGIN")
@@ -158,7 +185,7 @@ contains
 #endif
 
         ! starting equilibrium solver
-        $:GPU_PARALLEL_LOOP(collapse=3, private='[i,j,k,l,p_infOV, p_infpT, p_infSL, sk, hk, gk, ek, rhok,pS, pSOV, pSSL, TS, TSOV, TSatOV, TSatSL, TSSL, rhoe, dynE, rhos, rho, rM, m1, m2, m2_after, MCT, TvF, pt_state_ok, ptg_state_ok]')
+        $:GPU_PARALLEL_LOOP(collapse=3, private='[i,j,k,l,p_infOV, p_infpT, p_infSL, sk, hk, gk, ek, rhok,pS, pSOV, pSSL, TS, TSOV, TSatOV, TSatSL, TSSL, rhoe, dynE, rhos, rho, rM, m1, m2, m2_after, delta_m_vapor, MCT, TvF, pt_state_ok, ptg_state_ok, fuel_before_coupling, fuel_candidate]', reduction='[[insufficient_fuel_count]]', reductionOp='[+]')
         do j = 0, m
             do k = 0, n
                 do l = 0, p
@@ -362,7 +389,20 @@ contains
 
 #ifdef MFC_SIMULATION
                     m2_after = q_cons_vf(vp + contxb - 1)%sf(j, k, l)
-                    m_dot_evap%sf(j, k, l) = (m2_after - m2)/relax_dt
+                    delta_m_vapor = m2_after - m2
+                    m_dot_evap%sf(j, k, l) = delta_m_vapor/relax_dt
+                    if (chemistry .and. evap_species_source .and. &
+                        phase_change_fuel_mass_coupling_fix_enabled .and. &
+                        fuel_species_id >= 1 .and. fuel_species_id <= (chemxe - chemxb + 1)) then
+                        fuel_before_coupling = q_cons_vf(chemxb + fuel_species_id - 1)%sf(j, k, l)
+                        fuel_candidate = fuel_before_coupling + delta_m_vapor
+                        if (delta_m_vapor < 0._wp .and. &
+                            fuel_candidate < -phase_change_fuel_mass_tolerance) then
+                            insufficient_fuel_count = insufficient_fuel_count + 1
+                        else
+                            q_cons_vf(chemxb + fuel_species_id - 1)%sf(j, k, l) = fuel_candidate
+                        end if
+                    end if
 #endif
                 end do
             end do
@@ -370,6 +410,15 @@ contains
         $:END_GPU_PARALLEL_LOOP()
 
 #ifdef MFC_SIMULATION
+        if (phase_change_fuel_mass_coupling_fix_enabled .and. insufficient_fuel_count > 0) then
+            write (output_unit, '(&
+                &"TEMP_PHASE_CHANGE_FUEL_MASS_COUPLING insufficient_fuel=T",&
+                &" count=",I0," tolerance=",ES16.8," t_step=",I0," stage=",I0," rank=",I0)') &
+                insufficient_fuel_count, phase_change_fuel_mass_tolerance, report_step, report_stage, proc_rank
+            call flush(output_unit)
+            call s_mpi_abort("TEMP_PHASE_CHANGE_FUEL_MASS_COUPLING insufficient NC12H26 for signed condensation removal")
+        end if
+
         if (present(t_step_diag)) then
             if (present(stage_diag)) then
                 call s_zhang_evap_hang_trace(t_step_diag, stage_diag, "S_INFINITE_RELAXATION_K_END")

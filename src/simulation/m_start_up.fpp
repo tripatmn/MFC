@@ -1079,6 +1079,7 @@ contains
         end if
         call s_initialize_mpi_common_module()
         call s_initialize_mpi_proxy_module()
+        call s_initialize_chemistry_module()
         call s_initialize_variables_conversion_module()
         if (grid_geometry == 3) call s_initialize_fftw_module()
 
