@@ -43,6 +43,7 @@ def _case(root: Path) -> None:
         "m=3\nn=0\np=0\nmodel_eqns=3\nnum_fluids=2\nchemistry=T\n"
         "parallel_io=F\ncfl_adap_dt=T\nt_save=5e-6\nmpp_lim=T\n"
         "cantera_file='mechanism.yaml'\ncantera_phase='gas'\n"
+        "fuel_species_id=1\n"
         "chem_gas_fluid_id=2\nevap_liquid_fluid_id=1\nevap_alpha_thresh=0.01\n"
         "chem_reaction_heat_enable=T\n"
         "fluid_pp(1)%gamma=2\nfluid_pp(1)%pi_inf=0\nfluid_pp(1)%qv=0\n"
@@ -101,6 +102,13 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual(len(result["rows"]), 3)
             self.assertEqual([row["time_us"] for row in result["rows"]], [0.0, 5.0, 10.0])
             self.assertAlmostEqual(result["rows"][0]["integrated_rhoY_NC12H26"], 0.25)
+            self.assertAlmostEqual(result["rows"][0]["integrated_rhoY_O2"], 1.0)
+            self.assertAlmostEqual(result["rows"][0]["gas_mass_weighted_Y_NC12H26"], 0.05)
+            self.assertAlmostEqual(result["rows"][0]["liquid_NC12H26_inventory"], 2.1)
+            self.assertAlmostEqual(result["rows"][0]["vapor_NC12H26_inventory"], 0.25)
+            self.assertAlmostEqual(result["rows"][0]["total_NC12H26_inventory"], 2.35)
+            self.assertAlmostEqual(result["rows"][0]["liquid_area_alpha_gt_0p5"], 2.0)
+            self.assertAlmostEqual(result["rows"][0]["liquid_area_ratio_A_A0"], 1.0)
             self.assertAlmostEqual(result["rows"][0]["combustible_area"], 2.0)
             self.assertEqual(result["rows"][0]["spatial_measure_unit"], "m")
             with (analysis / "scalar_timeseries.csv").open(newline="") as stream:
@@ -144,7 +152,7 @@ class AnalysisTests(unittest.TestCase):
             clean_trends = analysis / "clean_trends"
             with contextlib.redirect_stdout(io.StringIO()):
                 default_plots = plot_history(analysis, out_dir=clean_trends)
-            self.assertEqual(len(default_plots["files"]), 5)
+            self.assertEqual(len(default_plots["files"]), 8)
             self.assertEqual(
                 {path.name for path in clean_trends.glob("*.png")},
                 {
@@ -153,6 +161,9 @@ class AnalysisTests(unittest.TestCase):
                     "radicals_OH_HO2_H2O2.png",
                     "hot_combustible_overlap_area.png",
                     "hot_near_stoich_overlap_area.png",
+                    "near_stoichiometric_area.png",
+                    "liquid_area_ratio_A_A0.png",
+                    "dodecane_inventory.png",
                 },
             )
             with self.assertRaisesRegex(FileExistsError, "output directory is not empty.*--overwrite"):

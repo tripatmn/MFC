@@ -19,7 +19,8 @@ from .reconstruction import Model3Configuration, reconstruct_model3
 from .sources import PAllSource
 
 
-INTEGRATED_SPECIES = ("NC12H26", "OH", "HO2", "H2O2", "CO", "CO2", "H2O")
+INTEGRATED_SPECIES = ("NC12H26", "O2", "OH", "HO2", "H2O2", "CO", "CO2", "H2O")
+PRESENTATION_SPECIES = ("NC12H26", "O2", "OH", "HO2", "H2O2", "CO", "CO2", "H2O")
 MAX_SPECIES = ("NC12H26", "OH", "CO2", "H2O")
 O2_FLOOR = 1.0e-12
 COMBUSTIBLE_PHI = (0.5, 2.0)
@@ -65,7 +66,7 @@ def analyze_case(
     _progress(context, f"startup: discovered p_all path: {report['path']}")
     _progress(context, f"startup: saves discovered: {discovered_count}")
     config = Model3Configuration.from_metadata(metadata)
-    _validate_species(config)
+    _validate_species(config, metadata)
     source = PAllSource(root, metadata)
     indices, selection = _select_indices(
         report["timeline"], selected_times_us, time_range_us, stride
@@ -124,6 +125,7 @@ def analyze_case(
     if not rows:
         raise RuntimeError("analysis produced zero scalar records; no output written")
     rows.sort(key=lambda row: (row["physical_time_s"], row["saved_index"]))
+    _add_presentation_columns(rows)
     source_files = sorted(set().union(*(set(row.pop("source_files")) for row in rows)))
     quality = [
         {"saved_index": row["saved_index"], "time_us": row["time_us"], **row.pop("quality")}
@@ -161,7 +163,7 @@ def _metadata(inspection: dict[str, Any]) -> RunMetadata:
     )
 
 
-def _validate_species(config: Model3Configuration) -> None:
+def _validate_species(config: Model3Configuration, metadata: RunMetadata) -> None:
     required = set(INTEGRATED_SPECIES) | set(MAX_SPECIES) | {"O2"}
     by_casefold: dict[str, list[str]] = {}
     for name in config.species_names:
@@ -169,6 +171,16 @@ def _validate_species(config: Model3Configuration) -> None:
     invalid = [name for name in sorted(required) if len(by_casefold.get(name.casefold(), [])) != 1]
     if invalid:
         raise ValueError(f"required analysis species are absent or ambiguous: {invalid}")
+    fuel_id = int(metadata.parameters.get("fuel_species_id", 0))
+    if not 1 <= fuel_id <= len(config.species_names):
+        raise ValueError(
+            "fuel_species_id is required to identify the designated liquid as NC12H26"
+        )
+    if config.species_names[fuel_id - 1].casefold() != "nc12h26":
+        raise ValueError(
+            "fuel_species_id does not resolve to NC12H26; liquid and total dodecane "
+            "inventories would be ambiguous"
+        )
 
 
 def _select_indices(timeline, selected_times_us, time_range_us, stride):
@@ -250,6 +262,34 @@ def _accumulate(states: Iterable[State], config: Model3Configuration) -> ScalarP
             values = fields[f"rhoY[{species_names[species]}]"]
             mask = finite_weights & np.isfinite(values)
             _add(result.sums, f"integrated_rhoY_{species}", np.sum(values[mask] * weights[mask], dtype=np.float64))
+        gas_density = fields["gas_density"]
+        gas_mass_mask = valid_gas & np.isfinite(gas_density) & (gas_density > 0.0)
+        _add(
+            result.sums, "valid_gas_mass",
+            np.sum(gas_density[gas_mass_mask] * weights[gas_mass_mask], dtype=np.float64),
+        )
+        for species in PRESENTATION_SPECIES:
+            values = fields[f"Y[{species_names[species]}]"]
+            mask = gas_mass_mask & np.isfinite(values)
+            _add(
+                result.sums, f"valid_gas_species_mass_{species}",
+                np.sum(gas_density[mask] * values[mask] * weights[mask], dtype=np.float64),
+            )
+        raw_liquid = np.asarray(
+            state.fields[f"partial_density[{config.liquid_fluid_id}]"].values,
+            dtype=np.float64,
+        ).reshape(-1)
+        liquid_mass_mask = finite_weights & np.isfinite(raw_liquid)
+        _add(
+            result.sums, "liquid_NC12H26_inventory",
+            np.sum(raw_liquid[liquid_mass_mask] * weights[liquid_mass_mask], dtype=np.float64),
+        )
+        alpha_liq = fields[f"alpha[{config.liquid_fluid_id}]"]
+        liquid_area_mask = masks["mask.valid"] & finite_weights & np.isfinite(alpha_liq) & (alpha_liq > 0.5)
+        _add(
+            result.sums, "liquid_area_alpha_gt_0p5",
+            np.sum(weights[liquid_area_mask], dtype=np.float64),
+        )
         temperature = fields["temperature"]
         tmask = valid_gas & np.isfinite(temperature)
         _add(result.sums, "valid_gas_temperature_weighted_sum", np.sum(temperature[tmask] * weights[tmask], dtype=np.float64))
@@ -332,12 +372,28 @@ def _reduce(partial: ScalarPartial, comm, mpi, dimensions: int) -> dict[str, Any
         return None
     spatial_unit = {1: "m", 2: "m2", 3: "m3"}.get(dimensions, "case_measure")
     integrated_unit = {1: "kg/m2", 2: "kg/m", 3: "kg"}.get(dimensions, "case_mass_measure")
+    internal_sums = {
+        "valid_gas_temperature_weighted_sum", "valid_gas_area", "valid_gas_mass",
+        *(f"valid_gas_species_mass_{name}" for name in PRESENTATION_SPECIES),
+    }
     record = {
-        **{name: float(value) for name, value in sums.items() if name not in {"valid_gas_temperature_weighted_sum", "valid_gas_area"}},
+        **{name: float(value) for name, value in sums.items() if name not in internal_sums},
         **{name: (float(value) if np.isfinite(value) else None) for name, value in maxima.items()},
         "mean_valid_gas_temperature_K": (
             float(sums["valid_gas_temperature_weighted_sum"] / sums["valid_gas_area"])
             if sums.get("valid_gas_area", 0.0) > 0.0 else None
+        ),
+        **{
+            f"gas_mass_weighted_Y_{name}": (
+                float(sums.get(f"valid_gas_species_mass_{name}", 0.0) / sums["valid_gas_mass"])
+                if sums.get("valid_gas_mass", 0.0) > 0.0 else None
+            )
+            for name in PRESENTATION_SPECIES
+        },
+        "vapor_NC12H26_inventory": float(sums.get("integrated_rhoY_NC12H26", 0.0)),
+        "total_NC12H26_inventory": float(
+            sums.get("liquid_NC12H26_inventory", 0.0)
+            + sums.get("integrated_rhoY_NC12H26", 0.0)
         ),
         "spatial_measure_unit": spatial_unit,
         "integrated_rhoY_unit": integrated_unit,
@@ -356,6 +412,15 @@ def _row(saved_index, timeline, reduced):
         "physical_time_s": physical_time, "time_us": physical_time * 1.0e6,
         **reduced,
     }
+
+
+def _add_presentation_columns(rows: list[dict[str, Any]]) -> None:
+    reference_area = rows[0].get("liquid_area_alpha_gt_0p5")
+    for row in rows:
+        row["liquid_area_ratio_A_A0"] = (
+            float(row["liquid_area_alpha_gt_0p5"] / reference_area)
+            if reference_area is not None and reference_area > 0.0 else None
+        )
 
 
 def _stoich_coefficient(config: Model3Configuration) -> float:
@@ -404,6 +469,17 @@ def _provenance(root, report, config, context, strategy, indices, selection, str
             "combustible": "0.5 <= phi <= 2.0",
             "near_stoichiometric": "0.8 <= phi <= 1.2",
             "hot_overlap": "T > 1200 K intersected with combustible or near-stoichiometric mask",
+            "liquid_area": "cell measure where reconstructed alpha_liq > 0.5",
+            "liquid_area_ratio": "A/A0 where A0 is the first chronological analyzed row",
+            "gas_mass_weighted_species": (
+                "integral(rho_g * bounded normalized Y_k dV) / integral(rho_g dV) "
+                "over chemistry-valid AND gas-dominated cells"
+            ),
+            "dodecane_inventories": (
+                "liquid=raw conservative partial density of evap_liquid_fluid_id; "
+                "vapor=raw conservative rhoY_NC12H26; total=liquid+vapor; "
+                "fuel_species_id is verified as NC12H26"
+            ),
         },
         "reductions": {
             "spatial": [
@@ -420,11 +496,15 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     columns = [
         "saved_index", "simulation_step", "physical_time_s", "time_us",
         *(f"integrated_rhoY_{name}" for name in INTEGRATED_SPECIES),
+        "liquid_NC12H26_inventory", "vapor_NC12H26_inventory",
+        "total_NC12H26_inventory",
+        *(f"gas_mass_weighted_Y_{name}" for name in PRESENTATION_SPECIES),
         "max_valid_gas_temperature_K", "mean_valid_gas_temperature_K",
         *(f"max_Y_{name}" for name in MAX_SPECIES),
         "hot_gas_area_above_1200K", "hot_gas_area_above_1500K",
         "combustible_area", "near_stoichiometric_area",
         "hot_combustible_overlap_area", "hot_near_stoich_overlap_area",
+        "liquid_area_alpha_gt_0p5", "liquid_area_ratio_A_A0",
         "integrated_rhoY_unit", "spatial_measure_unit",
     ]
     temporary = path.with_name(f".{path.name}.tmp")

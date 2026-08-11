@@ -32,6 +32,17 @@ FIELD_LABELS = {
     "near_stoichiometric_area": ("Near-stoichiometric gas", "Area / volume"),
     "hot_combustible_overlap_area": ("Hot-combustible overlap", "Area / volume"),
     "hot_near_stoich_overlap_area": ("Hot-near-stoichiometric overlap", "Area / volume"),
+    "liquid_area_alpha_gt_0p5": ("Liquid area", "Area / volume"),
+    "liquid_area_ratio_A_A0": ("Liquid area ratio", "A / A0"),
+    "liquid_NC12H26_inventory": ("Liquid NC12H26", "Conservative inventory"),
+    "vapor_NC12H26_inventory": ("Gas NC12H26", "Conservative inventory"),
+    "total_NC12H26_inventory": ("Total NC12H26", "Conservative inventory"),
+    **{
+        f"gas_mass_weighted_Y_{name}": (
+            f"Gas-mass-weighted Y({name})", "Gas-mass-weighted mass fraction"
+        )
+        for name in ("NC12H26", "O2", "OH", "HO2", "H2O2", "CO", "CO2", "H2O")
+    },
 }
 
 TREND_SPECS = {
@@ -40,12 +51,12 @@ TREND_SPECS = {
         "title": "Maximum valid-gas temperature", "ylabel": "Temperature (K)",
     },
     "products_CO2_H2O": {
-        "fields": ("integrated_rhoY_CO2", "integrated_rhoY_H2O"),
-        "title": "Product inventories", "ylabel": "Conservative inventory",
+        "fields": ("gas_mass_weighted_Y_CO2", "gas_mass_weighted_Y_H2O"),
+        "title": "Gas-phase products", "ylabel": "Gas-mass-weighted mass fraction",
     },
     "radicals_OH_HO2_H2O2": {
-        "fields": ("integrated_rhoY_OH", "integrated_rhoY_HO2", "integrated_rhoY_H2O2"),
-        "title": "Radical inventories", "ylabel": "Conservative inventory",
+        "fields": ("gas_mass_weighted_Y_OH", "gas_mass_weighted_Y_HO2", "gas_mass_weighted_Y_H2O2"),
+        "title": "Gas-phase radicals", "ylabel": "Gas-mass-weighted mass fraction",
     },
     "hot_combustible_overlap_area": {
         "fields": ("hot_combustible_overlap_area",),
@@ -55,12 +66,30 @@ TREND_SPECS = {
         "fields": ("hot_near_stoich_overlap_area",),
         "title": "Hot-near-stoichiometric overlap", "ylabel": "Area / volume",
     },
+    "near_stoichiometric_area": {
+        "fields": ("near_stoichiometric_area",),
+        "title": "Near-stoichiometric gas area", "ylabel": "Area / volume",
+    },
+    "liquid_area_ratio_A_A0": {
+        "fields": ("liquid_area_ratio_A_A0",),
+        "title": "Liquid area ratio", "ylabel": "A / A0",
+    },
+    "dodecane_inventory": {
+        "fields": (
+            "liquid_NC12H26_inventory", "vapor_NC12H26_inventory",
+            "total_NC12H26_inventory",
+        ),
+        "title": "Dodecane inventory", "ylabel": "Conservative inventory",
+    },
 }
 
 PLOT_SETS = {
     "thermal": ("valid_gas_temperature_max",),
-    "species": ("products_CO2_H2O", "radicals_OH_HO2_H2O2"),
-    "mixing": ("hot_combustible_overlap_area", "hot_near_stoich_overlap_area"),
+    "species": ("products_CO2_H2O", "radicals_OH_HO2_H2O2", "dodecane_inventory"),
+    "mixing": (
+        "hot_combustible_overlap_area", "hot_near_stoich_overlap_area",
+        "near_stoichiometric_area", "liquid_area_ratio_A_A0",
+    ),
     "all": tuple(TREND_SPECS),
     "default": tuple(TREND_SPECS),
 }
@@ -125,7 +154,10 @@ def plot_history(
             flush=True,
         )
         ylabel = spec["ylabel"]
-        if all(name.startswith("integrated_rhoY_") for name in spec["fields"]):
+        if all(
+            name.startswith("integrated_rhoY_") or name.endswith("_NC12H26_inventory")
+            for name in spec["fields"]
+        ):
             ylabel = f"{ylabel} ({rows[0].get('integrated_rhoY_unit') or 'case units'})"
         elif all(name.endswith("area") or "_area_" in name for name in spec["fields"]):
             ylabel = f"{ylabel} ({rows[0].get('spatial_measure_unit') or 'case units'})"
@@ -189,6 +221,15 @@ def _individual_spec(name: str) -> dict:
 def _series_label(name: str) -> str:
     if name.startswith("integrated_rhoY_"):
         return name.removeprefix("integrated_rhoY_")
+    if name.startswith("gas_mass_weighted_Y_"):
+        return name.removeprefix("gas_mass_weighted_Y_")
+    inventory_labels = {
+        "liquid_NC12H26_inventory": "liquid",
+        "vapor_NC12H26_inventory": "vapor / gas",
+        "total_NC12H26_inventory": "total",
+    }
+    if name in inventory_labels:
+        return inventory_labels[name]
     return FIELD_LABELS[name][0]
 
 

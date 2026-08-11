@@ -20,8 +20,11 @@ from .sources import PAllSource
 
 
 RENDER_FIELDS = ("temperature", "OH", "NC12H26", "O2", "phi", "alpha_liq")
-DEFAULT_PHI_LEVELS = (0.5, 1.0, 2.0)
+DEFAULT_PHI_LEVELS = (1.0,)
 O2_FLOOR = 1.0e-12
+LIQUID_CONTOUR_LEVEL = 0.5
+LIQUID_CONTOUR_COLOR = "#00a6c8"
+LIQUID_CONTOUR_WIDTH = 1.1
 
 FIELD_STYLE = {
     "temperature": ("Temperature", "Temperature [K]", "inferno"),
@@ -106,7 +109,11 @@ def render_case(
 
     source = PAllSource(root, metadata)
     raw_fields = tuple(str(item["name"]) for item in metadata.equation_layout)
-    load_symbols = tuple(dict.fromkeys(canonical_fields + (canonical_overlay or ())))
+    # alpha_liq is a visual context field for every render, even when it is not
+    # itself requested as a plotted field.
+    load_symbols = tuple(dict.fromkeys(
+        canonical_fields + (canonical_overlay or ()) + ("alpha_liq",)
+    ))
     ranges = {symbol: [float("inf"), float("-inf")] for symbol in load_symbols}
     all_sources: set[str] = set()
     cached: dict[int, dict[str, Any]] = {}
@@ -399,14 +406,15 @@ def _render_field(destination, selection, symbol, assembled, limits, config, cou
     figure = None
     try:
         figure, axis = plt.subplots(figsize=(10.0, 4.2), constrained_layout=True)
-        cmap = plt.get_cmap(cmap_name).copy()
-        cmap.set_bad("#eeeeee")
+        _draw_liquid_underlay(axis, assembled)
+        cmap = plt.get_cmap(cmap_name).with_extremes(bad=(0.0, 0.0, 0.0, 0.0))
         image = axis.pcolormesh(
             assembled["x_bounds"] * 1.0e6, assembled["y_bounds"] * 1.0e6,
             np.ma.masked_invalid(plotted), cmap=cmap, vmin=limits[0], vmax=limits[1],
             shading="flat", rasterized=True,
         )
         figure.colorbar(image, ax=axis, pad=0.02).set_label(colorbar_label)
+        liquid_contour_drawn = _draw_liquid_contour(axis, assembled)
         _clean_axes(axis, f"{title}, t = {selection['actual_time_us']:.2f} us")
         figure.savefig(path, dpi=180)
     except Exception as exc:
@@ -419,6 +427,7 @@ def _render_field(destination, selection, symbol, assembled, limits, config, cou
         "raw_range": _range_dict(raw_values), "plotted_range": _range_dict(plotted),
         "color_limits": {"minimum": limits[0], "maximum": limits[1]},
         "mask_policy": mask_policy, "counts": counts,
+        "liquid_context": _liquid_context_record(liquid_contour_drawn),
         "species_equation_index": (
             config.equation_indices[f"species_density[{_actual_species(config, symbol)}]"]
             if symbol in {"OH", "NC12H26", "O2"} else None
@@ -445,8 +454,10 @@ def _render_overlay(destination, selection, overlay, levels, assembled, base_lim
     figure = None
     try:
         figure, axis = plt.subplots(figsize=(10.0, 4.2), constrained_layout=True)
-        cmap = plt.get_cmap(FIELD_STYLE[base][2]).copy()
-        cmap.set_bad("#eeeeee")
+        _draw_liquid_underlay(axis, assembled)
+        cmap = plt.get_cmap(FIELD_STYLE[base][2]).with_extremes(
+            bad=(0.0, 0.0, 0.0, 0.0),
+        )
         image = axis.pcolormesh(
             assembled["x_bounds"] * 1.0e6, assembled["y_bounds"] * 1.0e6,
             np.ma.masked_invalid(base_values), cmap=cmap,
@@ -460,9 +471,14 @@ def _render_overlay(destination, selection, overlay, levels, assembled, base_lim
                 x_centers, y_centers, np.ma.masked_invalid(contour_values),
                 levels=drawn_levels, colors="white", linewidths=1.0,
             )
+        liquid_contour_drawn = _draw_liquid_contour(axis, assembled)
+        contour_description = (
+            f"{FIELD_STYLE[contour][0].lower()} = {levels[0]:g} contour"
+            if len(levels) == 1 else f"{FIELD_STYLE[contour][0].lower()} contours"
+        )
         _clean_axes(
             axis,
-            f"{FIELD_STYLE[base][0]} with {FIELD_STYLE[contour][0].lower()} contours, "
+            f"{FIELD_STYLE[base][0]} with {contour_description}, "
             f"t = {selection['actual_time_us']:.2f} us",
         )
         figure.savefig(path, dpi=180)
@@ -476,7 +492,58 @@ def _render_overlay(destination, selection, overlay, levels, assembled, base_lim
         "path": str(path), "levels_requested": list(levels), "levels_drawn": drawn_levels,
         "base_color_limits": {"minimum": base_limits[0], "maximum": base_limits[1]},
         "base_mask_policy": base_policy, "overlay_mask_policy": contour_policy, "counts": counts,
+        "liquid_context": _liquid_context_record(liquid_contour_drawn),
     }
+
+
+def _draw_liquid_underlay(axis, assembled):
+    """Show reconstructed liquid fraction wherever the gas field is masked."""
+    import matplotlib.colors as colors
+
+    alpha = np.asarray(assembled["fields"]["alpha_liq"], dtype=np.float64)
+    valid = np.asarray(assembled["masks"]["mask.valid"], dtype=bool)
+    liquid_cmap = colors.LinearSegmentedColormap.from_list(
+        "mfc_post_liquid_context", ("#f4f9fb", "#9bd8e5"),
+    ).with_extremes(bad=(0.0, 0.0, 0.0, 0.0))
+    axis.pcolormesh(
+        assembled["x_bounds"] * 1.0e6, assembled["y_bounds"] * 1.0e6,
+        np.ma.masked_invalid(np.where(valid, alpha, np.nan)),
+        cmap=liquid_cmap, vmin=0.0, vmax=1.0, shading="flat", rasterized=True,
+    )
+
+
+def _draw_liquid_contour(axis, assembled):
+    alpha = np.asarray(assembled["fields"]["alpha_liq"], dtype=np.float64)
+    valid = np.asarray(assembled["masks"]["mask.valid"], dtype=bool)
+    alpha = np.where(valid, alpha, np.nan)
+    alpha_range = _range(alpha)
+    drawn = (
+        alpha_range[0] is not None
+        and alpha_range[0] <= LIQUID_CONTOUR_LEVEL <= alpha_range[1]
+        and alpha_range[0] < alpha_range[1]
+    )
+    if drawn:
+        x_centers = (assembled["x_bounds"][:-1] + assembled["x_bounds"][1:]) * 0.5e6
+        y_centers = (assembled["y_bounds"][:-1] + assembled["y_bounds"][1:]) * 0.5e6
+        axis.contour(
+            x_centers, y_centers, np.ma.masked_invalid(alpha),
+            levels=(LIQUID_CONTOUR_LEVEL,), colors=LIQUID_CONTOUR_COLOR,
+            linewidths=LIQUID_CONTOUR_WIDTH,
+        )
+    return drawn
+
+
+def _liquid_context_record(contour_drawn):
+    record = {
+        "underlay": "reconstructed alpha_liq on valid cells beneath masked field values",
+        "contour": {
+            "field": "alpha_liq", "level": LIQUID_CONTOUR_LEVEL,
+            "color": LIQUID_CONTOUR_COLOR, "linewidth": LIQUID_CONTOUR_WIDTH,
+        },
+    }
+    if contour_drawn is not None:
+        record["contour"]["drawn"] = bool(contour_drawn)
+    return record
 
 
 def _clean_axes(axis, title):
@@ -615,7 +682,11 @@ def _provenance(config, source_files, limits, overlay, levels):
             "temperature": "chemistry-clipped temperature; chemistry-valid AND gas-dominated",
             "species_and_phi": "gas-phase fields; valid AND gas-dominated",
             "alpha_liq": "solver-reconstructed liquid volume fraction over valid cells",
-            "masked_color": "light gray; no in-image mask legend or provenance annotation",
+            "masked_regions": (
+                "transparent field pixels reveal a pale alpha_liq underlay; invalid cells remain "
+                "transparent; no in-image mask legend or provenance annotation"
+            ),
+            "liquid_context": _liquid_context_record(None),
             "overlay": (
                 {"base": overlay[0], "contour": overlay[1], "levels": list(levels)}
                 if overlay else None

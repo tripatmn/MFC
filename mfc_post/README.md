@@ -15,7 +15,7 @@ mpiexec -n 8 ./mfc-post process /path/to/case --execution mpi
   --no-mp4 --out-dir /path/to/render_clean
 ./mfc-post render /path/to/case \
   --time-range-us 0,10 --stride 2 --fields temperature \
-  --overlay temperature,phi --overlay-levels 0.5,1.0,2.0 \
+  --overlay temperature,phi \
   --no-mp4 --out-dir /path/to/render_clean_overlay
 ./mfc-post analyze /path/to/case --selected-times-us 0,5,10 \
   --out-dir /path/to/analysis
@@ -74,22 +74,33 @@ Clean rendering chooses nearest requested saves or an inclusive physical-time
 range followed by stride. It writes one subdirectory per field plus
 `manifest.json` and `provenance.json`; it never computes scalar history, trends,
 or MP4 output. Static PNGs contain only a concise title, micrometer axes, and a
-colorbar. All frames for a field share batch-wide color limits. Temperature is
+colorbar. All frames for a field share batch-wide color limits. Each frame has
+a thin `alpha_liq = 0.5` contour; masked gas-field pixels reveal a pale
+reconstructed-liquid-fraction underlay instead of an unexplained gray blob.
+Temperature is
 chemistry-clipped and chemistry-valid/gas-dominated masked; species images use
 gas-phase `Y_k`, and `phi` uses the configured mechanism molecular weights.
 `--overlay temperature,phi` adds clean equivalence-ratio contour lines with
-default levels 0.5, 1.0, and 2.0.
+default level 1.0. Pass `--overlay-levels 0.5,1.0,2.0` only when multiple
+equivalence-ratio contours are wanted.
 
 Scalar analysis writes `scalar_timeseries.csv`, `quality.json`, and
 `provenance.json`. Raw conservative species inventories are integrated using
 the actual cell measures; temperature, mass-fraction, hot-region, combustible,
-and overlap diagnostics use the recorded valid-gas policy. MPI runs assign
+and overlap diagnostics use the recorded valid-gas policy. Presentation
+columns include gas-mass-weighted species fractions, liquid area and `A/A0`,
+and separate liquid, vapor, and total NC12H26 inventories. `A0` is the first
+chronological state in the selected analysis, so a full-history run should
+include the initial save. MPI runs assign
 whole states to workers when temporal concurrency is favorable and otherwise
 reduce spatial partitions. Rank 0 orders and writes the sole history.
 
 Trend plotting reads only `scalar_timeseries.csv`; it does not rediscover the
 case or open `p_all`. The default/all set writes stable clean temperature,
-product, radical, hot-combustible, and hot-near-stoichiometric PNG names.
+product, radical, hot-region, near-stoichiometric, liquid-area-ratio, and
+dodecane-inventory PNG names. Product and radical presentation curves are
+gas-mass-weighted mass fractions; conservative integrated `rhoY` fields remain
+available through `--fields`.
 `--plot-set` also accepts `species`, `thermal`, or `mixing`; `--fields` writes
 individual requested CSV series. The manifest records the CSV hash and exact
 series used by each PNG.

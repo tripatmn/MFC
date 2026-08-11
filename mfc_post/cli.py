@@ -60,8 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--overlay", help="BASE,CONTOUR overlay, for example temperature,phi",
     )
     render_parser.add_argument(
-        "--overlay-levels", default="0.5,1.0,2.0",
-        help="comma-separated contour levels (default: 0.5,1.0,2.0)",
+        "--overlay-levels", default="1.0",
+        help="comma-separated contour levels (default: 1.0)",
     )
     analyze_parser = subparsers.add_parser(
         "analyze", help="compute an MPI-compatible scalar history from raw p_all saves"

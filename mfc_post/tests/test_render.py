@@ -70,7 +70,7 @@ class RenderTests(unittest.TestCase):
             result = render_case(
                 root, fields=RENDER_FIELDS, out_dir=out, execution="serial",
                 time_range_us=(0.0, 10.0), stride=2, no_mp4=True,
-                overlay=("temperature", "phi"), overlay_levels=(0.5, 1.0, 2.0),
+                overlay=("temperature", "phi"),
             )
             self.assertEqual([item["saved_index"] for item in result["selections"]], [0, 2])
             self.assertEqual(len(result["frames"]), 14)
@@ -95,7 +95,19 @@ class RenderTests(unittest.TestCase):
             self.assertEqual(observed_names, expected_names)
             manifest = json.loads((out / "manifest.json").read_text())
             self.assertEqual(manifest["schema_version"], "mfc-post.render-clean/v1")
-            self.assertEqual(manifest["overlay"]["levels"], [0.5, 1.0, 2.0])
+            self.assertEqual(manifest["overlay"]["levels"], [1.0])
+            self.assertTrue(all(
+                frame["liquid_context"]["contour"]["level"] == 0.5
+                for frame in manifest["frames"]
+            ))
+            self.assertTrue(all(
+                frame["liquid_context"]["contour"]["drawn"]
+                for frame in manifest["frames"]
+            ))
+            provenance = json.loads((out / "provenance.json").read_text())
+            self.assertEqual(
+                provenance["render_policy"]["liquid_context"]["contour"]["level"], 0.5,
+            )
             temperature_limits = {
                 tuple(frame["color_limits"].values())
                 for frame in manifest["frames"] if frame.get("field") == "temperature"
