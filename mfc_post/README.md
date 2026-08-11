@@ -11,9 +11,12 @@ mpiexec -n 8 ./mfc-post process /path/to/case --execution mpi
 ./mfc-post process /path/to/case --index-start 0 --index-stop 100
 ./mfc-post render /path/to/case \
   --selected-times-us 5.0 \
-  --fields 'temperature,Y[NC12H26],Y[OH],Y[CO2],Y[H2O]' \
-  --no-zoom --no-mp4 --skip-scalars --skip-trends \
-  --out-dir /path/to/distinct-render-output
+  --fields temperature,OH,NC12H26,O2,phi,alpha_liq \
+  --no-mp4 --out-dir /path/to/render_clean
+./mfc-post render /path/to/case \
+  --time-range-us 0,10 --stride 2 --fields temperature \
+  --overlay temperature,phi --overlay-levels 0.5,1.0,2.0 \
+  --no-mp4 --out-dir /path/to/render_clean_overlay
 ./mfc-post analyze /path/to/case --selected-times-us 0,5,10 \
   --out-dir /path/to/analysis
 mpiexec -n 8 ./mfc-post analyze /path/to/case --time-range-us 0,100 \
@@ -23,6 +26,10 @@ mpiexec -n 8 ./mfc-post analyze /path/to/case --time-range-us 0,100 \
   --fields max_valid_gas_temperature_K,integrated_rhoY_OH \
   --out-dir /path/to/distinct-trends
 ```
+
+`analyze`, `plot`, and `render` reject a nonempty output directory by default.
+Pass `--overwrite` to replace that command's known outputs without deleting
+unrelated files from the directory.
 
 Inspection inventories each MFC output family independently. It never combines
 or silently deduplicates source families. Canonical raw conservative `Field`
@@ -63,14 +70,15 @@ normalization, and derivation is recorded in provenance. If a copied production
 run no longer contains a resolvable mechanism path, `--mechanism` and `--phase`
 must identify the exact mechanism rather than assuming a species layout.
 
-Selected-state rendering chooses the nearest available physical save and reads
-only those states. It writes full-domain PNGs plus `manifest.json`,
-`provenance.json`, and `frames.csv`; it never computes scalar history, trends,
-or MP4 output. Temperature uses the chemistry-clipped field with the
-chemistry-valid and gas-dominated masks, while the manifest separately reports
-the raw reconstructed temperature range and clipping count. Species images use
-gas-phase `Y_k`, never conservative `rhoY_k`. A nonempty output directory is
-rejected so separate serial and MPI validations cannot overwrite one another.
+Clean rendering chooses nearest requested saves or an inclusive physical-time
+range followed by stride. It writes one subdirectory per field plus
+`manifest.json` and `provenance.json`; it never computes scalar history, trends,
+or MP4 output. Static PNGs contain only a concise title, micrometer axes, and a
+colorbar. All frames for a field share batch-wide color limits. Temperature is
+chemistry-clipped and chemistry-valid/gas-dominated masked; species images use
+gas-phase `Y_k`, and `phi` uses the configured mechanism molecular weights.
+`--overlay temperature,phi` adds clean equivalence-ratio contour lines with
+default levels 0.5, 1.0, and 2.0.
 
 Scalar analysis writes `scalar_timeseries.csv`, `quality.json`, and
 `provenance.json`. Raw conservative species inventories are integrated using
@@ -80,6 +88,8 @@ whole states to workers when temporal concurrency is favorable and otherwise
 reduce spatial partitions. Rank 0 orders and writes the sole history.
 
 Trend plotting reads only `scalar_timeseries.csv`; it does not rediscover the
-case or open `p_all`. `--plot-set` accepts `species`, `thermal`, `mixing`,
-`default`, or `all`. Each scalar is written as an independent PNG alongside a
-manifest containing the CSV hash and selected fields.
+case or open `p_all`. The default/all set writes stable clean temperature,
+product, radical, hot-combustible, and hot-near-stoichiometric PNG names.
+`--plot-set` also accepts `species`, `thermal`, or `mixing`; `--fields` writes
+individual requested CSV series. The manifest records the CSV hash and exact
+series used by each PNG.

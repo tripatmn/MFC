@@ -45,6 +45,7 @@ def analyze_case(
     execution: str = "auto",
     mechanism: str | Path | None = None,
     phase: str | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any] | None:
     context = ExecutionContext.create(execution)
     root = Path(case_path).expanduser().resolve()
@@ -54,20 +55,24 @@ def analyze_case(
     if selected_times_us is not None and time_range_us is not None:
         raise ValueError("--selected-times-us and --time-range-us are mutually exclusive")
 
-    _progress(context, f"discovery: inspecting {root}")
+    _progress(context, f"startup: case path: {root}")
     inspection = inspect_case(root, mechanism=mechanism, phase=phase)
     metadata = _metadata(inspection)
     report = next((item for item in inspection["sources"] if item["family"] == "p_all"), None)
     if report is None or not report["timeline"]["saved_indices"]:
         raise ValueError(f"scalar analysis requires raw p_all saves; none were found in {root}")
+    discovered_count = len(report["timeline"]["saved_indices"])
+    _progress(context, f"startup: discovered p_all path: {report['path']}")
+    _progress(context, f"startup: saves discovered: {discovered_count}")
     config = Model3Configuration.from_metadata(metadata)
     _validate_species(config)
     source = PAllSource(root, metadata)
     indices, selection = _select_indices(
         report["timeline"], selected_times_us, time_range_us, stride
     )
-    _progress(context, f"selection: {len(indices)} save(s): {indices}")
-    _prepare_output(context, destination)
+    _progress(context, f"startup: saves selected after filters: {len(indices)}")
+    _progress(context, f"startup: output directory: {destination}")
+    _prepare_output(context, destination, overwrite)
 
     strategy = context.strategy(len(indices))
     raw_fields = tuple(str(item["name"]) for item in metadata.equation_layout)
@@ -75,9 +80,13 @@ def analyze_case(
     errors: list[str] = []
     if strategy == "state":
         state_comm = context.mpi.COMM_SELF
-        for saved_index in indices[context.rank::context.size]:
+        for local_position, saved_index in enumerate(indices[context.rank::context.size]):
             try:
-                _progress(context, f"derivation: saved index {saved_index}")
+                _save_progress(
+                    context, context.rank + local_position * context.size + 1,
+                    len(indices), saved_index,
+                    state_parallel=True,
+                )
                 states = _load_local(source, saved_index, raw_fields, "serial", context)
                 partial = _accumulate(states, config)
                 reduced = _reduce(partial, state_comm, context.mpi, metadata.dimensions or 1)
@@ -91,8 +100,11 @@ def analyze_case(
         if context.rank == 0:
             rows = [row for group in gathered for row in group]
     else:
-        for saved_index in indices:
-            _progress(context, f"derivation: saved index {saved_index}")
+        for position, saved_index in enumerate(indices, 1):
+            _save_progress(
+                context, position, len(indices), saved_index,
+                state_parallel=False,
+            )
             local_error = None
             partial = None
             try:
@@ -109,6 +121,8 @@ def analyze_case(
 
     if context.rank != 0:
         return None
+    if not rows:
+        raise RuntimeError("analysis produced zero scalar records; no output written")
     rows.sort(key=lambda row: (row["physical_time_s"], row["saved_index"]))
     source_files = sorted(set().union(*(set(row.pop("source_files")) for row in rows)))
     quality = [
@@ -130,7 +144,10 @@ def analyze_case(
         "output_directory": str(destination), "rows": rows,
         "quality": quality, "provenance": provenance,
     }
-    _progress(context, f"completion: wrote {len(rows)} scalar record(s) to {destination}")
+    _progress(context, f"completion: row count: {len(rows)}")
+    _progress(context, f"completion: scalar_timeseries.csv: {destination / 'scalar_timeseries.csv'}")
+    _progress(context, f"completion: quality.json: {destination / 'quality.json'}")
+    _progress(context, f"completion: provenance.json: {destination / 'provenance.json'}")
     return result
 
 
@@ -195,12 +212,17 @@ def _select_indices(timeline, selected_times_us, time_range_us, stride):
     return indices, selection
 
 
-def _prepare_output(context: ExecutionContext, destination: Path) -> None:
+def _prepare_output(context: ExecutionContext, destination: Path, overwrite: bool) -> None:
     error = None
     if context.rank == 0:
         try:
-            if destination.exists() and any(destination.iterdir()):
-                raise FileExistsError(f"output directory is not empty: {destination}")
+            if destination.exists() and not destination.is_dir():
+                raise FileExistsError(f"output path exists and is not a directory: {destination}")
+            if destination.exists() and any(destination.iterdir()) and not overwrite:
+                raise FileExistsError(
+                    f"output directory is not empty: {destination}; use --overwrite to replace "
+                    "mfc-post analyze outputs"
+                )
             destination.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -426,3 +448,12 @@ def _error(context, saved_index, exc):
 def _progress(context, message):
     if context.rank == 0:
         print(f"mfc-post analyze: {message}", flush=True)
+
+
+def _save_progress(context, ordinal, total, saved_index, state_parallel):
+    if state_parallel or context.rank == 0:
+        print(
+            f"mfc-post analyze: progress: save {ordinal}/{total}: "
+            f"saved_index={saved_index}, worker_rank={context.rank}",
+            flush=True,
+        )

@@ -35,22 +35,34 @@ def build_parser() -> argparse.ArgumentParser:
         "render", help="render selected full-domain physical fields without computing scalar history"
     )
     render_parser.add_argument("case", help="path to an MFC case/run directory")
-    render_parser.add_argument(
-        "--selected-times-us", required=True,
-        help="comma-separated requested physical times in microseconds",
+    render_selection = render_parser.add_mutually_exclusive_group()
+    render_selection.add_argument(
+        "--selected-times-us", help="comma-separated requested times; nearest saves are used",
+    )
+    render_selection.add_argument(
+        "--time-range-us", help="inclusive START,STOP range in microseconds",
     )
     render_parser.add_argument(
         "--fields", default=",".join(RENDER_FIELDS),
         help="comma-separated symbolic fields",
     )
     render_parser.add_argument("--out-dir", required=True, help="new or empty output directory")
+    render_parser.add_argument("--stride", type=int, default=1, help="retain every Nth selected save")
+    render_parser.add_argument(
+        "--overwrite", action="store_true",
+        help="replace mfc-post render files in an existing nonempty output directory",
+    )
     render_parser.add_argument("--execution", choices=("auto", "serial", "mpi"), default="auto")
     render_parser.add_argument("--mechanism", help="explicit Cantera YAML when metadata is incomplete")
     render_parser.add_argument("--phase", help="explicit mechanism phase name")
-    render_parser.add_argument("--no-zoom", action="store_true", help="render only full-domain frames")
     render_parser.add_argument("--no-mp4", action="store_true", help="explicitly disable MP4 output")
-    render_parser.add_argument("--skip-scalars", action="store_true", help="skip scalar-history processing")
-    render_parser.add_argument("--skip-trends", action="store_true", help="skip trend processing")
+    render_parser.add_argument(
+        "--overlay", help="BASE,CONTOUR overlay, for example temperature,phi",
+    )
+    render_parser.add_argument(
+        "--overlay-levels", default="0.5,1.0,2.0",
+        help="comma-separated contour levels (default: 0.5,1.0,2.0)",
+    )
     analyze_parser = subparsers.add_parser(
         "analyze", help="compute an MPI-compatible scalar history from raw p_all saves"
     )
@@ -60,6 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
     selection.add_argument("--time-range-us", help="inclusive START,STOP range in microseconds")
     analyze_parser.add_argument("--stride", type=int, default=1, help="retain every Nth selected save")
     analyze_parser.add_argument("--out-dir", required=True, help="new or empty output directory")
+    analyze_parser.add_argument(
+        "--overwrite", action="store_true",
+        help="replace mfc-post analyze files in an existing nonempty output directory",
+    )
     analyze_parser.add_argument("--execution", choices=("auto", "serial", "mpi"), default="auto")
     analyze_parser.add_argument("--mechanism", help="explicit Cantera YAML when metadata is incomplete")
     analyze_parser.add_argument("--phase", help="explicit mechanism phase name")
@@ -71,6 +87,10 @@ def build_parser() -> argparse.ArgumentParser:
     plot_selection.add_argument("--fields", help="comma-separated scalar CSV columns")
     plot_selection.add_argument("--plot-set", choices=tuple(PLOT_SETS), default=None)
     plot_parser.add_argument("--out-dir", help="new or empty output directory (default: INPUT/trend_plots)")
+    plot_parser.add_argument(
+        "--overwrite", action="store_true",
+        help="replace selected trend PNGs and the manifest in a nonempty output directory",
+    )
     return parser
 
 
@@ -97,13 +117,17 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return 0
         if args.command == "render":
+            overlay = _overlay(args.overlay) if args.overlay else None
             result = render_case(
                 args.case,
-                selected_times_us=_comma_floats(args.selected_times_us),
+                selected_times_us=(
+                    _comma_floats(args.selected_times_us) if args.selected_times_us else None
+                ),
+                time_range_us=_time_range(args.time_range_us) if args.time_range_us else None,
                 fields=_comma_strings(args.fields), out_dir=args.out_dir,
                 execution=args.execution, mechanism=args.mechanism, phase=args.phase,
-                no_zoom=args.no_zoom, no_mp4=args.no_mp4,
-                skip_scalars=args.skip_scalars, skip_trends=args.skip_trends,
+                stride=args.stride, overwrite=args.overwrite, no_mp4=args.no_mp4,
+                overlay=overlay, overlay_levels=_comma_floats(args.overlay_levels),
             )
             if result is not None:
                 print(
@@ -120,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 time_range_us=time_range, stride=args.stride, out_dir=args.out_dir,
                 execution=args.execution, mechanism=args.mechanism, phase=args.phase,
+                overwrite=args.overwrite,
             )
             if result is not None:
                 print(
@@ -131,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
             result = plot_history(
                 args.input,
                 fields=_comma_strings(args.fields) if args.fields else None,
-                plot_set=args.plot_set, out_dir=args.out_dir,
+                plot_set=args.plot_set, out_dir=args.out_dir, overwrite=args.overwrite,
             )
             print(
                 f"mfc-post: plotted {len(result['files'])} trend(s) -> "
@@ -139,9 +164,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
     except (OSError, RuntimeError, ValueError) as exc:
-        print(f"mfc-post: {exc}", file=sys.stderr)
+        print(f"mfc-post: {exc}", file=sys.stderr, flush=True)
         return 2
-    return 1
+    print(f"mfc-post: unsupported command: {args.command}", file=sys.stderr, flush=True)
+    return 2
 
 
 def _comma_strings(value: str) -> tuple[str, ...]:
@@ -159,6 +185,13 @@ def _time_range(value: str) -> tuple[float, float]:
     parsed = _comma_floats(value)
     if len(parsed) != 2:
         raise ValueError(f"--time-range-us requires exactly START,STOP; got {value!r}")
+    return parsed
+
+
+def _overlay(value: str) -> tuple[str, str]:
+    parsed = _comma_strings(value)
+    if len(parsed) != 2:
+        raise ValueError(f"--overlay requires exactly BASE,CONTOUR; got {value!r}")
     return parsed
 
 

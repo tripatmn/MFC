@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import csv
+import contextlib
+import io
 import json
 import shutil
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from mfc_post.analysis import _select_indices, analyze_case
+from mfc_post.cli import main
 from mfc_post.plotting import plot_history
 
 
@@ -79,7 +84,20 @@ class AnalysisTests(unittest.TestCase):
             root = Path(directory)
             _case(root)
             analysis = root / "analysis"
-            result = analyze_case(root, out_dir=analysis, execution="serial")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = analyze_case(root, out_dir=analysis, execution="serial")
+            messages = stdout.getvalue()
+            self.assertIn(f"startup: case path: {root}", messages)
+            self.assertIn(f"startup: discovered p_all path: {root / 'p_all'}", messages)
+            self.assertIn("startup: saves discovered: 3", messages)
+            self.assertIn("startup: saves selected after filters: 3", messages)
+            self.assertIn(f"startup: output directory: {analysis}", messages)
+            self.assertEqual(messages.count("mfc-post analyze: progress: save "), 3)
+            self.assertIn("completion: row count: 3", messages)
+            self.assertIn(f"completion: scalar_timeseries.csv: {analysis / 'scalar_timeseries.csv'}", messages)
+            self.assertIn(f"completion: quality.json: {analysis / 'quality.json'}", messages)
+            self.assertIn(f"completion: provenance.json: {analysis / 'provenance.json'}", messages)
             self.assertEqual(len(result["rows"]), 3)
             self.assertEqual([row["time_us"] for row in result["rows"]], [0.0, 5.0, 10.0])
             self.assertAlmostEqual(result["rows"][0]["integrated_rhoY_NC12H26"], 0.25)
@@ -95,6 +113,25 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual(provenance["source"]["family"], "p_all")
             self.assertEqual(provenance["execution"]["mpi_size"], 1)
 
+            with self.assertRaisesRegex(RuntimeError, "output directory is not empty.*--overwrite"):
+                analyze_case(root, out_dir=analysis, execution="serial")
+            with contextlib.redirect_stdout(io.StringIO()):
+                overwritten = analyze_case(
+                    root, out_dir=analysis, execution="serial", overwrite=True
+                )
+            self.assertEqual(len(overwritten["rows"]), 3)
+
+            failed_output = root / "empty-selection"
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                exit_code = main([
+                    "analyze", str(root), "--time-range-us", "20,30",
+                    "--out-dir", str(failed_output), "--execution", "serial",
+                ])
+            self.assertNotEqual(exit_code, 0)
+            self.assertIn("produced no saved states", stderr.getvalue())
+            self.assertFalse(failed_output.exists())
+
             shutil.rmtree(root / "p_all")
             plotted = plot_history(
                 analysis, fields=("max_valid_gas_temperature_K", "combustible_area"),
@@ -104,6 +141,65 @@ class AnalysisTests(unittest.TestCase):
             self.assertTrue(all(Path(path).is_file() for path in plotted["files"]))
             manifest = json.loads((analysis / "trends" / "plot_manifest.json").read_text())
             self.assertIn("does not inspect or read p_all", manifest["data_access"])
+            clean_trends = analysis / "clean_trends"
+            with contextlib.redirect_stdout(io.StringIO()):
+                default_plots = plot_history(analysis, out_dir=clean_trends)
+            self.assertEqual(len(default_plots["files"]), 5)
+            self.assertEqual(
+                {path.name for path in clean_trends.glob("*.png")},
+                {
+                    "valid_gas_temperature_max.png",
+                    "products_CO2_H2O.png",
+                    "radicals_OH_HO2_H2O2.png",
+                    "hot_combustible_overlap_area.png",
+                    "hot_near_stoich_overlap_area.png",
+                },
+            )
+            with self.assertRaisesRegex(FileExistsError, "output directory is not empty.*--overwrite"):
+                plot_history(
+                    analysis, fields=("max_valid_gas_temperature_K",),
+                    out_dir=analysis / "trends",
+                )
+            with contextlib.redirect_stdout(io.StringIO()):
+                replotted = plot_history(
+                    analysis, fields=("max_valid_gas_temperature_K",),
+                    out_dir=analysis / "trends", overwrite=True,
+                )
+            self.assertEqual(len(replotted["files"]), 1)
+
+    def test_plot_help_and_cli_failure_are_explicit(self):
+        repository = Path(__file__).resolve().parents[2]
+        help_result = subprocess.run(
+            [sys.executable, str(repository / "mfc-post"), "plot", "--help"],
+            cwd=repository, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("--overwrite", help_result.stdout)
+        analyze_help = subprocess.run(
+            [sys.executable, str(repository / "mfc-post"), "analyze", "--help"],
+            cwd=repository, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(analyze_help.returncode, 0, analyze_help.stderr)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            exit_code = main(["plot", "/definitely/missing/scalar_timeseries.csv"])
+        self.assertNotEqual(exit_code, 0)
+        self.assertIn("does not exist", stderr.getvalue())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            malformed = root / "scalar_timeseries.csv"
+            malformed.write_text(
+                "saved_index,time_us,max_valid_gas_temperature_K\n0,0,not-a-number\n"
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                exit_code = main([
+                    "plot", str(malformed), "--fields", "max_valid_gas_temperature_K",
+                    "--out-dir", str(root / "plots"),
+                ])
+            self.assertNotEqual(exit_code, 0)
+            self.assertIn("invalid numeric value", stderr.getvalue())
+            self.assertIn("CSV row 2", stderr.getvalue())
 
 
 if __name__ == "__main__":
