@@ -16,6 +16,7 @@ import argparse
 import contextlib
 import csv
 import io
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import math
 import os
 import re
@@ -166,7 +167,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-zoom", action="store_true")
     parser.add_argument("--no-full-domain", action="store_true")
     parser.add_argument("--gas-mass-floor", type=float, default=DEFAULT_GAS_MASS_FLOOR)
+    parser.add_argument("--skip-scalars", action="store_true", help="Render frames/manifest/README without scalar_timeseries")
+    parser.add_argument("--skip-trends", action="store_true", help="Skip trend plot generation")
+    parser.add_argument("--debug", action="store_true", help="Print per-frame progress with flush=True")
+    parser.add_argument("--workers", type=int, default=1, help="Frame-render worker processes; default 1")
     return parser.parse_args()
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def debug_log(args: argparse.Namespace, message: str) -> None:
+    if getattr(args, "debug", False):
+        log(message)
 
 
 def truthy(value: Any) -> bool:
@@ -327,8 +341,29 @@ def available_pall_steps(run_dir: Path) -> list[int]:
     return sorted(steps)
 
 
+def available_flat_steps_fast(run_dir: Path) -> list[int]:
+    # Avoid raw.available_steps() on hierarchical p_all trees: it performs many
+    # recursive globs and can burn minutes on Lustre before printing anything.
+    steps: set[int] = set()
+    d_root = run_dir / "D"
+    if d_root.is_dir():
+        for path in d_root.rglob("*.dat"):
+            info = raw.raw_file_info(path)
+            if info is not None:
+                steps.add(info[3])
+    p_root = run_dir / "p_all"
+    if p_root.is_dir():
+        # Only support flat raw files directly under p_all here. Hierarchical
+        # p_all/p*/<save>/q_cons_vf*.dat is handled by available_pall_steps().
+        for path in p_root.glob("*.dat"):
+            info = raw.raw_file_info(path)
+            if info is not None:
+                steps.add(info[3])
+    return sorted(steps)
+
+
 def all_steps(run_dir: Path) -> tuple[list[int], list[int], list[int]]:
-    flat_steps = raw.available_steps(run_dir)
+    flat_steps = available_flat_steps_fast(run_dir)
     pall_steps = available_pall_steps(run_dir)
     return sorted(set(flat_steps) | set(pall_steps)), flat_steps, pall_steps
 
@@ -461,6 +496,30 @@ def reconstruct_pressure_from_cons(cons: dict[int, np.ndarray], case: dict) -> n
     return np.where(np.isfinite(p), np.maximum(p, PRESSURE_FLOOR_PA), np.nan)
 
 
+def species_from_fields(fields: list[str]) -> set[str]:
+    species: set[str] = set()
+    for field in fields:
+        if field.startswith("Y_"):
+            species.add(field[2:])
+        elif field.startswith("rhoY_"):
+            species.add(field[5:])
+    return species
+
+
+def needed_cons_indices(all_species: list[str], fields: list[str], *, scalars: bool = False) -> set[int]:
+    needed = {2, 3, 7, 8, 9}
+    if "valid_gas_temperature" in fields or scalars:
+        needed.update(range(1, 13 + len(all_species)))
+    else:
+        for species in species_from_fields(fields):
+            needed.add(species_cons_index_1based(all_species, species))
+    if scalars:
+        for species in INTEGRATED_SPECIES:
+            if species in all_species:
+                needed.add(species_cons_index_1based(all_species, species))
+    return needed
+
+
 def make_state_from_arrays(
     step: int,
     save_index: int,
@@ -476,6 +535,7 @@ def make_state_from_arrays(
     all_species: list[str],
     mw: np.ndarray,
     gas_mass_floor: float,
+    temperature_required: bool,
 ) -> State:
     alpha_rho_g_idx, alpha_g_idx = gas_fluid_indices_from_case(case)
     if not all(idx in cons for idx in (*alpha_rho_g_idx, *alpha_g_idx, 7)):
@@ -491,29 +551,36 @@ def make_state_from_arrays(
         if species_cons_index_1based(all_species, sp) in cons
     }
     all_species_available = len(available_species_indices) == len(all_species)
+    temp_available = False
     if all_species_available and pressure is not None:
         rhoY_stack_arr = np.stack([cons[species_cons_index_1based(all_species, sp)] for sp in all_species])
         y_prim = mfc_primitive_y(rhoY_stack_arr, rho_g)
         mw_mix = mixture_mw(y_prim, mw)
         with np.errstate(divide="ignore", invalid="ignore"):
             temp = pressure * mw_mix / (R_UNIVERSAL_KJ_PER_KMOL_K * rho_g)
+        temp_available = True
     elif raw_temperature is not None:
         temp = raw_temperature
-    else:
+        temp_available = True
+    elif temperature_required:
         raise RuntimeError(
             "temperature unavailable: need all 54 conservative species plus pressure/EOS fields "
             "for C4 reconstruction, or raw-helper temperature from D/ output"
         )
-    valid = (
+    else:
+        temp = np.full_like(rho_g, np.nan, dtype=float)
+    base_valid = (
         np.isfinite(alpha_g)
         & np.isfinite(rho_g)
         & np.isfinite(alpha_liq)
-        & np.isfinite(temp)
         & (alpha_g > 0.5)
         & (rho_g > gas_mass_floor)
         & (alpha_liq < 0.5)
-        & (temp > 0.0)
     )
+    if temp_available:
+        valid = base_valid & np.isfinite(temp) & (temp > 0.0)
+    else:
+        valid = base_valid
     arrays = {
         "valid_gas_temperature": np.where(valid, temp, np.nan),
         "rho_g": rho_g,
@@ -540,7 +607,7 @@ def make_state_from_arrays(
     return State(step, save_index, time_s, time_source, source_layout, xs, ys, cell_area(xs, ys), arrays, y_arrays, rhoY_arrays, valid, alpha_liq)
 
 
-def load_flat_state(run_dir: Path, step: int, save_index: int, time_s: float, time_source: str, case: dict, all_species: list[str], mw: np.ndarray, gas_mass_floor: float) -> State | None:
+def load_flat_state(run_dir: Path, step: int, save_index: int, time_s: float, time_source: str, case: dict, all_species: list[str], mw: np.ndarray, gas_mass_floor: float, fields: list[str], scalars: bool = False) -> State | None:
     try:
         fields = raw.read_step_fields(run_dir, step, gas_mass_floor)
     except Exception:
@@ -554,7 +621,7 @@ def load_flat_state(run_dir: Path, step: int, save_index: int, time_s: float, ti
         return None
     xs, ys, _ = grids["vapor_alpha_rho"]
     cons: dict[int, np.ndarray] = {}
-    for idx in range(1, 13 + len(all_species)):
+    for idx in sorted(needed_cons_indices(all_species, fields, scalars=scalars)):
         name = None
         if idx == 1:
             name = "liquid_alpha_rho"
@@ -593,13 +660,13 @@ def load_flat_state(run_dir: Path, step: int, save_index: int, time_s: float, ti
         gx, gy, arr = gd_p
         if gx.shape == xs.shape and gy.shape == ys.shape and np.allclose(gx, xs) and np.allclose(gy, ys):
             prim_pressure = np.where(np.isfinite(arr), np.maximum(arr, PRESSURE_FLOOR_PA), np.nan)
-    return make_state_from_arrays(step, save_index, time_s, time_source, "D_or_flat_raw", xs, ys, cons, prim_pressure, raw_temperature, case, all_species, mw, gas_mass_floor)
+    return make_state_from_arrays(step, save_index, time_s, time_source, "D_or_flat_raw", xs, ys, cons, prim_pressure, raw_temperature, case, all_species, mw, gas_mass_floor, "valid_gas_temperature" in fields or scalars)
 
 
-def load_pall_state(run_dir: Path, step: int, save_index: int, time_s: float, time_source: str, case: dict, all_species: list[str], mw: np.ndarray, gas_mass_floor: float) -> State | None:
+def load_pall_state(run_dir: Path, step: int, save_index: int, time_s: float, time_source: str, case: dict, all_species: list[str], mw: np.ndarray, gas_mass_floor: float, fields: list[str], scalars: bool = False) -> State | None:
     cons: dict[int, np.ndarray] = {}
     xs_ref = ys_ref = None
-    for idx in range(1, 13 + len(all_species)):
+    for idx in sorted(needed_cons_indices(all_species, fields, scalars=scalars)):
         gd = read_pall_field(run_dir, step, "q_cons_vf", idx)
         if gd is not None:
             xs, ys, arr = gd
@@ -616,17 +683,17 @@ def load_pall_state(run_dir: Path, step: int, save_index: int, time_s: float, ti
         xs, ys, arr = gd_p
         if xs.shape == xs_ref.shape and ys.shape == ys_ref.shape and np.allclose(xs, xs_ref) and np.allclose(ys, ys_ref):
             prim_pressure = np.where(np.isfinite(arr), np.maximum(arr, PRESSURE_FLOOR_PA), np.nan)
-    return make_state_from_arrays(step, save_index, time_s, time_source, "p_all_binary", xs_ref, ys_ref, cons, prim_pressure, None, case, all_species, mw, gas_mass_floor)
+    return make_state_from_arrays(step, save_index, time_s, time_source, "p_all_binary", xs_ref, ys_ref, cons, prim_pressure, None, case, all_species, mw, gas_mass_floor, "valid_gas_temperature" in fields or scalars)
 
 
-def load_state(run_dir: Path, step: int, save_index: int, times: dict[int, tuple[float, str]], flat_steps: set[int], pall_steps: set[int], case: dict, all_species: list[str], mw: np.ndarray, gas_mass_floor: float) -> State:
+def load_state(run_dir: Path, step: int, save_index: int, times: dict[int, tuple[float, str]], flat_steps: set[int], pall_steps: set[int], case: dict, all_species: list[str], mw: np.ndarray, gas_mass_floor: float, fields: list[str], scalars: bool = False) -> State:
     time_s, time_source = times.get(step, (math.nan, "missing"))
     if step in flat_steps:
-        state = load_flat_state(run_dir, step, save_index, time_s, time_source, case, all_species, mw, gas_mass_floor)
+        state = load_flat_state(run_dir, step, save_index, time_s, time_source, case, all_species, mw, gas_mass_floor, fields, scalars)
         if state is not None:
             return state
     if step in pall_steps:
-        state = load_pall_state(run_dir, step, save_index, time_s, time_source, case, all_species, mw, gas_mass_floor)
+        state = load_pall_state(run_dir, step, save_index, time_s, time_source, case, all_species, mw, gas_mass_floor, fields, scalars)
         if state is not None:
             return state
     raise RuntimeError(f"could not load save {step} from flat D/raw or p_all_binary")
@@ -835,115 +902,231 @@ def write_summary(out_dir: Path, rows: list[dict[str, Any]], manifest: list[dict
     (out_dir / "key_summary.txt").write_text("\n".join(lines) + "\n")
 
 
-def render(args: argparse.Namespace) -> list[dict[str, Any]]:
-    run_dir = args.run_dir.resolve()
-    out_dir = args.out_dir.resolve()
-    case = load_case(run_dir)
-    all_species, mw, mechanism_source = load_species_and_mw(case)
-    steps, flat_steps, pall_steps = all_steps(run_dir)
-    if not steps:
-        raise RuntimeError(f"No raw D/ or p_all saves found in {run_dir}")
-    times = raw.infer_times(run_dir, steps)
-    jobs = jobs_from_args(args)
-    flat_set = set(flat_steps)
-    pall_set = set(pall_steps)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    write_readme(out_dir, args, mechanism_source, flat_steps, pall_steps)
-
-    first_t = times.get(steps[0], (math.nan, "missing"))[0]
-    last_t = times.get(steps[-1], (math.nan, "missing"))[0]
-    print(f"Raw saves found: {len(steps)} (flat={len(flat_steps)}, p_all={len(pall_steps)})")
-    print(f"Selected available time range: {first_t * 1e6 if math.isfinite(first_t) else math.nan:.6g} to {last_t * 1e6 if math.isfinite(last_t) else math.nan:.6g} us")
-
-    rows: list[dict[str, Any]] = []
-    states_by_step: dict[int, State] = {}
-    for save_index, step in enumerate(steps):
-        state = load_state(run_dir, step, save_index, times, flat_set, pall_set, case, all_species, mw, args.gas_mass_floor)
-        states_by_step[step] = state
-        rows.append(compute_row(state))
-    write_csv(out_dir / "scalar_timeseries.csv", rows)
-    make_trend_plots(rows, out_dir)
-
-    manifest: list[dict[str, Any]] = []
+def domains_from_args(args: argparse.Namespace) -> list[tuple[str, tuple[float, float] | None, tuple[float, float] | None]]:
     domains: list[tuple[str, tuple[float, float] | None, tuple[float, float] | None]] = []
     if not args.no_full_domain:
         domains.append(("full_domain", None, None))
     if not args.no_zoom:
         domains.append(("zoom", tuple(args.zoom_xlim_um), tuple(args.zoom_ylim_um)))
-    videos_dir = out_dir / "videos"
-    videos_dir.mkdir(parents=True, exist_ok=True)
+    if not domains:
+        raise RuntimeError("both --no-full-domain and --no-zoom were specified; nothing to render")
+    return domains
 
-    for job in jobs:
-        selected = select_steps(steps, times, job, args.max_frames)
-        if not selected:
-            raise RuntimeError(f"No saves selected for {job.field} in requested time window")
-        print(f"Rendering {job.field}: {len(selected)} saves, first/last {selected[0]} / {selected[-1]}")
-        cfg = FIELD_CONFIG[job.field]
-        for domain, xlim, ylim in domains:
-            frame_dir = out_dir / "frames" / job.field / domain
-            frame_dir.mkdir(parents=True, exist_ok=True)
-            for frame_index, step in enumerate(selected):
-                state = states_by_step[step]
-                path = frame_dir / f"{cfg['short']}_{domain}_{frame_index:04d}.png"
-                draw_contour(path, state, job.field, domain, args.case_label, xlim, ylim)
-                manifest.append({
-                    "field": job.field,
-                    "domain": domain,
-                    "frame_index": frame_index,
-                    "step": step,
-                    "time_s": state.time_s,
-                    "time_us": state.time_s * 1.0e6 if math.isfinite(state.time_s) else math.nan,
-                    "source_layout": state.source_layout,
-                    "png": str(path.relative_to(out_dir)),
-                    "video_status": "not_requested" if args.no_mp4 else "pending",
-                    "video_detail": "",
-                })
-            if not args.no_mp4:
-                video_path = videos_dir / f"{cfg['short']}_{domain}.mp4"
-                status, detail = assemble_mp4(frame_dir, f"{cfg['short']}_{domain}", video_path, args.fps)
-                for row in manifest:
-                    if row["field"] == job.field and row["domain"] == domain:
-                        row["video_status"] = status
-                        row["video_detail"] = detail
-                if status == "ffmpeg_missing":
-                    print(f"ffmpeg missing for {job.field}/{domain}; manual command: {detail}")
-                elif status != "mp4_written":
-                    print(f"ffmpeg failed for {job.field}/{domain}: {detail}")
-                else:
-                    print(f"Wrote {detail}")
 
+def steps_for_job(steps: list[int], times: dict[int, tuple[float, str]], job: RenderJob, args: argparse.Namespace) -> list[int]:
     if args.selected_times_us:
-        selected_dir = out_dir / "selected_frames"
+        out: list[int] = []
         for target_us in args.selected_times_us:
             step = nearest_step_for_time(steps, times, target_us)
-            if step is None:
-                continue
-            state = states_by_step[step]
-            for field in (args.fields or CONTOUR_FIELDS):
-                cfg = FIELD_CONFIG[field]
-                path = selected_dir / f"{cfg['short']}_requested_{target_us:.3f}us_actual_{state.time_s * 1e6:.3f}us.png"
-                draw_contour(path, state, field, "selected_full_domain", args.case_label, None, None)
-                manifest.append({
-                    "field": field,
-                    "domain": "selected_full_domain",
-                    "frame_index": "",
-                    "step": step,
-                    "time_s": state.time_s,
-                    "time_us": state.time_s * 1.0e6 if math.isfinite(state.time_s) else math.nan,
-                    "source_layout": state.source_layout,
-                    "png": str(path.relative_to(out_dir)),
-                    "video_status": "not_applicable",
-                    "video_detail": f"requested_time_us={target_us}",
-                })
+            if step is not None and step not in out:
+                out.append(step)
+        return out[: args.max_frames] if args.max_frames > 0 else out
+    return select_steps(steps, times, job, args.max_frames)
 
+
+def write_manifest(out_dir: Path, manifest: list[dict[str, Any]]) -> None:
     write_csv(out_dir / "manifest.csv", manifest)
-    write_summary(out_dir, rows, manifest)
-    print(f"Wrote advisor package to {out_dir}")
+
+
+def render_task(task: tuple) -> dict[str, Any]:
+    (
+        run_dir, step, save_index, times, flat_steps, pall_steps, case, all_species, mw,
+        gas_mass_floor, field, domain, xlim, ylim, case_label, out_dir, debug,
+    ) = task
+    state = load_state(run_dir, step, save_index, times, flat_steps, pall_steps, case, all_species, mw, gas_mass_floor, [field], False)
+    cfg = FIELD_CONFIG[field]
+    path = out_dir / "frames" / field / domain / f"{cfg['short']}_{domain}_{save_index:04d}.png"
+    draw_contour(path, state, field, domain, case_label, xlim, ylim)
+    if debug:
+        log(f"rendered field={field} domain={domain} save={step} png={path}")
+    return {
+        "field": field,
+        "domain": domain,
+        "frame_index": save_index,
+        "step": step,
+        "time_s": state.time_s,
+        "time_us": state.time_s * 1.0e6 if math.isfinite(state.time_s) else math.nan,
+        "source_layout": state.source_layout,
+        "png": str(path.relative_to(out_dir)),
+        "video_status": "not_requested",
+        "video_detail": "",
+    }
+
+
+def render_frames_fast(
+    args: argparse.Namespace,
+    run_dir: Path,
+    out_dir: Path,
+    steps: list[int],
+    times: dict[int, tuple[float, str]],
+    flat_set: set[int],
+    pall_set: set[int],
+    case: dict,
+    all_species: list[str],
+    mw: np.ndarray,
+    jobs: list[RenderJob],
+) -> list[dict[str, Any]]:
+    log("frame stage start")
+    domains = domains_from_args(args)
+    manifest: list[dict[str, Any]] = []
+    tasks: list[tuple] = []
+    save_index_by_step = {step: i for i, step in enumerate(steps)}
+    for job in jobs:
+        selected = steps_for_job(steps, times, job, args)
+        log(f"beginning field={job.field}; selected saves={selected}")
+        if not selected:
+            log(f"WARNING: no saves selected for field={job.field}; continuing")
+            continue
+        for domain, xlim, ylim in domains:
+            (out_dir / "frames" / job.field / domain).mkdir(parents=True, exist_ok=True)
+            for local_idx, step in enumerate(selected):
+                tasks.append((
+                    run_dir, step, local_idx, times, flat_set, pall_set, case, all_species, mw,
+                    args.gas_mass_floor, job.field, domain, xlim, ylim, args.case_label, out_dir, args.debug,
+                ))
+    if args.workers > 1 and len(tasks) > 1:
+        log(f"frame rendering with workers={args.workers}; tasks={len(tasks)}")
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            futures = [executor.submit(render_task, task) for task in tasks]
+            for future in as_completed(futures):
+                try:
+                    manifest.append(future.result())
+                except Exception as exc:
+                    log(f"WARNING: frame task failed: {exc}")
+    else:
+        log(f"frame rendering serial; tasks={len(tasks)}")
+        for task in tasks:
+            try:
+                manifest.append(render_task(task))
+            except Exception as exc:
+                field = task[10]
+                if field == "valid_gas_temperature":
+                    log(f"WARNING: temperature frame skipped: {exc}")
+                    continue
+                raise
+    write_manifest(out_dir, manifest)
+    log(f"frame stage end; frames={len(manifest)}")
     return manifest
 
 
+def render(args: argparse.Namespace) -> list[dict[str, Any]]:
+    log("entering render")
+    run_dir = args.run_dir.resolve()
+    out_dir = args.out_dir.resolve()
+    log(f"run-dir={run_dir}")
+    log(f"out-dir={out_dir}")
+    log(f"fields={args.fields}; option_a={args.option_a}; selected_times_us={args.selected_times_us}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log("output folders created")
+
+    log("case/mechanism parse start")
+    case = load_case(run_dir)
+    all_species, mw, mechanism_source = load_species_and_mw(case)
+    log(f"case/mechanism parse end; species={len(all_species)}; mechanism={mechanism_source}")
+
+    log("save discovery start")
+    steps, flat_steps, pall_steps = all_steps(run_dir)
+    log(f"save discovery end; total={len(steps)} flat={len(flat_steps)} p_all={len(pall_steps)}")
+    if not steps:
+        raise RuntimeError(f"No raw D/ or p_all saves found in {run_dir}")
+    times = raw.infer_times(run_dir, steps)
+    first_t = times.get(steps[0], (math.nan, "missing"))[0]
+    last_t = times.get(steps[-1], (math.nan, "missing"))[0]
+    log(
+        "time range: "
+        f"{first_t * 1e6 if math.isfinite(first_t) else math.nan:.6g} to "
+        f"{last_t * 1e6 if math.isfinite(last_t) else math.nan:.6g} us"
+    )
+
+    jobs = jobs_from_args(args)
+    log(f"field list: {[job.field for job in jobs]}")
+    for job in jobs:
+        log(f"selected saves for {job.field}: {steps_for_job(steps, times, job, args)}")
+    flat_set = set(flat_steps)
+    pall_set = set(pall_steps)
+    write_readme(out_dir, args, mechanism_source, flat_steps, pall_steps)
+    log("README.txt written")
+
+    fast_mode = bool(args.selected_times_us) or args.max_frames > 0 or args.skip_scalars or args.skip_trends
+    manifest: list[dict[str, Any]] = []
+
+    if fast_mode:
+        log("fast-frame mode active: rendering frames before scalar/trend work")
+        manifest = render_frames_fast(args, run_dir, out_dir, steps, times, flat_set, pall_set, case, all_species, mw, jobs)
+        if args.skip_scalars and args.skip_trends:
+            log("skip-scalars and skip-trends set; exiting after frame/manifest/README")
+            write_summary(out_dir, [], manifest)
+            return manifest
+    else:
+        log("standard mode: rendering frames before scalar/trend work to avoid silent startup delay")
+        manifest = render_frames_fast(args, run_dir, out_dir, steps, times, flat_set, pall_set, case, all_species, mw, jobs)
+
+    rows: list[dict[str, Any]] = []
+    states_by_step: dict[int, State] = {}
+    if not args.skip_scalars:
+        log("scalar stage start")
+        scalar_fields = CONTOUR_FIELDS
+        for save_index, step in enumerate(steps):
+            if args.debug:
+                log(f"scalar loading save={step} index={save_index}")
+            state = load_state(
+                run_dir,
+                step,
+                save_index,
+                times,
+                flat_set,
+                pall_set,
+                case,
+                all_species,
+                mw,
+                args.gas_mass_floor,
+                scalar_fields,
+                True,
+            )
+            states_by_step[step] = state
+            rows.append(compute_row(state))
+        write_csv(out_dir / "scalar_timeseries.csv", rows)
+        log(f"scalar stage end; rows={len(rows)}")
+    else:
+        log("scalar stage skipped")
+
+    if not args.skip_trends:
+        log("trend stage start")
+        if rows:
+            make_trend_plots(rows, out_dir)
+        else:
+            log("WARNING: trends requested but no scalar rows are available")
+        log("trend stage end")
+    else:
+        log("trend stage skipped")
+
+    if not args.no_mp4:
+        log("mp4 stage start")
+        # MP4s for the fast frame stage are assembled here so slow video encoding
+        # never delays first PNG/manifest output. Existing frames are serially encoded.
+        videos_dir = out_dir / "videos"
+        videos_dir.mkdir(parents=True, exist_ok=True)
+        for job in jobs:
+            cfg = FIELD_CONFIG[job.field]
+            for domain, _xlim, _ylim in domains_from_args(args):
+                frame_dir = out_dir / "frames" / job.field / domain
+                if not any(frame_dir.glob("*.png")):
+                    continue
+                video_path = videos_dir / f"{cfg['short']}_{domain}.mp4"
+                status, detail = assemble_mp4(frame_dir, f"{cfg['short']}_{domain}", video_path, args.fps)
+                log(f"mp4 {job.field}/{domain}: {status} {detail}")
+        log("mp4 stage end")
+    else:
+        log("mp4 stage skipped")
+
+    write_summary(out_dir, rows, manifest)
+    log(f"Wrote advisor package to {out_dir}")
+    return manifest
+
 def main() -> None:
+    log("entering main")
     args = parse_args()
+    log(f"parsed args: {args}")
     render(args)
 
 
