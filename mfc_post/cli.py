@@ -53,6 +53,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="replace mfc-post render files in an existing nonempty output directory",
     )
     render_parser.add_argument("--execution", choices=("auto", "serial", "mpi"), default="auto")
+    render_parser.add_argument(
+        "--temperature-mask", choices=("strict_gas", "nonliquid"), default="strict_gas",
+        help="temperature plotting mask (default: strict_gas)",
+    )
     render_parser.add_argument("--mechanism", help="explicit Cantera YAML when metadata is incomplete")
     render_parser.add_argument("--phase", help="explicit mechanism phase name")
     render_parser.add_argument("--no-mp4", action="store_true", help="explicitly disable MP4 output")
@@ -128,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
                 execution=args.execution, mechanism=args.mechanism, phase=args.phase,
                 stride=args.stride, overwrite=args.overwrite, no_mp4=args.no_mp4,
                 overlay=overlay, overlay_levels=_comma_floats(args.overlay_levels),
+                temperature_mask=args.temperature_mask,
             )
             if result is not None:
                 print(

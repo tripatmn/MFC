@@ -14,6 +14,10 @@ mpiexec -n 8 ./mfc-post process /path/to/case --execution mpi
   --fields temperature,OH,NC12H26,O2,phi,alpha_liq \
   --no-mp4 --out-dir /path/to/render_clean
 ./mfc-post render /path/to/case \
+  --selected-times-us 5.0 --fields temperature \
+  --temperature-mask nonliquid \
+  --no-mp4 --out-dir /path/to/render_nonliquid
+./mfc-post render /path/to/case \
   --time-range-us 0,10 --stride 2 --fields temperature \
   --overlay temperature,phi \
   --no-mp4 --out-dir /path/to/render_clean_overlay
@@ -80,6 +84,12 @@ reconstructed-liquid-fraction underlay instead of an unexplained gray blob.
 Temperature is
 chemistry-clipped and chemistry-valid/gas-dominated masked; species images use
 gas-phase `Y_k`, and `phi` uses the configured mechanism molecular weights.
+This strict temperature policy remains the default through
+`--temperature-mask strict_gas`. For droplet deformation and near-wake views,
+`--temperature-mask nonliquid` plots finite reconstructed temperature wherever
+`alpha_liq <= 0.5`; species masks are unchanged. Temperature directories and
+filenames include `strict_gas` or `nonliquid`, and per-frame plotted/masked cell
+counts and the exact policy are recorded in the manifest and provenance.
 `--overlay temperature,phi` adds clean equivalence-ratio contour lines with
 default level 1.0. Pass `--overlay-levels 0.5,1.0,2.0` only when multiple
 equivalence-ratio contours are wanted.

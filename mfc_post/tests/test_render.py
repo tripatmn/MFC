@@ -74,20 +74,22 @@ class RenderTests(unittest.TestCase):
             )
             self.assertEqual([item["saved_index"] for item in result["selections"]], [0, 2])
             self.assertEqual(len(result["frames"]), 14)
-            expected_directories = set(RENDER_FIELDS) | {"overlay_temperature_phi"}
+            expected_directories = (
+                set(RENDER_FIELDS) - {"temperature"}
+            ) | {"temperature_strict_gas", "overlay_temperature_strict_gas_phi"}
             self.assertEqual(
                 {path.name for path in out.iterdir() if path.is_dir()}, expected_directories,
             )
             expected_names = {
-                "temperature/temperature_t0000p00us.png",
-                "temperature/temperature_t0010p00us.png",
+                "temperature_strict_gas/temperature_strict_gas_t0000p00us.png",
+                "temperature_strict_gas/temperature_strict_gas_t0010p00us.png",
                 "OH/OH_t0000p00us.png", "OH/OH_t0010p00us.png",
                 "NC12H26/NC12H26_t0000p00us.png", "NC12H26/NC12H26_t0010p00us.png",
                 "O2/O2_t0000p00us.png", "O2/O2_t0010p00us.png",
                 "phi/phi_t0000p00us.png", "phi/phi_t0010p00us.png",
                 "alpha_liq/alpha_liq_t0000p00us.png", "alpha_liq/alpha_liq_t0010p00us.png",
-                "overlay_temperature_phi/temperature_phi_t0000p00us.png",
-                "overlay_temperature_phi/temperature_phi_t0010p00us.png",
+                "overlay_temperature_strict_gas_phi/temperature_strict_gas_phi_t0000p00us.png",
+                "overlay_temperature_strict_gas_phi/temperature_strict_gas_phi_t0010p00us.png",
             }
             observed_names = {
                 str(path.relative_to(out)) for path in out.rglob("*.png")
@@ -123,7 +125,7 @@ class RenderTests(unittest.TestCase):
             self.assertEqual(len(replaced["frames"]), 1)
             self.assertEqual(
                 {str(path.relative_to(out)) for path in out.rglob("*.png")},
-                {"temperature/temperature_t0005p00us.png"},
+                {"temperature_strict_gas/temperature_strict_gas_t0005p00us.png"},
             )
             with self.assertRaisesRegex(ValueError, "zero saved states"):
                 render_case(
@@ -131,6 +133,54 @@ class RenderTests(unittest.TestCase):
                     execution="serial", time_range_us=(20.0, 30.0),
                 )
             self.assertFalse((root / "empty").exists())
+
+    def test_nonliquid_temperature_mask_plots_more_mixed_cells(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _case(root)
+            strict = render_case(
+                root, selected_times_us=(5.0,), fields=("temperature",),
+                out_dir=root / "strict", execution="serial",
+            )
+            nonliquid = render_case(
+                root, selected_times_us=(5.0,), fields=("temperature",),
+                out_dir=root / "nonliquid", execution="serial",
+                temperature_mask="nonliquid", overlay=("temperature", "phi"),
+            )
+            strict_frame = strict["frames"][0]
+            nonliquid_frame = next(
+                frame for frame in nonliquid["frames"] if frame["kind"] == "field"
+            )
+            self.assertEqual(strict["temperature_mask"]["mode"], "strict_gas")
+            self.assertEqual(nonliquid["temperature_mask"]["mode"], "nonliquid")
+            self.assertGreater(
+                nonliquid_frame["plot_cell_counts"]["plotted"],
+                strict_frame["plot_cell_counts"]["plotted"],
+            )
+            self.assertEqual(
+                nonliquid_frame["plot_cell_counts"]["masked"],
+                nonliquid_frame["plot_cell_counts"]["total"]
+                - nonliquid_frame["plot_cell_counts"]["plotted"],
+            )
+            self.assertTrue(
+                (root / "nonliquid" / "temperature_nonliquid"
+                 / "temperature_nonliquid_t0005p00us.png").is_file()
+            )
+            self.assertTrue(
+                (root / "nonliquid" / "overlay_temperature_nonliquid_phi"
+                 / "temperature_nonliquid_phi_t0005p00us.png").is_file()
+            )
+            provenance = json.loads((root / "nonliquid" / "provenance.json").read_text())
+            self.assertEqual(
+                provenance["render_policy"]["temperature_mask"]["definition"],
+                "alpha_liq <= 0.5 AND isfinite(temperature)",
+            )
+            provenance_counts = provenance["render_policy"]["temperature_mask"]["cell_counts"]
+            self.assertEqual(len(provenance_counts), 2)
+            self.assertEqual(
+                provenance_counts[0]["plotted"],
+                nonliquid_frame["plot_cell_counts"]["plotted"],
+            )
 
     def test_render_help(self):
         repository = Path(__file__).resolve().parents[2]
@@ -142,6 +192,7 @@ class RenderTests(unittest.TestCase):
         for option in (
             "--selected-times-us", "--time-range-us", "--stride", "--fields",
             "--overwrite", "--execution", "--out-dir", "--no-mp4", "--overlay",
+            "--temperature-mask",
         ):
             self.assertIn(option, result.stdout)
 

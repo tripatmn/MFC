@@ -25,6 +25,10 @@ O2_FLOOR = 1.0e-12
 LIQUID_CONTOUR_LEVEL = 0.5
 LIQUID_CONTOUR_COLOR = "#00a6c8"
 LIQUID_CONTOUR_WIDTH = 1.1
+TEMPERATURE_MASKS = {
+    "strict_gas": "mask.chemistry_valid AND mask.gas_dominated",
+    "nonliquid": "alpha_liq <= 0.5 AND isfinite(temperature)",
+}
 
 FIELD_STYLE = {
     "temperature": ("Temperature", "Temperature [K]", "inferno"),
@@ -50,6 +54,7 @@ def render_case(
     no_mp4: bool = False,
     overlay: tuple[str, str] | None = None,
     overlay_levels: Iterable[float] = DEFAULT_PHI_LEVELS,
+    temperature_mask: str = "strict_gas",
 ) -> dict[str, Any] | None:
     context = ExecutionContext.create(execution)
     root = Path(case_path).expanduser().resolve()
@@ -61,6 +66,10 @@ def render_case(
         raise ValueError("--stride must be a positive integer")
     if selected_times_us is not None and time_range_us is not None:
         raise ValueError("--selected-times-us and --time-range-us are mutually exclusive")
+    if temperature_mask not in TEMPERATURE_MASKS:
+        raise ValueError(
+            f"unknown temperature mask {temperature_mask!r}; choose from {tuple(TEMPERATURE_MASKS)}"
+        )
 
     _progress(context, f"startup: case path: {root}")
     inspection = inspect_case(root, mechanism=mechanism, phase=phase)
@@ -104,6 +113,7 @@ def render_case(
     _progress(context, f"startup: discovered p_all path: {report['path']}")
     _progress(context, f"startup: saves discovered: {len(report['timeline']['saved_indices'])}")
     _progress(context, f"startup: saves selected after filters: {len(selections)}")
+    _progress(context, f"startup: temperature mask: {temperature_mask}")
     _progress(context, f"startup: output directory: {destination}")
     _prepare_output(context, destination, overwrite)
 
@@ -125,7 +135,7 @@ def render_case(
         if context.rank == 0:
             all_sources.update(assembled["source_files"])
             for symbol in load_symbols:
-                plotted, _ = _plot_data(symbol, assembled)
+                plotted, _ = _plot_data(symbol, assembled, temperature_mask)
                 observed = _range(plotted)
                 if observed[0] is not None:
                     ranges[symbol][0] = min(ranges[symbol][0], observed[0])
@@ -157,12 +167,13 @@ def render_case(
                 counts = _mask_counts(assembled)
                 for symbol in canonical_fields:
                     frames.append(_render_field(
-                        destination, selection, symbol, assembled, limits[symbol], config, counts
+                        destination, selection, symbol, assembled, limits[symbol], config, counts,
+                        temperature_mask,
                     ))
                 if canonical_overlay:
                     frames.append(_render_overlay(
                         destination, selection, canonical_overlay, levels, assembled,
-                        limits[canonical_overlay[0]], counts,
+                        limits[canonical_overlay[0]], counts, temperature_mask,
                     ))
             except Exception as exc:
                 root_error = (
@@ -177,7 +188,9 @@ def render_case(
         return None
     if not frames:
         raise RuntimeError("render produced zero PNG artifacts; no manifest written")
-    provenance = _provenance(config, all_sources, limits, canonical_overlay, levels)
+    provenance = _provenance(
+        config, all_sources, limits, canonical_overlay, levels, temperature_mask, frames,
+    )
     manifest = {
         "schema_version": "mfc-post.render-clean/v1",
         "case": str(root),
@@ -185,6 +198,11 @@ def render_case(
         "selection_policy": "nearest requested saves or inclusive time range, followed by stride",
         "selections": selections,
         "fields": list(canonical_fields),
+        "temperature_mask": {
+            "mode": temperature_mask,
+            "definition": TEMPERATURE_MASKS[temperature_mask],
+            "alpha_liq_threshold": LIQUID_CONTOUR_LEVEL,
+        },
         "field_limits": {
             symbol: {"minimum": value[0], "maximum": value[1]} for symbol, value in limits.items()
         },
@@ -377,12 +395,18 @@ def _assemble(pieces, symbols):
     return {"x_bounds": x_bounds, "y_bounds": y_bounds, "fields": fields, "masks": masks}
 
 
-def _plot_data(symbol, assembled):
+def _plot_data(symbol, assembled, temperature_mask="strict_gas"):
     fields, masks = assembled["fields"], assembled["masks"]
     values = fields[symbol]
     if symbol == "temperature":
-        mask = masks["mask.chemistry_valid"] & masks["mask.gas_dominated"]
-        policy = "mask.chemistry_valid AND mask.gas_dominated; chemistry-clipped temperature"
+        if temperature_mask == "strict_gas":
+            mask = masks["mask.chemistry_valid"] & masks["mask.gas_dominated"]
+        elif temperature_mask == "nonliquid":
+            alpha_liq = fields["alpha_liq"]
+            mask = (alpha_liq <= LIQUID_CONTOUR_LEVEL) & np.isfinite(values)
+        else:
+            raise ValueError(f"unknown temperature mask {temperature_mask!r}")
+        policy = TEMPERATURE_MASKS[temperature_mask] + "; chemistry-clipped temperature"
     elif symbol in {"OH", "NC12H26", "O2", "phi"}:
         mask = masks["mask.valid"] & masks["mask.gas_dominated"] & np.isfinite(values)
         policy = "mask.valid AND mask.gas_dominated"
@@ -392,17 +416,20 @@ def _plot_data(symbol, assembled):
     return np.where(mask, values, np.nan), policy
 
 
-def _render_field(destination, selection, symbol, assembled, limits, config, counts):
+def _render_field(
+    destination, selection, symbol, assembled, limits, config, counts, temperature_mask,
+):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    plotted, mask_policy = _plot_data(symbol, assembled)
+    plotted, mask_policy = _plot_data(symbol, assembled, temperature_mask)
     raw_values = assembled["fields"]["temperature.raw"] if symbol == "temperature" else assembled["fields"][symbol]
     title, colorbar_label, cmap_name = FIELD_STYLE[symbol]
-    folder = destination / symbol
+    output_symbol = _output_symbol(symbol, temperature_mask)
+    folder = destination / output_symbol
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{symbol}_t{_time_token(selection['actual_time_us'])}us.png"
+    path = folder / f"{output_symbol}_t{_time_token(selection['actual_time_us'])}us.png"
     figure = None
     try:
         figure, axis = plt.subplots(figsize=(10.0, 4.2), constrained_layout=True)
@@ -427,6 +454,8 @@ def _render_field(destination, selection, symbol, assembled, limits, config, cou
         "raw_range": _range_dict(raw_values), "plotted_range": _range_dict(plotted),
         "color_limits": {"minimum": limits[0], "maximum": limits[1]},
         "mask_policy": mask_policy, "counts": counts,
+        "plot_cell_counts": _plot_cell_counts(plotted),
+        "temperature_mask": temperature_mask if symbol == "temperature" else None,
         "liquid_context": _liquid_context_record(liquid_contour_drawn),
         "species_equation_index": (
             config.equation_indices[f"species_density[{_actual_species(config, symbol)}]"]
@@ -435,17 +464,23 @@ def _render_field(destination, selection, symbol, assembled, limits, config, cou
     }
 
 
-def _render_overlay(destination, selection, overlay, levels, assembled, base_limits, counts):
+def _render_overlay(
+    destination, selection, overlay, levels, assembled, base_limits, counts, temperature_mask,
+):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     base, contour = overlay
-    base_values, base_policy = _plot_data(base, assembled)
-    contour_values, contour_policy = _plot_data(contour, assembled)
-    folder = destination / f"overlay_{base}_{contour}"
+    base_values, base_policy = _plot_data(base, assembled, temperature_mask)
+    contour_values, contour_policy = _plot_data(contour, assembled, temperature_mask)
+    base_output = _output_symbol(base, temperature_mask)
+    contour_output = _output_symbol(contour, temperature_mask)
+    folder = destination / f"overlay_{base_output}_{contour_output}"
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{base}_{contour}_t{_time_token(selection['actual_time_us'])}us.png"
+    path = folder / (
+        f"{base_output}_{contour_output}_t{_time_token(selection['actual_time_us'])}us.png"
+    )
     contour_range = _range(contour_values)
     drawn_levels = [
         value for value in levels
@@ -492,8 +527,21 @@ def _render_overlay(destination, selection, overlay, levels, assembled, base_lim
         "path": str(path), "levels_requested": list(levels), "levels_drawn": drawn_levels,
         "base_color_limits": {"minimum": base_limits[0], "maximum": base_limits[1]},
         "base_mask_policy": base_policy, "overlay_mask_policy": contour_policy, "counts": counts,
+        "base_plot_cell_counts": _plot_cell_counts(base_values),
+        "overlay_plot_cell_counts": _plot_cell_counts(contour_values),
+        "temperature_mask": temperature_mask if "temperature" in overlay else None,
         "liquid_context": _liquid_context_record(liquid_contour_drawn),
     }
+
+
+def _output_symbol(symbol, temperature_mask):
+    return f"temperature_{temperature_mask}" if symbol == "temperature" else symbol
+
+
+def _plot_cell_counts(plotted):
+    plotted_count = int(np.count_nonzero(np.isfinite(plotted)))
+    total = int(np.asarray(plotted).size)
+    return {"total": total, "plotted": plotted_count, "masked": total - plotted_count}
 
 
 def _draw_liquid_underlay(axis, assembled):
@@ -650,6 +698,9 @@ def _prepare_output(context, destination, overwrite):
                 for path in destination.glob("overlay_*"):
                     if path.is_dir():
                         shutil.rmtree(path)
+                for path in destination.glob("temperature_*"):
+                    if path.is_dir():
+                        shutil.rmtree(path)
             destination.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -658,7 +709,7 @@ def _prepare_output(context, destination, overwrite):
         raise RuntimeError(errors[0])
 
 
-def _provenance(config, source_files, limits, overlay, levels):
+def _provenance(config, source_files, limits, overlay, levels, temperature_mask, frames):
     return {
         "source_files": sorted(source_files),
         "mechanism": {"path": config.mechanism_path, "phase": config.mechanism_phase},
@@ -679,7 +730,13 @@ def _provenance(config, source_files, limits, overlay, levels):
         },
         "render_policy": {
             "clean_static_png": True,
-            "temperature": "chemistry-clipped temperature; chemistry-valid AND gas-dominated",
+            "temperature_mask": {
+                "mode": temperature_mask,
+                "definition": TEMPERATURE_MASKS[temperature_mask],
+                "alpha_liq_threshold": LIQUID_CONTOUR_LEVEL,
+                "temperature_field": "chemistry-clipped temperature",
+                "cell_counts": _temperature_cell_counts(frames),
+            },
             "species_and_phi": "gas-phase fields; valid AND gas-dominated",
             "alpha_liq": "solver-reconstructed liquid volume fraction over valid cells",
             "masked_regions": (
@@ -693,6 +750,24 @@ def _provenance(config, source_files, limits, overlay, levels):
             ),
         },
     }
+
+
+def _temperature_cell_counts(frames):
+    records = []
+    for frame in frames:
+        if frame.get("field") == "temperature":
+            counts, role = frame["plot_cell_counts"], "field"
+        elif frame.get("base_field") == "temperature":
+            counts, role = frame["base_plot_cell_counts"], "overlay_base"
+        elif frame.get("overlay_field") == "temperature":
+            counts, role = frame["overlay_plot_cell_counts"], "overlay_contour"
+        else:
+            continue
+        records.append({
+            "saved_index": frame["saved_index"], "actual_time_us": frame["actual_time_us"],
+            "role": role, **counts,
+        })
+    return records
 
 
 def _atomic_json(path, value):
