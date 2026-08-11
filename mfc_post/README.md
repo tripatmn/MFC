@@ -14,6 +14,14 @@ mpiexec -n 8 ./mfc-post process /path/to/case --execution mpi
   --fields 'temperature,Y[NC12H26],Y[OH],Y[CO2],Y[H2O]' \
   --no-zoom --no-mp4 --skip-scalars --skip-trends \
   --out-dir /path/to/distinct-render-output
+./mfc-post analyze /path/to/case --selected-times-us 0,5,10 \
+  --out-dir /path/to/analysis
+mpiexec -n 8 ./mfc-post analyze /path/to/case --time-range-us 0,100 \
+  --stride 2 --execution mpi --out-dir /path/to/mpi-analysis
+./mfc-post plot /path/to/analysis --plot-set all
+./mfc-post plot /path/to/analysis/scalar_timeseries.csv \
+  --fields max_valid_gas_temperature_K,integrated_rhoY_OH \
+  --out-dir /path/to/distinct-trends
 ```
 
 Inspection inventories each MFC output family independently. It never combines
@@ -63,3 +71,15 @@ chemistry-valid and gas-dominated masks, while the manifest separately reports
 the raw reconstructed temperature range and clipping count. Species images use
 gas-phase `Y_k`, never conservative `rhoY_k`. A nonempty output directory is
 rejected so separate serial and MPI validations cannot overwrite one another.
+
+Scalar analysis writes `scalar_timeseries.csv`, `quality.json`, and
+`provenance.json`. Raw conservative species inventories are integrated using
+the actual cell measures; temperature, mass-fraction, hot-region, combustible,
+and overlap diagnostics use the recorded valid-gas policy. MPI runs assign
+whole states to workers when temporal concurrency is favorable and otherwise
+reduce spatial partitions. Rank 0 orders and writes the sole history.
+
+Trend plotting reads only `scalar_timeseries.csv`; it does not rediscover the
+case or open `p_all`. `--plot-set` accepts `species`, `thermal`, `mixing`,
+`default`, or `all`. Each scalar is written as an independent PNG alongside a
+manifest containing the CSV hash and selected fields.

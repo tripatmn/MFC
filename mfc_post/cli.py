@@ -7,7 +7,9 @@ import json
 import sys
 from typing import Any
 
+from .analysis import analyze_case
 from .inspect import inspect_case
+from .plotting import PLOT_SETS, plot_history
 from .process import process_case
 from .render import RENDER_FIELDS, render_case
 
@@ -49,6 +51,26 @@ def build_parser() -> argparse.ArgumentParser:
     render_parser.add_argument("--no-mp4", action="store_true", help="explicitly disable MP4 output")
     render_parser.add_argument("--skip-scalars", action="store_true", help="skip scalar-history processing")
     render_parser.add_argument("--skip-trends", action="store_true", help="skip trend processing")
+    analyze_parser = subparsers.add_parser(
+        "analyze", help="compute an MPI-compatible scalar history from raw p_all saves"
+    )
+    analyze_parser.add_argument("case", help="path to an MFC case/run directory")
+    selection = analyze_parser.add_mutually_exclusive_group()
+    selection.add_argument("--selected-times-us", help="comma-separated requested times; nearest saves are used")
+    selection.add_argument("--time-range-us", help="inclusive START,STOP range in microseconds")
+    analyze_parser.add_argument("--stride", type=int, default=1, help="retain every Nth selected save")
+    analyze_parser.add_argument("--out-dir", required=True, help="new or empty output directory")
+    analyze_parser.add_argument("--execution", choices=("auto", "serial", "mpi"), default="auto")
+    analyze_parser.add_argument("--mechanism", help="explicit Cantera YAML when metadata is incomplete")
+    analyze_parser.add_argument("--phase", help="explicit mechanism phase name")
+    plot_parser = subparsers.add_parser(
+        "plot", help="render trend PNGs from scalar_timeseries.csv without reading p_all"
+    )
+    plot_parser.add_argument("input", help="scalar_timeseries.csv or its analysis directory")
+    plot_selection = plot_parser.add_mutually_exclusive_group()
+    plot_selection.add_argument("--fields", help="comma-separated scalar CSV columns")
+    plot_selection.add_argument("--plot-set", choices=tuple(PLOT_SETS), default=None)
+    plot_parser.add_argument("--out-dir", help="new or empty output directory (default: INPUT/trend_plots)")
     return parser
 
 
@@ -89,7 +111,34 @@ def main(argv: list[str] | None = None) -> int:
                     f"{result['output_directory']}", flush=True,
                 )
             return 0
-    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        if args.command == "analyze":
+            time_range = _time_range(args.time_range_us) if args.time_range_us else None
+            result = analyze_case(
+                args.case,
+                selected_times_us=(
+                    _comma_floats(args.selected_times_us) if args.selected_times_us else None
+                ),
+                time_range_us=time_range, stride=args.stride, out_dir=args.out_dir,
+                execution=args.execution, mechanism=args.mechanism, phase=args.phase,
+            )
+            if result is not None:
+                print(
+                    f"mfc-post: analyzed {len(result['rows'])} state(s) -> "
+                    f"{result['output_directory']}", flush=True,
+                )
+            return 0
+        if args.command == "plot":
+            result = plot_history(
+                args.input,
+                fields=_comma_strings(args.fields) if args.fields else None,
+                plot_set=args.plot_set, out_dir=args.out_dir,
+            )
+            print(
+                f"mfc-post: plotted {len(result['files'])} trend(s) -> "
+                f"{result['output_directory']}", flush=True,
+            )
+            return 0
+    except (OSError, RuntimeError, ValueError) as exc:
         print(f"mfc-post: {exc}", file=sys.stderr)
         return 2
     return 1
@@ -104,6 +153,13 @@ def _comma_floats(value: str) -> tuple[float, ...]:
         return tuple(float(item) for item in _comma_strings(value))
     except ValueError as exc:
         raise ValueError(f"invalid --selected-times-us value: {value!r}") from exc
+
+
+def _time_range(value: str) -> tuple[float, float]:
+    parsed = _comma_floats(value)
+    if len(parsed) != 2:
+        raise ValueError(f"--time-range-us requires exactly START,STOP; got {value!r}")
+    return parsed
 
 
 def format_text(result: dict[str, Any]) -> str:
