@@ -94,6 +94,25 @@ precision = 2
             result = inspect_case(root)
             self.assertIsNone(result["recommendation"])
 
+    def test_lustre_restart_continuation_warns_about_global_time_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "simulation.inp").write_text(
+                "m=0\nn=0\np=0\nmodel_eqns=2\nnum_fluids=1\n"
+                "parallel_io=T\nt_save=1e-6\nn_start=100\n"
+            )
+            restart = root / "restart_data"
+            restart.mkdir()
+            (restart / "lustre_x_cb.dat").write_bytes(struct.pack("<2d", 0.0, 1.0))
+            # Four Model-2 fields for one cell.
+            (restart / "lustre_0.dat").write_bytes(struct.pack("<4d", 1.0, 0.0, 1.0, 1.0))
+            result = inspect_case(root)
+            timeline = result["timeline"]["lustre_shared"]
+            self.assertTrue(any(
+                "global saved-index/time offset is ambiguous" in warning
+                for warning in timeline["warnings"]
+            ))
+
 
 if __name__ == "__main__":
     unittest.main()

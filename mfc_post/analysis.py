@@ -16,7 +16,7 @@ from .inspect import inspect_case
 from .models import RunMetadata, State
 from .process import _load_local, _partition_plan, _transformation_provenance
 from .reconstruction import Model3Configuration, reconstruct_model3
-from .sources import PAllSource
+from .source_selection import select_raw_source
 
 
 INTEGRATED_SPECIES = ("NC12H26", "O2", "OH", "HO2", "H2O2", "CO", "CO2", "H2O")
@@ -47,6 +47,7 @@ def analyze_case(
     mechanism: str | Path | None = None,
     phase: str | None = None,
     overwrite: bool = False,
+    source_family: str = "auto",
 ) -> dict[str, Any] | None:
     context = ExecutionContext.create(execution)
     root = Path(case_path).expanduser().resolve()
@@ -59,15 +60,13 @@ def analyze_case(
     _progress(context, f"startup: case path: {root}")
     inspection = inspect_case(root, mechanism=mechanism, phase=phase)
     metadata = _metadata(inspection)
-    report = next((item for item in inspection["sources"] if item["family"] == "p_all"), None)
-    if report is None or not report["timeline"]["saved_indices"]:
-        raise ValueError(f"scalar analysis requires raw p_all saves; none were found in {root}")
+    source, report = select_raw_source(root, metadata, inspection, source_family)
     discovered_count = len(report["timeline"]["saved_indices"])
-    _progress(context, f"startup: discovered p_all path: {report['path']}")
+    _progress(context, f"startup: selected source family: {report['family']}")
+    _progress(context, f"startup: selected source path: {report['path']}")
     _progress(context, f"startup: saves discovered: {discovered_count}")
     config = Model3Configuration.from_metadata(metadata)
     _validate_species(config, metadata)
-    source = PAllSource(root, metadata)
     indices, selection = _select_indices(
         report["timeline"], selected_times_us, time_range_us, stride
     )
@@ -93,7 +92,7 @@ def analyze_case(
                 reduced = _reduce(partial, state_comm, context.mpi, metadata.dimensions or 1)
                 rows.append(_row(saved_index, report["timeline"], reduced))
             except Exception as exc:
-                errors.append(_error(context, saved_index, exc))
+                errors.append(_error(context, report["family"], saved_index, exc))
         all_errors = [item for group in context.comm.allgather(errors) for item in group]
         if all_errors:
             raise RuntimeError("analysis failed; no output written:\n" + "\n".join(sorted(all_errors)))
@@ -112,7 +111,7 @@ def analyze_case(
                 states = _load_local(source, saved_index, raw_fields, strategy, context)
                 partial = _accumulate(states, config)
             except Exception as exc:
-                local_error = _error(context, saved_index, exc)
+                local_error = _error(context, report["family"], saved_index, exc)
             state_errors = [item for item in context.comm.allgather(local_error) if item]
             if state_errors:
                 raise RuntimeError("analysis failed; no output written:\n" + "\n".join(sorted(state_errors)))
@@ -133,12 +132,12 @@ def analyze_case(
     ]
     provenance = _provenance(
         root, report, config, context, strategy, indices, selection, stride,
-        source_files, source, metadata,
+        source_files, source, metadata, rows,
     )
     _write_csv(destination / "scalar_timeseries.csv", rows)
     _atomic_json(destination / "quality.json", {
         "schema_version": "mfc-post.quality/v1",
-        "source_family": "p_all",
+        "source_family": report["family"],
         "quality": quality,
     })
     _atomic_json(destination / "provenance.json", provenance)
@@ -436,14 +435,30 @@ def _species_lookup(config: Model3Configuration) -> dict[str, str]:
     }
 
 
-def _provenance(root, report, config, context, strategy, indices, selection, stride, source_files, source, metadata):
+def _provenance(
+    root, report, config, context, strategy, indices, selection, stride,
+    source_files, source, metadata, rows,
+):
     measure = {1: "kg/m2 for integrals and m for measures", 2: "kg/m for integrals and m2 for areas", 3: "kg for integrals and m3 for volumes"}.get(metadata.dimensions)
     return {
         "schema_version": "mfc-post.analyze/v1", "case": str(root),
+        "source_family": report["family"], "source_path": report["path"],
         "source": {
-            "family": "p_all", "path": report["path"], "layout": report["layout"],
+            "family": report["family"], "path": report["path"], "layout": report["layout"],
             "files": source_files,
             "warnings": report.get("warnings", []) + report["timeline"].get("warnings", []),
+        },
+        "timeline": {
+            "time_basis": report["timeline"]["time_basis"],
+            "t_save": metadata.parameters.get("t_save"),
+            "records": [
+                {
+                    "saved_index": row["saved_index"],
+                    "simulation_step": row["simulation_step"],
+                    "physical_time": row["physical_time_s"],
+                }
+                for row in rows
+            ],
         },
         "selection": selection,
         "execution": {
@@ -486,7 +501,10 @@ def _provenance(root, report, config, context, strategy, indices, selection, str
                 "MPI SUM: integrals, weighted temperature, areas, and counts",
                 "MPI MAX: temperature, species fractions, and closure residuals",
             ],
-            "state": "each state is owned by one MPI worker and accumulated over its stored p_all partitions without a cross-state reduction",
+            "state": (
+                "each state is owned by one MPI worker and accumulated over its source "
+                "partitions/chunks without a cross-state reduction"
+            ),
         },
         "stride": stride,
     }
@@ -521,8 +539,11 @@ def _atomic_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-def _error(context, saved_index, exc):
-    return f"worker_rank={context.rank} source=p_all saved_index={saved_index}: {type(exc).__name__}: {exc}"
+def _error(context, family, saved_index, exc):
+    return (
+        f"worker_rank={context.rank} source={family} saved_index={saved_index}: "
+        f"{type(exc).__name__}: {exc}"
+    )
 
 
 def _progress(context, message):

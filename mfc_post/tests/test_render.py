@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import struct
 import subprocess
 import sys
@@ -8,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from mfc_post.cli import _field_limits
+from mfc_post.inspect import inspect_case
 from mfc_post.render import RENDER_FIELDS, _select_times, render_case
 
 
@@ -55,6 +58,21 @@ def _case(root: Path) -> None:
             _record(state / f"q_cons_vf{index}.dat", values)
 
 
+def _lustre_from_p_all(root: Path, saved_index: int) -> None:
+    restart = root / "restart_data"
+    restart.mkdir()
+    restart.joinpath("lustre_x_cb.dat").write_bytes(struct.pack("<3d", 0.0, 1.0e-6, 2.0e-6))
+    restart.joinpath("lustre_y_cb.dat").write_bytes(struct.pack("<3d", 0.0, 1.0e-6, 2.0e-6))
+    state = root / "p_all" / "p0" / str(saved_index)
+    fields = sorted(
+        state.glob("q_cons_vf*.dat"),
+        key=lambda path: int(path.stem.removeprefix("q_cons_vf")),
+    )
+    restart.joinpath(f"lustre_{saved_index}.dat").write_bytes(
+        b"".join(path.read_bytes()[4:-4] for path in fields)
+    )
+
+
 class RenderTests(unittest.TestCase):
     def test_nearest_time_tie_chooses_earlier_save(self):
         timeline = {"saved_indices": [2, 4], "physical_times": [4.0e-6, 6.0e-6]}
@@ -66,6 +84,7 @@ class RenderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _case(root)
+            _lustre_from_p_all(root, 0)
             out = root / "render_clean"
             result = render_case(
                 root, fields=RENDER_FIELDS, out_dir=out, execution="serial",
@@ -96,6 +115,8 @@ class RenderTests(unittest.TestCase):
             }
             self.assertEqual(observed_names, expected_names)
             manifest = json.loads((out / "manifest.json").read_text())
+            self.assertEqual(manifest["source"]["family"], "p_all")
+            self.assertEqual(manifest["field_limits"]["temperature"]["mode"], "batch")
             self.assertEqual(manifest["schema_version"], "mfc-post.render-clean/v1")
             self.assertEqual(manifest["overlay"]["levels"], [1.0])
             self.assertTrue(all(
@@ -133,6 +154,66 @@ class RenderTests(unittest.TestCase):
                     execution="serial", time_range_us=(20.0, 30.0),
                 )
             self.assertFalse((root / "empty").exists())
+
+    def test_manual_temperature_limits_parse_render_and_record(self):
+        self.assertEqual(
+            _field_limits(["temperature:1000:2200"]),
+            {"temperature": (1000.0, 2200.0)},
+        )
+        with self.assertRaisesRegex(ValueError, "FIELD:VMIN:VMAX"):
+            _field_limits(["temperature:1000"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _case(root)
+            out = root / "manual"
+            result = render_case(
+                root, selected_times_us=(5.0,), fields=("temperature",),
+                temperature_mask="nonliquid", field_limits={"temperature": (1000, 2200)},
+                execution="serial", out_dir=out,
+            )
+            expected = (
+                out / "temperature_nonliquid_T1000_2200"
+                / "temperature_nonliquid_T1000_2200_t0005p00us.png"
+            )
+            self.assertTrue(expected.is_file())
+            frame = result["frames"][0]
+            self.assertEqual(
+                frame["color_limits"],
+                {"minimum": 1000.0, "maximum": 2200.0, "mode": "manual"},
+            )
+            self.assertEqual(
+                result["field_limits"]["temperature"],
+                {"minimum": 1000.0, "maximum": 2200.0, "mode": "manual"},
+            )
+            provenance = json.loads((out / "provenance.json").read_text())
+            self.assertEqual(
+                provenance["manual_field_limits"]["temperature"],
+                {"minimum": 1000.0, "maximum": 2200.0},
+            )
+
+    def test_auto_renders_shared_lustre_temperature_without_p_all(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _case(root)
+            _lustre_from_p_all(root, 1)
+            shutil.rmtree(root / "p_all")
+            inspection = inspect_case(root)
+            self.assertEqual(
+                {item["family"] for item in inspection["sources"]}, {"lustre_shared"},
+            )
+            result = render_case(
+                root, selected_times_us=(5.0,), fields=("temperature",),
+                temperature_mask="nonliquid", execution="serial",
+                out_dir=root / "lustre_render",
+            )
+            self.assertEqual(result["source"]["family"], "lustre_shared")
+            self.assertTrue(
+                (root / "lustre_render" / "temperature_nonliquid"
+                 / "temperature_nonliquid_t0005p00us.png").is_file()
+            )
+            provenance = json.loads((root / "lustre_render" / "provenance.json").read_text())
+            self.assertEqual(provenance["source_family"], "lustre_shared")
+            self.assertIn("saved_index * t_save", provenance["timeline"]["time_basis"])
 
     def test_nonliquid_temperature_mask_plots_more_mixed_cells(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -193,6 +274,8 @@ class RenderTests(unittest.TestCase):
             "--selected-times-us", "--time-range-us", "--stride", "--fields",
             "--overwrite", "--execution", "--out-dir", "--no-mp4", "--overlay",
             "--temperature-mask",
+            "--source",
+            "--field-limits",
         ):
             self.assertIn(option, result.stdout)
 

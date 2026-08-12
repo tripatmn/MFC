@@ -57,7 +57,7 @@ class LustreSharedSource(DataSource):
             family=self.family,
             path=str(self.path),
             layout="restart_data/lustre_<saved_index>.dat plus markerless lustre_{x,y,z}_cb.dat; global variable-major MPI-IO",
-            timeline=make_timeline((index for index, _ in files), params),
+            timeline=make_timeline((index for index, _ in files), params, saved_output=True),
             grid=grid,
             precision=precision_label(params, raw=True),
             downsampled=bool_param(params, "down_sample"),
@@ -156,7 +156,9 @@ class LustreSharedSource(DataSource):
                 notes=(f"flattened global C-order range [{start}, {stop})", f"global shape {grid.shape}"),
             ),
         )
-        clock = make_timeline((saved_index,), dict(self.metadata.parameters))
+        clock = make_timeline(
+            (saved_index,), dict(self.metadata.parameters), saved_output=True,
+        )
         return State(
             saved_index=saved_index, simulation_step=clock.simulation_steps[0], physical_time=clock.physical_times[0],
             grid=local_grid, fields=loaded,
@@ -208,7 +210,7 @@ class LustrePerProcessSource(DataSource):
             family=self.family,
             path=str(self.path),
             layout="restart_data/lustre_<saved_index>/<saved_index>_<rank:07>.dat; markerless rank-local variable sequence",
-            timeline=make_timeline((index for index, _ in dirs), params),
+            timeline=make_timeline((index for index, _ in dirs), params, saved_output=True),
             grid=grid,
             precision=precision_label(params, raw=True),
             downsampled=bool_param(params, "down_sample"),
@@ -251,7 +253,9 @@ class LustrePerProcessSource(DataSource):
             for item in self.metadata.equation_layout
             if selected is None or item["name"] in selected
         }
-        clock = make_timeline((saved_index,), dict(self.metadata.parameters))
+        clock = make_timeline(
+            (saved_index,), dict(self.metadata.parameters), saved_output=True,
+        )
         return State(
             saved_index, clock.simulation_steps[0], clock.physical_times[0], global_grid, loaded,
             Provenance(self.family, str(path), notes=(f"stored MFC rank {partition}",)),

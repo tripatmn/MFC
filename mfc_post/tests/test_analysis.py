@@ -14,6 +14,7 @@ from pathlib import Path
 
 from mfc_post.analysis import _select_indices, analyze_case
 from mfc_post.cli import main
+from mfc_post.inspect import inspect_case
 from mfc_post.plotting import plot_history
 
 
@@ -71,6 +72,23 @@ def _case(root: Path) -> None:
             _record(state / f"q_cons_vf{index}.dat", values)
 
 
+def _lustre_from_p_all(root: Path, saved_indices) -> None:
+    restart = root / "restart_data"
+    restart.mkdir()
+    restart.joinpath("lustre_x_cb.dat").write_bytes(
+        struct.pack("<5d", 0.0, 1.0, 2.0, 4.0, 5.0)
+    )
+    for saved_index in saved_indices:
+        state = root / "p_all" / "p0" / str(saved_index)
+        fields = sorted(
+            state.glob("q_cons_vf*.dat"),
+            key=lambda path: int(path.stem.removeprefix("q_cons_vf")),
+        )
+        restart.joinpath(f"lustre_{saved_index}.dat").write_bytes(
+            b"".join(path.read_bytes()[4:-4] for path in fields)
+        )
+
+
 class AnalysisTests(unittest.TestCase):
     def test_selection_range_stride_and_nearest(self):
         timeline = {"saved_indices": [0, 1, 2], "physical_times": [0.0, 5e-6, 10e-6]}
@@ -90,7 +108,8 @@ class AnalysisTests(unittest.TestCase):
                 result = analyze_case(root, out_dir=analysis, execution="serial")
             messages = stdout.getvalue()
             self.assertIn(f"startup: case path: {root}", messages)
-            self.assertIn(f"startup: discovered p_all path: {root / 'p_all'}", messages)
+            self.assertIn("startup: selected source family: p_all", messages)
+            self.assertIn(f"startup: selected source path: {root / 'p_all'}", messages)
             self.assertIn("startup: saves discovered: 3", messages)
             self.assertIn("startup: saves selected after filters: 3", messages)
             self.assertIn(f"startup: output directory: {analysis}", messages)
@@ -178,6 +197,28 @@ class AnalysisTests(unittest.TestCase):
                 )
             self.assertEqual(len(replotted["files"]), 1)
 
+    def test_auto_reads_complete_shared_lustre_when_p_all_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _case(root)
+            _lustre_from_p_all(root, (1,))
+            shutil.rmtree(root / "p_all")
+            inspection = inspect_case(root)
+            self.assertEqual(
+                {item["family"] for item in inspection["sources"]}, {"lustre_shared"},
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = analyze_case(
+                    root, selected_times_us=(5.0,), execution="serial",
+                    out_dir=root / "lustre_analysis",
+                )
+            self.assertIn("selected source family: lustre_shared", stdout.getvalue())
+            self.assertEqual(result["provenance"]["source_family"], "lustre_shared")
+            self.assertEqual(result["rows"][0]["saved_index"], 1)
+            self.assertAlmostEqual(result["rows"][0]["physical_time_s"], 5.0e-6)
+            self.assertIn("saved_index * t_save", result["provenance"]["timeline"]["time_basis"])
+
     def test_plot_help_and_cli_failure_are_explicit(self):
         repository = Path(__file__).resolve().parents[2]
         help_result = subprocess.run(
@@ -191,6 +232,7 @@ class AnalysisTests(unittest.TestCase):
             cwd=repository, capture_output=True, text=True, check=False,
         )
         self.assertEqual(analyze_help.returncode, 0, analyze_help.stderr)
+        self.assertIn("--source", analyze_help.stdout)
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             exit_code = main(["plot", "/definitely/missing/scalar_timeseries.csv"])

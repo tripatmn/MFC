@@ -1,4 +1,4 @@
-"""Clean, selected-state contour rendering from raw p_all output."""
+"""Clean, selected-state contour rendering from supported raw MFC output."""
 
 from __future__ import annotations
 
@@ -7,16 +7,17 @@ import os
 import shutil
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
-from .execution import ExecutionContext
+from .execution import ExecutionContext, split_range
 from .inspect import inspect_case
 from .models import RunMetadata
 from .process import _transformation_provenance
 from .reconstruction import FieldRegistry, Model3Configuration, reconstruct_model3
-from .sources import PAllSource
+from .source_selection import select_raw_source
+from .sources import LustreSharedSource, PAllSource
 
 
 RENDER_FIELDS = ("temperature", "OH", "NC12H26", "O2", "phi", "alpha_liq")
@@ -55,6 +56,8 @@ def render_case(
     overlay: tuple[str, str] | None = None,
     overlay_levels: Iterable[float] = DEFAULT_PHI_LEVELS,
     temperature_mask: str = "strict_gas",
+    source_family: str = "auto",
+    field_limits: Mapping[str, tuple[float, float]] | None = None,
 ) -> dict[str, Any] | None:
     context = ExecutionContext.create(execution)
     root = Path(case_path).expanduser().resolve()
@@ -74,9 +77,7 @@ def render_case(
     _progress(context, f"startup: case path: {root}")
     inspection = inspect_case(root, mechanism=mechanism, phase=phase)
     metadata = _metadata(inspection)
-    report = next((item for item in inspection["sources"] if item["family"] == "p_all"), None)
-    if report is None or not report["timeline"]["saved_indices"]:
-        raise ValueError(f"clean rendering requires raw p_all saves; none were found in {root}")
+    source, report = select_raw_source(root, metadata, inspection, source_family)
     if metadata.dimensions != 2:
         raise ValueError(f"PNG contour rendering requires a 2D case, got {metadata.dimensions}D")
     config = Model3Configuration.from_metadata(metadata)
@@ -96,6 +97,9 @@ def render_case(
     if canonical_overlay and len(set(levels)) != len(levels):
         raise ValueError("--overlay-levels contains duplicates")
     levels = tuple(sorted(levels))
+    manual_limits = _canonical_limits(
+        field_limits or {}, config, canonical_fields, canonical_overlay,
+    )
 
     selections = _select_times(
         report["timeline"],
@@ -110,14 +114,22 @@ def render_case(
             "selected saves collide at the deterministic 0.01 us filename precision; "
             "narrow the selection or increase --stride"
         )
-    _progress(context, f"startup: discovered p_all path: {report['path']}")
+    _progress(context, f"startup: selected source family: {report['family']}")
+    _progress(context, f"startup: selected source path: {report['path']}")
     _progress(context, f"startup: saves discovered: {len(report['timeline']['saved_indices'])}")
     _progress(context, f"startup: saves selected after filters: {len(selections)}")
     _progress(context, f"startup: temperature mask: {temperature_mask}")
+    _progress(
+        context,
+        "startup: manual field limits: "
+        + (", ".join(
+            f"{name}={bounds[0]:g}:{bounds[1]:g}"
+            for name, bounds in manual_limits.items()
+        ) or "none"),
+    )
     _progress(context, f"startup: output directory: {destination}")
     _prepare_output(context, destination, overwrite)
 
-    source = PAllSource(root, metadata)
     raw_fields = tuple(str(item["name"]) for item in metadata.equation_layout)
     # alpha_liq is a visual context field for every render, even when it is not
     # itself requested as a plotted field.
@@ -147,7 +159,13 @@ def render_case(
     limit_error = None
     if context.rank == 0:
         try:
-            limits = {symbol: _final_limits(symbol, values) for symbol, values in ranges.items()}
+            limits = {
+                symbol: (
+                    manual_limits[symbol]
+                    if symbol in manual_limits else _final_limits(symbol, values)
+                )
+                for symbol, values in ranges.items()
+            }
         except Exception as exc:
             limit_error = f"{type(exc).__name__}: {exc}"
     limit_errors = [item for item in context.comm.allgather(limit_error) if item]
@@ -168,16 +186,16 @@ def render_case(
                 for symbol in canonical_fields:
                     frames.append(_render_field(
                         destination, selection, symbol, assembled, limits[symbol], config, counts,
-                        temperature_mask,
+                        temperature_mask, manual_limits,
                     ))
                 if canonical_overlay:
                     frames.append(_render_overlay(
                         destination, selection, canonical_overlay, levels, assembled,
-                        limits[canonical_overlay[0]], counts, temperature_mask,
+                        limits[canonical_overlay[0]], counts, temperature_mask, manual_limits,
                     ))
             except Exception as exc:
                 root_error = (
-                    f"worker_rank=0 source=p_all saved_index={saved_index}: "
+                    f"worker_rank=0 source={source.family} saved_index={saved_index}: "
                     f"{type(exc).__name__}: {exc}"
                 )
         render_errors = [item for item in context.comm.allgather(root_error) if item]
@@ -190,11 +208,14 @@ def render_case(
         raise RuntimeError("render produced zero PNG artifacts; no manifest written")
     provenance = _provenance(
         config, all_sources, limits, canonical_overlay, levels, temperature_mask, frames,
+        report, metadata, selections, manual_limits,
     )
     manifest = {
         "schema_version": "mfc-post.render-clean/v1",
         "case": str(root),
-        "source": {"family": "p_all", "path": report["path"], "layout": report["layout"]},
+        "source": {
+            "family": report["family"], "path": report["path"], "layout": report["layout"],
+        },
         "selection_policy": "nearest requested saves or inclusive time range, followed by stride",
         "selections": selections,
         "fields": list(canonical_fields),
@@ -204,7 +225,11 @@ def render_case(
             "alpha_liq_threshold": LIQUID_CONTOUR_LEVEL,
         },
         "field_limits": {
-            symbol: {"minimum": value[0], "maximum": value[1]} for symbol, value in limits.items()
+            symbol: {
+                "minimum": value[0], "maximum": value[1],
+                "mode": "manual" if symbol in manual_limits else "batch",
+            }
+            for symbol, value in limits.items()
         },
         "overlay": (
             {"base": canonical_overlay[0], "contour": canonical_overlay[1], "levels": list(levels)}
@@ -301,18 +326,62 @@ def _canonical_symbol(symbol: str, config: Model3Configuration) -> str:
     return standard
 
 
+def _canonical_limits(raw_limits, config, fields, overlay):
+    result = {}
+    color_fields = set(fields)
+    if overlay:
+        color_fields.add(overlay[0])
+    for requested, raw_bounds in raw_limits.items():
+        symbol = _canonical_symbol(str(requested), config)
+        if symbol not in color_fields:
+            raise ValueError(
+                f"--field-limits field {requested!r} is not a requested field or overlay base"
+            )
+        if symbol in result:
+            raise ValueError(f"--field-limits resolves to duplicate field {symbol!r}")
+        try:
+            low, high = (float(value) for value in raw_bounds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"--field-limits for {requested!r} requires numeric VMIN,VMAX"
+            ) from exc
+        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            raise ValueError(
+                f"--field-limits for {requested!r} requires finite VMAX > VMIN; "
+                f"got {low!r}, {high!r}"
+            )
+        result[symbol] = (low, high)
+    return result
+
+
 def _load_assembled(source, saved_index, raw_fields, symbols, config, context):
     local_pieces = []
     local_error = None
     try:
-        partitions = source.partition_ids(saved_index)
-        for partition in partitions[context.rank::context.size]:
-            state = source.read_partition(saved_index, partition, raw_fields)
+        if isinstance(source, PAllSource):
+            partitions = source.partition_ids(saved_index)
+            for partition in partitions[context.rank::context.size]:
+                state = source.read_partition(saved_index, partition, raw_fields)
+                physical = reconstruct_model3(state, config)
+                local_pieces.append(_piece(state, physical, symbols, config))
+            global_grid = None
+        elif isinstance(source, LustreSharedSource):
+            global_grid = source.read_grid(saved_index)
+            cells = int(np.prod(global_grid.shape, dtype=np.int64))
+            start, stop = split_range(cells, context.size, context.rank)
+            state = source.read_chunk(
+                saved_index, start, stop, raw_fields,
+                mpi_comm=context.comm if context.mpi is not None else None,
+            )
             physical = reconstruct_model3(state, config)
-            local_pieces.append(_piece(state, physical, symbols, config))
+            local_pieces.append(_flat_piece(
+                state, physical, symbols, config, start, stop,
+            ))
+        else:
+            raise ValueError(f"unsupported render source {source.family}")
     except Exception as exc:
         local_error = (
-            f"worker_rank={context.rank} source=p_all saved_index={saved_index}: "
+            f"worker_rank={context.rank} source={source.family} saved_index={saved_index}: "
             f"{type(exc).__name__}: {exc}"
         )
     state_errors = [item for item in context.comm.allgather(local_error) if item]
@@ -323,8 +392,14 @@ def _load_assembled(source, saved_index, raw_fields, symbols, config, context):
         return None
     pieces = [piece for group in gathered for piece in group]
     if not pieces:
-        raise RuntimeError(f"saved index {saved_index}: no p_all partitions were loaded")
-    assembled = _assemble(pieces, symbols)
+        raise RuntimeError(
+            f"saved index {saved_index}: no {source.family} partitions/chunks were loaded"
+        )
+    assembled = (
+        _assemble(pieces, symbols)
+        if isinstance(source, PAllSource)
+        else _assemble_flat(pieces, symbols, global_grid)
+    )
     assembled["source_files"] = sorted({path for piece in pieces for path in piece["source_files"]})
     return assembled
 
@@ -332,6 +407,25 @@ def _load_assembled(source, saved_index, raw_fields, symbols, config, context):
 def _piece(state, physical, symbols, config):
     if state.grid is None or not state.grid.bounds.get("x") or not state.grid.bounds.get("y"):
         raise ValueError(f"saved index {state.saved_index}: partition lacks 2D physical coordinates")
+    fields, masks, source_files = _derived_piece_data(state, physical, symbols, config)
+    return {
+        "x_bounds": np.asarray(state.grid.bounds["x"], dtype=np.float64),
+        "y_bounds": np.asarray(state.grid.bounds["y"], dtype=np.float64),
+        "fields": fields, "masks": masks, "source_files": source_files,
+    }
+
+
+def _flat_piece(state, physical, symbols, config, start, stop):
+    fields, masks, source_files = _derived_piece_data(state, physical, symbols, config)
+    return {
+        "start": int(start), "stop": int(stop),
+        "fields": {name: np.asarray(values).reshape(-1) for name, values in fields.items()},
+        "masks": {name: np.asarray(values).reshape(-1) for name, values in masks.items()},
+        "source_files": source_files,
+    }
+
+
+def _derived_piece_data(state, physical, symbols, config):
     registry = FieldRegistry(physical, config)
     fields = {
         "temperature": np.asarray(registry.resolve("temperature").values, dtype=np.float64),
@@ -356,14 +450,9 @@ def _piece(state, physical, symbols, config):
         phi[valid] = _stoich_coefficient(config) * fuel[valid] / oxygen[valid]
         fields["phi"] = phi
     masks = {name: np.asarray(field.values, dtype=bool) for name, field in physical.masks.items()}
-    return {
-        "x_bounds": np.asarray(state.grid.bounds["x"], dtype=np.float64),
-        "y_bounds": np.asarray(state.grid.bounds["y"], dtype=np.float64),
-        "fields": fields, "masks": masks,
-        "source_files": sorted({
+    return fields, masks, sorted({
             field.provenance.source_path for field in state.fields.values() if field.provenance
-        }),
-    }
+        })
 
 
 def _assemble(pieces, symbols):
@@ -395,6 +484,49 @@ def _assemble(pieces, symbols):
     return {"x_bounds": x_bounds, "y_bounds": y_bounds, "fields": fields, "masks": masks}
 
 
+def _assemble_flat(pieces, symbols, grid):
+    if grid is None or not grid.bounds.get("x") or not grid.bounds.get("y"):
+        raise ValueError("shared Lustre render requires global x/y boundary files")
+    cell_count = int(np.prod(grid.shape, dtype=np.int64))
+    canonical_shape = tuple(reversed(grid.shape))
+    names = set(symbols) | {"temperature", "temperature.raw", "pressure", "pressure.raw"}
+    fields = {name: np.full(cell_count, np.nan) for name in names}
+    mask_names = set().union(*(piece["masks"] for piece in pieces))
+    masks = {name: np.zeros(cell_count, dtype=bool) for name in mask_names}
+    assigned = np.zeros(cell_count, dtype=bool)
+    for piece in pieces:
+        start, stop = piece["start"], piece["stop"]
+        if start < 0 or stop < start or stop > cell_count:
+            raise ValueError(f"invalid shared Lustre assembled range [{start}, {stop})")
+        target = np.s_[start:stop]
+        if np.any(assigned[target]):
+            raise ValueError("shared Lustre chunks overlap while assembling the full domain")
+        for name in names:
+            values = np.asarray(piece["fields"][name]).reshape(-1)
+            if values.size != stop - start:
+                raise ValueError(
+                    f"shared Lustre field {name} has {values.size} values for range [{start}, {stop})"
+                )
+            fields[name][target] = values
+        for name in mask_names:
+            masks[name][target] = np.asarray(piece["masks"][name]).reshape(-1)
+        assigned[target] = True
+    if not np.all(assigned):
+        raise ValueError(
+            f"shared Lustre assembly contains {np.count_nonzero(~assigned)} uncovered cells"
+        )
+    return {
+        "x_bounds": np.asarray(grid.bounds["x"], dtype=np.float64),
+        "y_bounds": np.asarray(grid.bounds["y"], dtype=np.float64),
+        "fields": {
+            name: values.reshape(canonical_shape, order="C") for name, values in fields.items()
+        },
+        "masks": {
+            name: values.reshape(canonical_shape, order="C") for name, values in masks.items()
+        },
+    }
+
+
 def _plot_data(symbol, assembled, temperature_mask="strict_gas"):
     fields, masks = assembled["fields"], assembled["masks"]
     values = fields[symbol]
@@ -418,6 +550,7 @@ def _plot_data(symbol, assembled, temperature_mask="strict_gas"):
 
 def _render_field(
     destination, selection, symbol, assembled, limits, config, counts, temperature_mask,
+    manual_limits,
 ):
     import matplotlib
     matplotlib.use("Agg")
@@ -426,7 +559,7 @@ def _render_field(
     plotted, mask_policy = _plot_data(symbol, assembled, temperature_mask)
     raw_values = assembled["fields"]["temperature.raw"] if symbol == "temperature" else assembled["fields"][symbol]
     title, colorbar_label, cmap_name = FIELD_STYLE[symbol]
-    output_symbol = _output_symbol(symbol, temperature_mask)
+    output_symbol = _output_symbol(symbol, temperature_mask, manual_limits)
     folder = destination / output_symbol
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{output_symbol}_t{_time_token(selection['actual_time_us'])}us.png"
@@ -452,7 +585,10 @@ def _render_field(
     return {
         **selection, "kind": "field", "field": symbol, "path": str(path),
         "raw_range": _range_dict(raw_values), "plotted_range": _range_dict(plotted),
-        "color_limits": {"minimum": limits[0], "maximum": limits[1]},
+        "color_limits": {
+            "minimum": limits[0], "maximum": limits[1],
+            "mode": "manual" if symbol in manual_limits else "batch",
+        },
         "mask_policy": mask_policy, "counts": counts,
         "plot_cell_counts": _plot_cell_counts(plotted),
         "temperature_mask": temperature_mask if symbol == "temperature" else None,
@@ -466,6 +602,7 @@ def _render_field(
 
 def _render_overlay(
     destination, selection, overlay, levels, assembled, base_limits, counts, temperature_mask,
+    manual_limits,
 ):
     import matplotlib
     matplotlib.use("Agg")
@@ -474,8 +611,8 @@ def _render_overlay(
     base, contour = overlay
     base_values, base_policy = _plot_data(base, assembled, temperature_mask)
     contour_values, contour_policy = _plot_data(contour, assembled, temperature_mask)
-    base_output = _output_symbol(base, temperature_mask)
-    contour_output = _output_symbol(contour, temperature_mask)
+    base_output = _output_symbol(base, temperature_mask, manual_limits)
+    contour_output = _output_symbol(contour, temperature_mask, manual_limits)
     folder = destination / f"overlay_{base_output}_{contour_output}"
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / (
@@ -525,7 +662,10 @@ def _render_overlay(
     return {
         **selection, "kind": "overlay", "base_field": base, "overlay_field": contour,
         "path": str(path), "levels_requested": list(levels), "levels_drawn": drawn_levels,
-        "base_color_limits": {"minimum": base_limits[0], "maximum": base_limits[1]},
+        "base_color_limits": {
+            "minimum": base_limits[0], "maximum": base_limits[1],
+            "mode": "manual" if base in manual_limits else "batch",
+        },
         "base_mask_policy": base_policy, "overlay_mask_policy": contour_policy, "counts": counts,
         "base_plot_cell_counts": _plot_cell_counts(base_values),
         "overlay_plot_cell_counts": _plot_cell_counts(contour_values),
@@ -534,8 +674,17 @@ def _render_overlay(
     }
 
 
-def _output_symbol(symbol, temperature_mask):
-    return f"temperature_{temperature_mask}" if symbol == "temperature" else symbol
+def _output_symbol(symbol, temperature_mask, manual_limits):
+    name = f"temperature_{temperature_mask}" if symbol == "temperature" else symbol
+    if symbol in manual_limits:
+        low, high = manual_limits[symbol]
+        prefix = "T" if symbol == "temperature" else "L"
+        name += f"_{prefix}{_limit_token(low)}_{_limit_token(high)}"
+    return name
+
+
+def _limit_token(value):
+    return f"{value:g}".replace("+", "").replace("-", "m").replace(".", "p")
 
 
 def _plot_cell_counts(plotted):
@@ -701,6 +850,10 @@ def _prepare_output(context, destination, overwrite):
                 for path in destination.glob("temperature_*"):
                     if path.is_dir():
                         shutil.rmtree(path)
+                for name in FIELD_STYLE:
+                    for path in destination.glob(f"{name}_L*"):
+                        if path.is_dir():
+                            shutil.rmtree(path)
             destination.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -709,9 +862,28 @@ def _prepare_output(context, destination, overwrite):
         raise RuntimeError(errors[0])
 
 
-def _provenance(config, source_files, limits, overlay, levels, temperature_mask, frames):
+def _provenance(
+    config, source_files, limits, overlay, levels, temperature_mask, frames,
+    report, metadata, selections, manual_limits,
+):
     return {
-        "source_files": sorted(source_files),
+        "source_family": report["family"], "source_path": report["path"],
+        "source": {
+            "family": report["family"], "path": report["path"],
+            "files": sorted(source_files),
+        },
+        "timeline": {
+            "time_basis": report["timeline"]["time_basis"],
+            "t_save": metadata.parameters.get("t_save"),
+            "records": [
+                {
+                    "saved_index": item["saved_index"],
+                    "physical_time": item["actual_time_us"] * 1.0e-6,
+                }
+                for item in selections
+            ],
+            "warnings": report["timeline"].get("warnings", []),
+        },
         "mechanism": {"path": config.mechanism_path, "phase": config.mechanism_phase},
         "species_mapping": [
             {
@@ -726,7 +898,15 @@ def _provenance(config, source_files, limits, overlay, levels, temperature_mask,
         "transformations": _transformation_provenance(config),
         "coordinate_conversion": "MFC coordinates multiplied by 1e6 for micrometer plot axes",
         "batch_color_limits": {
-            symbol: {"minimum": value[0], "maximum": value[1]} for symbol, value in limits.items()
+            symbol: {
+                "minimum": value[0], "maximum": value[1],
+                "mode": "manual" if symbol in manual_limits else "batch",
+            }
+            for symbol, value in limits.items()
+        },
+        "manual_field_limits": {
+            symbol: {"minimum": value[0], "maximum": value[1]}
+            for symbol, value in manual_limits.items()
         },
         "render_policy": {
             "clean_static_png": True,

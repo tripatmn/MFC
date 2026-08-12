@@ -46,6 +46,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--fields", default=",".join(RENDER_FIELDS),
         help="comma-separated symbolic fields",
     )
+    render_parser.add_argument(
+        "--field-limits", action="append", default=[], metavar="FIELD:VMIN:VMAX",
+        help="manual color limits; repeat for multiple fields",
+    )
     render_parser.add_argument("--out-dir", required=True, help="new or empty output directory")
     render_parser.add_argument("--stride", type=int, default=1, help="retain every Nth selected save")
     render_parser.add_argument(
@@ -53,6 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="replace mfc-post render files in an existing nonempty output directory",
     )
     render_parser.add_argument("--execution", choices=("auto", "serial", "mpi"), default="auto")
+    render_parser.add_argument(
+        "--source", choices=("auto", "p_all", "lustre_shared"), default="auto",
+    )
     render_parser.add_argument(
         "--temperature-mask", choices=("strict_gas", "nonliquid"), default="strict_gas",
         help="temperature plotting mask (default: strict_gas)",
@@ -68,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma-separated contour levels (default: 1.0)",
     )
     analyze_parser = subparsers.add_parser(
-        "analyze", help="compute an MPI-compatible scalar history from raw p_all saves"
+        "analyze", help="compute an MPI-compatible scalar history from supported raw saves"
     )
     analyze_parser.add_argument("case", help="path to an MFC case/run directory")
     selection = analyze_parser.add_mutually_exclusive_group()
@@ -81,6 +88,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="replace mfc-post analyze files in an existing nonempty output directory",
     )
     analyze_parser.add_argument("--execution", choices=("auto", "serial", "mpi"), default="auto")
+    analyze_parser.add_argument(
+        "--source", choices=("auto", "p_all", "lustre_shared"), default="auto",
+    )
     analyze_parser.add_argument("--mechanism", help="explicit Cantera YAML when metadata is incomplete")
     analyze_parser.add_argument("--phase", help="explicit mechanism phase name")
     plot_parser = subparsers.add_parser(
@@ -133,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
                 stride=args.stride, overwrite=args.overwrite, no_mp4=args.no_mp4,
                 overlay=overlay, overlay_levels=_comma_floats(args.overlay_levels),
                 temperature_mask=args.temperature_mask,
+                source_family=args.source,
+                field_limits=_field_limits(args.field_limits),
             )
             if result is not None:
                 print(
@@ -149,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 time_range_us=time_range, stride=args.stride, out_dir=args.out_dir,
                 execution=args.execution, mechanism=args.mechanism, phase=args.phase,
-                overwrite=args.overwrite,
+                overwrite=args.overwrite, source_family=args.source,
             )
             if result is not None:
                 print(
@@ -198,6 +210,26 @@ def _overlay(value: str) -> tuple[str, str]:
     if len(parsed) != 2:
         raise ValueError(f"--overlay requires exactly BASE,CONTOUR; got {value!r}")
     return parsed
+
+
+def _field_limits(values: list[str]) -> dict[str, tuple[float, float]]:
+    result: dict[str, tuple[float, float]] = {}
+    for value in values:
+        parts = tuple(item.strip() for item in value.split(":"))
+        if len(parts) != 3 or not all(parts):
+            raise ValueError(
+                f"--field-limits requires FIELD:VMIN:VMAX; got {value!r}"
+            )
+        field, low_text, high_text = parts
+        if field in result:
+            raise ValueError(f"--field-limits repeats field {field!r}")
+        try:
+            result[field] = (float(low_text), float(high_text))
+        except ValueError as exc:
+            raise ValueError(
+                f"--field-limits has nonnumeric bounds in {value!r}"
+            ) from exc
+    return result
 
 
 def format_text(result: dict[str, Any]) -> str:

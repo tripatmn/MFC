@@ -16,13 +16,14 @@ mpiexec -n 8 ./mfc-post process /path/to/case --execution mpi
 ./mfc-post render /path/to/case \
   --selected-times-us 5.0 --fields temperature \
   --temperature-mask nonliquid \
+  --field-limits temperature:1000:2200 \
   --no-mp4 --out-dir /path/to/render_nonliquid
 ./mfc-post render /path/to/case \
   --time-range-us 0,10 --stride 2 --fields temperature \
   --overlay temperature,phi \
   --no-mp4 --out-dir /path/to/render_clean_overlay
 ./mfc-post analyze /path/to/case --selected-times-us 0,5,10 \
-  --out-dir /path/to/analysis
+  --source auto --out-dir /path/to/analysis
 mpiexec -n 8 ./mfc-post analyze /path/to/case --time-range-us 0,100 \
   --stride 2 --execution mpi --out-dir /path/to/mpi-analysis
 ./mfc-post plot /path/to/analysis --plot-set all
@@ -34,6 +35,16 @@ mpiexec -n 8 ./mfc-post analyze /path/to/case --time-range-us 0,100 \
 `analyze`, `plot`, and `render` reject a nonempty output directory by default.
 Pass `--overwrite` to replace that command's known outputs without deleting
 unrelated files from the directory.
+
+`analyze` and `render` accept `--source auto|p_all|lustre_shared`. Automatic
+selection chooses complete `p_all` saves first and otherwise a complete shared
+Lustre checkpoint family. Shared Lustre input reads markerless
+`restart_data/lustre_{x,y,z}_cb.dat` coordinates and variable-major
+`lustre_<saved_index>.dat` payloads without modifying them. Spatial MPI runs
+use disjoint coordinated chunks rather than rereading the complete file on
+every rank. Lustre saved times use `saved_index * t_save`; they are not inferred
+from `simulation_step * dt`. Restart-continuation metadata produces an explicit
+warning when the global saved-index/time offset cannot be established.
 
 Inspection inventories each MFC output family independently. It never combines
 or silently deduplicates source families. Canonical raw conservative `Field`
@@ -90,6 +101,11 @@ This strict temperature policy remains the default through
 `alpha_liq <= 0.5`; species masks are unchanged. Temperature directories and
 filenames include `strict_gas` or `nonliquid`, and per-frame plotted/masked cell
 counts and the exact policy are recorded in the manifest and provenance.
+Color normalization remains batch-wide by default. A repeatable manual override
+such as `--field-limits temperature:1000:2200` fixes the colorbar range and
+saturates values outside it. Manual bounds and their mode are recorded in the
+manifest/provenance, and temperature output names include a deterministic
+suffix such as `temperature_nonliquid_T1000_2200`.
 `--overlay temperature,phi` adds clean equivalence-ratio contour lines with
 default level 1.0. Pass `--overlay-levels 0.5,1.0,2.0` only when multiple
 equivalence-ratio contours are wanted.
