@@ -26,16 +26,20 @@ O2_FLOOR = 1.0e-12
 LIQUID_CONTOUR_LEVEL = 0.5
 LIQUID_CONTOUR_COLOR = "#00a6c8"
 LIQUID_CONTOUR_WIDTH = 1.1
-TEMPERATURE_MASKS = {
-    "strict_gas": "mask.chemistry_valid AND mask.gas_dominated",
-    "nonliquid": "alpha_liq <= 0.5 AND isfinite(temperature)",
+RENDER_MASKS = {
+    "strict_gas": "legacy field-specific valid-gas mask",
+    "nonliquid": "alpha_liq <= 0.5 AND isfinite(field)",
 }
 
 FIELD_STYLE = {
     "temperature": ("Temperature", "Temperature [K]", "inferno"),
     "OH": ("OH mass fraction", "OH mass fraction", "magma"),
+    "HO2": ("HO2 mass fraction", "HO2 mass fraction", "magma"),
+    "H2O2": ("H2O2 mass fraction", "H2O2 mass fraction", "magma"),
     "NC12H26": ("NC12H26 mass fraction", "NC12H26 mass fraction", "viridis"),
     "O2": ("O2 mass fraction", "O2 mass fraction", "viridis"),
+    "CO2": ("CO2 mass fraction", "CO2 mass fraction", "viridis"),
+    "H2O": ("H2O mass fraction", "H2O mass fraction", "viridis"),
     "phi": ("Equivalence ratio", "Equivalence ratio", "plasma"),
     "alpha_liq": ("Liquid volume fraction", "Liquid volume fraction", "Blues"),
 }
@@ -55,7 +59,7 @@ def render_case(
     no_mp4: bool = False,
     overlay: tuple[str, str] | None = None,
     overlay_levels: Iterable[float] = DEFAULT_PHI_LEVELS,
-    temperature_mask: str = "strict_gas",
+    temperature_mask: str = "nonliquid",
     source_family: str = "auto",
     field_limits: Mapping[str, tuple[float, float]] | None = None,
 ) -> dict[str, Any] | None:
@@ -69,9 +73,9 @@ def render_case(
         raise ValueError("--stride must be a positive integer")
     if selected_times_us is not None and time_range_us is not None:
         raise ValueError("--selected-times-us and --time-range-us are mutually exclusive")
-    if temperature_mask not in TEMPERATURE_MASKS:
+    if temperature_mask not in RENDER_MASKS:
         raise ValueError(
-            f"unknown temperature mask {temperature_mask!r}; choose from {tuple(TEMPERATURE_MASKS)}"
+            f"unknown render mask {temperature_mask!r}; choose from {tuple(RENDER_MASKS)}"
         )
 
     _progress(context, f"startup: case path: {root}")
@@ -118,7 +122,7 @@ def render_case(
     _progress(context, f"startup: selected source path: {report['path']}")
     _progress(context, f"startup: saves discovered: {len(report['timeline']['saved_indices'])}")
     _progress(context, f"startup: saves selected after filters: {len(selections)}")
-    _progress(context, f"startup: temperature mask: {temperature_mask}")
+    _progress(context, f"startup: render mask: {temperature_mask}")
     _progress(
         context,
         "startup: manual field limits: "
@@ -221,7 +225,12 @@ def render_case(
         "fields": list(canonical_fields),
         "temperature_mask": {
             "mode": temperature_mask,
-            "definition": TEMPERATURE_MASKS[temperature_mask],
+            "definition": RENDER_MASKS[temperature_mask],
+            "alpha_liq_threshold": LIQUID_CONTOUR_LEVEL,
+        },
+        "render_mask": {
+            "mode": temperature_mask,
+            "definition": RENDER_MASKS[temperature_mask],
             "alpha_liq_threshold": LIQUID_CONTOUR_LEVEL,
         },
         "field_limits": {
@@ -314,16 +323,10 @@ def _canonical_symbol(symbol: str, config: Model3Configuration) -> str:
     if cleaned in aliases:
         return aliases[cleaned]
     requested = cleaned[2:-1] if cleaned.startswith("Y[") and cleaned.endswith("]") else cleaned
-    standard = next(
-        (name for name in ("OH", "NC12H26", "O2") if name.casefold() == requested.casefold()),
-        None,
-    )
-    if standard is None:
-        raise ValueError("clean render supports species fields OH, NC12H26, and O2")
-    matches = [name for name in config.species_names if name.casefold() == standard.casefold()]
+    matches = [name for name in config.species_names if name.casefold() == requested.casefold()]
     if len(matches) != 1:
         raise ValueError(f"requested render field/species {cleaned!r} is absent or ambiguous")
-    return standard
+    return matches[0]
 
 
 def _canonical_limits(raw_limits, config, fields, overlay):
@@ -434,7 +437,7 @@ def _derived_piece_data(state, physical, symbols, config):
         "pressure.raw": np.asarray(registry.resolve("pressure.raw").values, dtype=np.float64),
     }
     for symbol in symbols:
-        if symbol in {"OH", "NC12H26", "O2"}:
+        if symbol in config.species_names:
             fields[symbol] = np.asarray(registry.resolve(f"Y[{symbol}]").values, dtype=np.float64)
         elif symbol == "alpha_liq":
             fields[symbol] = np.asarray(registry.resolve("alpha[liquid]").values, dtype=np.float64)
@@ -527,25 +530,32 @@ def _assemble_flat(pieces, symbols, grid):
     }
 
 
-def _plot_data(symbol, assembled, temperature_mask="strict_gas"):
+def _plot_data(symbol, assembled, temperature_mask="nonliquid"):
     fields, masks = assembled["fields"], assembled["masks"]
     values = fields[symbol]
-    if symbol == "temperature":
-        if temperature_mask == "strict_gas":
+    if symbol == "alpha_liq":
+        mask = masks["mask.valid"] & np.isfinite(values)
+        policy = "mask.valid AND isfinite(alpha_liq); liquid context field exemption"
+    elif temperature_mask == "nonliquid":
+        alpha_liq = fields["alpha_liq"]
+        mask = (alpha_liq <= LIQUID_CONTOUR_LEVEL) & np.isfinite(values)
+        policy = "alpha_liq <= 0.5 AND isfinite(field)"
+    elif temperature_mask == "strict_gas":
+        if symbol == "temperature":
             mask = masks["mask.chemistry_valid"] & masks["mask.gas_dominated"]
-        elif temperature_mask == "nonliquid":
-            alpha_liq = fields["alpha_liq"]
-            mask = (alpha_liq <= LIQUID_CONTOUR_LEVEL) & np.isfinite(values)
+            policy = "mask.chemistry_valid AND mask.gas_dominated; chemistry-clipped temperature"
         else:
-            raise ValueError(f"unknown temperature mask {temperature_mask!r}")
-        policy = TEMPERATURE_MASKS[temperature_mask] + "; chemistry-clipped temperature"
-    elif symbol in {"OH", "NC12H26", "O2", "phi"}:
-        mask = masks["mask.valid"] & masks["mask.gas_dominated"] & np.isfinite(values)
-        policy = "mask.valid AND mask.gas_dominated"
+            mask = masks["mask.valid"] & masks["mask.gas_dominated"] & np.isfinite(values)
+            policy = "mask.valid AND mask.gas_dominated AND isfinite(field)"
     else:
-        mask = masks["mask.valid"]
-        policy = "mask.valid"
+        raise ValueError(f"unknown render mask {temperature_mask!r}")
     return np.where(mask, values, np.nan), policy
+
+
+def _field_style(symbol):
+    return FIELD_STYLE.get(
+        symbol, (f"{symbol} mass fraction", f"{symbol} mass fraction", "viridis"),
+    )
 
 
 def _render_field(
@@ -558,7 +568,7 @@ def _render_field(
 
     plotted, mask_policy = _plot_data(symbol, assembled, temperature_mask)
     raw_values = assembled["fields"]["temperature.raw"] if symbol == "temperature" else assembled["fields"][symbol]
-    title, colorbar_label, cmap_name = FIELD_STYLE[symbol]
+    title, colorbar_label, cmap_name = _field_style(symbol)
     output_symbol = _output_symbol(symbol, temperature_mask, manual_limits)
     folder = destination / output_symbol
     folder.mkdir(parents=True, exist_ok=True)
@@ -591,11 +601,12 @@ def _render_field(
         },
         "mask_policy": mask_policy, "counts": counts,
         "plot_cell_counts": _plot_cell_counts(plotted),
+        "render_mask": temperature_mask if symbol != "alpha_liq" else "valid",
         "temperature_mask": temperature_mask if symbol == "temperature" else None,
         "liquid_context": _liquid_context_record(liquid_contour_drawn),
         "species_equation_index": (
             config.equation_indices[f"species_density[{_actual_species(config, symbol)}]"]
-            if symbol in {"OH", "NC12H26", "O2"} else None
+            if symbol in config.species_names else None
         ),
     }
 
@@ -627,7 +638,7 @@ def _render_overlay(
     try:
         figure, axis = plt.subplots(figsize=(10.0, 4.2), constrained_layout=True)
         _draw_liquid_underlay(axis, assembled)
-        cmap = plt.get_cmap(FIELD_STYLE[base][2]).with_extremes(
+        cmap = plt.get_cmap(_field_style(base)[2]).with_extremes(
             bad=(0.0, 0.0, 0.0, 0.0),
         )
         image = axis.pcolormesh(
@@ -635,7 +646,7 @@ def _render_overlay(
             np.ma.masked_invalid(base_values), cmap=cmap,
             vmin=base_limits[0], vmax=base_limits[1], shading="flat", rasterized=True,
         )
-        figure.colorbar(image, ax=axis, pad=0.02).set_label(FIELD_STYLE[base][1])
+        figure.colorbar(image, ax=axis, pad=0.02).set_label(_field_style(base)[1])
         if drawn_levels:
             x_centers = (assembled["x_bounds"][:-1] + assembled["x_bounds"][1:]) * 0.5e6
             y_centers = (assembled["y_bounds"][:-1] + assembled["y_bounds"][1:]) * 0.5e6
@@ -645,12 +656,12 @@ def _render_overlay(
             )
         liquid_contour_drawn = _draw_liquid_contour(axis, assembled)
         contour_description = (
-            f"{FIELD_STYLE[contour][0].lower()} = {levels[0]:g} contour"
-            if len(levels) == 1 else f"{FIELD_STYLE[contour][0].lower()} contours"
+            f"{_field_style(contour)[0].lower()} = {levels[0]:g} contour"
+            if len(levels) == 1 else f"{_field_style(contour)[0].lower()} contours"
         )
         _clean_axes(
             axis,
-            f"{FIELD_STYLE[base][0]} with {contour_description}, "
+            f"{_field_style(base)[0]} with {contour_description}, "
             f"t = {selection['actual_time_us']:.2f} us",
         )
         figure.savefig(path, dpi=180)
@@ -669,6 +680,7 @@ def _render_overlay(
         "base_mask_policy": base_policy, "overlay_mask_policy": contour_policy, "counts": counts,
         "base_plot_cell_counts": _plot_cell_counts(base_values),
         "overlay_plot_cell_counts": _plot_cell_counts(contour_values),
+        "render_mask": temperature_mask,
         "temperature_mask": temperature_mask if "temperature" in overlay else None,
         "liquid_context": _liquid_context_record(liquid_contour_drawn),
     }
@@ -912,12 +924,18 @@ def _provenance(
             "clean_static_png": True,
             "temperature_mask": {
                 "mode": temperature_mask,
-                "definition": TEMPERATURE_MASKS[temperature_mask],
+                "definition": RENDER_MASKS[temperature_mask],
                 "alpha_liq_threshold": LIQUID_CONTOUR_LEVEL,
                 "temperature_field": "chemistry-clipped temperature",
                 "cell_counts": _temperature_cell_counts(frames),
             },
-            "species_and_phi": "gas-phase fields; valid AND gas-dominated",
+            "scalar_mask": {
+                "mode": temperature_mask,
+                "definition": RENDER_MASKS[temperature_mask],
+                "alpha_liq_threshold": LIQUID_CONTOUR_LEVEL,
+                "cell_counts": _scalar_cell_counts(frames),
+                "alpha_liq_exemption": "alpha_liq itself uses mask.valid AND finite values",
+            },
             "alpha_liq": "solver-reconstructed liquid volume fraction over valid cells",
             "masked_regions": (
                 "transparent field pixels reveal a pale alpha_liq underlay; invalid cells remain "
@@ -947,6 +965,25 @@ def _temperature_cell_counts(frames):
             "saved_index": frame["saved_index"], "actual_time_us": frame["actual_time_us"],
             "role": role, **counts,
         })
+    return records
+
+
+def _scalar_cell_counts(frames):
+    records = []
+    for frame in frames:
+        if frame["kind"] == "field":
+            entries = ((frame["field"], "field", frame["plot_cell_counts"]),)
+        else:
+            entries = (
+                (frame["base_field"], "overlay_base", frame["base_plot_cell_counts"]),
+                (frame["overlay_field"], "overlay_contour", frame["overlay_plot_cell_counts"]),
+            )
+        for field, role, counts in entries:
+            records.append({
+                "saved_index": frame["saved_index"],
+                "actual_time_us": frame["actual_time_us"],
+                "field": field, "role": role, **counts,
+            })
     return records
 
 

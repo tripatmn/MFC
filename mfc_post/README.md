@@ -15,7 +15,7 @@ mpiexec -n 8 ./mfc-post process /path/to/case --execution mpi
   --no-mp4 --out-dir /path/to/render_clean
 ./mfc-post render /path/to/case \
   --selected-times-us 5.0 --fields temperature \
-  --temperature-mask nonliquid \
+  --render-mask nonliquid \
   --field-limits temperature:1000:2200 \
   --no-mp4 --out-dir /path/to/render_nonliquid
 ./mfc-post render /path/to/case \
@@ -90,17 +90,19 @@ range followed by stride. It writes one subdirectory per field plus
 `manifest.json` and `provenance.json`; it never computes scalar history, trends,
 or MP4 output. Static PNGs contain only a concise title, micrometer axes, and a
 colorbar. All frames for a field share batch-wide color limits. Each frame has
-a thin `alpha_liq = 0.5` contour; masked gas-field pixels reveal a pale
+a thin `alpha_liq = 0.5` contour; masked field pixels reveal a pale
 reconstructed-liquid-fraction underlay instead of an unexplained gray blob.
-Temperature is
-chemistry-clipped and chemistry-valid/gas-dominated masked; species images use
-gas-phase `Y_k`, and `phi` uses the configured mechanism molecular weights.
-This strict temperature policy remains the default through
-`--temperature-mask strict_gas`. For droplet deformation and near-wake views,
-`--temperature-mask nonliquid` plots finite reconstructed temperature wherever
-`alpha_liq <= 0.5`; species masks are unchanged. Temperature directories and
-filenames include `strict_gas` or `nonliquid`, and per-frame plotted/masked cell
-counts and the exact policy are recorded in the manifest and provenance.
+The default presentation mask, `--render-mask nonliquid`, plots every finite
+temperature, gas-phase `Y_k`, phi, or other supported scalar wherever
+`alpha_liq <= 0.5`; only the liquid interior is masked. Temperature remains the
+chemistry-clipped reconstruction, and phi uses configured mechanism molecular
+weights. Any mechanism species can be requested by name or as `Y[NAME]`.
+`--render-mask strict_gas` retains the earlier chemistry-valid/gas-dominated
+temperature mask and valid/gas-dominated species/phi mask. The older
+`--temperature-mask` spelling remains a compatibility alias. Temperature
+directories and filenames include `strict_gas` or `nonliquid`, and per-frame
+plotted/masked cell counts and the exact scalar policy are recorded in the
+manifest and provenance.
 Color normalization remains batch-wide by default. A repeatable manual override
 such as `--field-limits temperature:1000:2200` fixes the colorbar range and
 saturates values outside it. Manual bounds and their mode are recorded in the

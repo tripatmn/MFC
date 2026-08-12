@@ -22,12 +22,16 @@ def _record(path: Path, values) -> None:
 
 def _case(root: Path) -> None:
     root.joinpath("mechanism.yaml").write_text(
-        "phases:\n- name: gas\n  species: [N2, NC12H26, OH, O2]\n"
+        "phases:\n- name: gas\n  species: [N2, NC12H26, OH, O2, HO2, H2O2, CO2, H2O]\n"
         "species:\n"
         "- name: N2\n  composition: {N: 2}\n"
         "- name: NC12H26\n  composition: {C: 12, H: 26}\n"
         "- name: OH\n  composition: {O: 1, H: 1}\n"
         "- name: O2\n  composition: {O: 2}\n"
+        "- name: HO2\n  composition: {H: 1, O: 2}\n"
+        "- name: H2O2\n  composition: {H: 2, O: 2}\n"
+        "- name: CO2\n  composition: {C: 1, O: 2}\n"
+        "- name: H2O\n  composition: {H: 2, O: 1}\n"
     )
     root.joinpath("simulation.inp").write_text(
         "m=1\nn=1\np=0\nmodel_eqns=3\nnum_fluids=2\nchemistry=T\n"
@@ -46,13 +50,15 @@ def _case(root: Path) -> None:
         fuel = 0.05 + 0.01 * saved_index
         oxygen = 0.20
         oh = 0.01 * (saved_index + 1)
-        nitrogen = 1.0 - fuel - oxygen - oh
+        ho2, h2o2, co2, h2o = 0.005, 0.005, 0.02, 0.02
+        nitrogen = 1.0 - fuel - oxygen - oh - ho2 - h2o2 - co2 - h2o
         fields = (
             [0.0, 0.0, 2.0, 0.2], [1.0] * 4,
             [0.0] * 4, [0.0] * 4, [5.0e5 + saved_index * 1.0e5] * 4,
             [0.0, 0.0, 0.8, 0.2], [1.0, 1.0, 0.2, 0.8],
             [1.0] * 4, [1.0] * 4,
             [nitrogen] * 4, [fuel] * 4, [oh] * 4, [oxygen] * 4,
+            [ho2] * 4, [h2o2] * 4, [co2] * 4, [h2o] * 4,
         )
         for index, values in enumerate(fields, 1):
             _record(state / f"q_cons_vf{index}.dat", values)
@@ -89,7 +95,7 @@ class RenderTests(unittest.TestCase):
             result = render_case(
                 root, fields=RENDER_FIELDS, out_dir=out, execution="serial",
                 time_range_us=(0.0, 10.0), stride=2, no_mp4=True,
-                overlay=("temperature", "phi"),
+                overlay=("temperature", "phi"), temperature_mask="strict_gas",
             )
             self.assertEqual([item["saved_index"] for item in result["selections"]], [0, 2])
             self.assertEqual(len(result["frames"]), 14)
@@ -142,6 +148,7 @@ class RenderTests(unittest.TestCase):
                 render_case(root, (5.0,), ("temperature",), out, execution="serial")
             replaced = render_case(
                 root, (5.0,), ("temperature",), out, execution="serial", overwrite=True,
+                temperature_mask="strict_gas",
             )
             self.assertEqual(len(replaced["frames"]), 1)
             self.assertEqual(
@@ -221,7 +228,7 @@ class RenderTests(unittest.TestCase):
             _case(root)
             strict = render_case(
                 root, selected_times_us=(5.0,), fields=("temperature",),
-                out_dir=root / "strict", execution="serial",
+                out_dir=root / "strict", execution="serial", temperature_mask="strict_gas",
             )
             nonliquid = render_case(
                 root, selected_times_us=(5.0,), fields=("temperature",),
@@ -254,13 +261,55 @@ class RenderTests(unittest.TestCase):
             provenance = json.loads((root / "nonliquid" / "provenance.json").read_text())
             self.assertEqual(
                 provenance["render_policy"]["temperature_mask"]["definition"],
-                "alpha_liq <= 0.5 AND isfinite(temperature)",
+                "alpha_liq <= 0.5 AND isfinite(field)",
             )
             provenance_counts = provenance["render_policy"]["temperature_mask"]["cell_counts"]
             self.assertEqual(len(provenance_counts), 2)
             self.assertEqual(
                 provenance_counts[0]["plotted"],
                 nonliquid_frame["plot_cell_counts"]["plotted"],
+            )
+
+    def test_nonliquid_is_default_for_all_supported_species_scalars(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _case(root)
+            species = ("NC12H26", "O2", "OH", "HO2", "H2O2", "CO2", "H2O")
+            strict = render_case(
+                root, selected_times_us=(5.0,), fields=species,
+                out_dir=root / "species_strict", execution="serial",
+                temperature_mask="strict_gas",
+            )
+            presentation = render_case(
+                root, selected_times_us=(5.0,), fields=species,
+                out_dir=root / "species_nonliquid", execution="serial",
+            )
+            self.assertEqual(presentation["render_mask"]["mode"], "nonliquid")
+            strict_counts = {
+                frame["field"]: frame["plot_cell_counts"]["plotted"]
+                for frame in strict["frames"]
+            }
+            presentation_counts = {
+                frame["field"]: frame["plot_cell_counts"]["plotted"]
+                for frame in presentation["frames"]
+            }
+            self.assertEqual(set(presentation_counts), set(species))
+            for species_name in species:
+                self.assertGreater(
+                    presentation_counts[species_name], strict_counts[species_name],
+                    species_name,
+                )
+            self.assertTrue(all(
+                frame["mask_policy"] == "alpha_liq <= 0.5 AND isfinite(field)"
+                and frame["render_mask"] == "nonliquid"
+                and frame["liquid_context"]["contour"]["level"] == 0.5
+                for frame in presentation["frames"]
+            ))
+            provenance = json.loads(
+                (root / "species_nonliquid" / "provenance.json").read_text()
+            )
+            self.assertEqual(
+                provenance["render_policy"]["scalar_mask"]["mode"], "nonliquid",
             )
 
     def test_render_help(self):
@@ -274,6 +323,7 @@ class RenderTests(unittest.TestCase):
             "--selected-times-us", "--time-range-us", "--stride", "--fields",
             "--overwrite", "--execution", "--out-dir", "--no-mp4", "--overlay",
             "--temperature-mask",
+            "--render-mask",
             "--source",
             "--field-limits",
         ):

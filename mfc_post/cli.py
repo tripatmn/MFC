@@ -61,8 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--source", choices=("auto", "p_all", "lustre_shared"), default="auto",
     )
     render_parser.add_argument(
-        "--temperature-mask", choices=("strict_gas", "nonliquid"), default="strict_gas",
-        help="temperature plotting mask (default: strict_gas)",
+        "--render-mask", "--temperature-mask", dest="render_mask",
+        choices=("strict_gas", "nonliquid"), default="nonliquid",
+        help="scalar plotting mask; --temperature-mask is a compatibility alias "
+        "(default: nonliquid)",
     )
     render_parser.add_argument("--mechanism", help="explicit Cantera YAML when metadata is incomplete")
     render_parser.add_argument("--phase", help="explicit mechanism phase name")
@@ -142,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
                 execution=args.execution, mechanism=args.mechanism, phase=args.phase,
                 stride=args.stride, overwrite=args.overwrite, no_mp4=args.no_mp4,
                 overlay=overlay, overlay_levels=_comma_floats(args.overlay_levels),
-                temperature_mask=args.temperature_mask,
+                temperature_mask=args.render_mask,
                 source_family=args.source,
                 field_limits=_field_limits(args.field_limits),
             )
