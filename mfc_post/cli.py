@@ -93,6 +93,10 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument(
         "--source", choices=("auto", "p_all", "lustre_shared"), default="auto",
     )
+    analyze_parser.add_argument(
+        "--compute-heat-release", choices=("cantera",), default=None,
+        help="optional cell-local chemical heat-release backend (default: off)",
+    )
     analyze_parser.add_argument("--mechanism", help="explicit Cantera YAML when metadata is incomplete")
     analyze_parser.add_argument("--phase", help="explicit mechanism phase name")
     plot_parser = subparsers.add_parser(
@@ -164,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
                 time_range_us=time_range, stride=args.stride, out_dir=args.out_dir,
                 execution=args.execution, mechanism=args.mechanism, phase=args.phase,
                 overwrite=args.overwrite, source_family=args.source,
+                compute_heat_release=args.compute_heat_release,
             )
             if result is not None:
                 print(

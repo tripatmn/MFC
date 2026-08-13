@@ -155,6 +155,7 @@ class PAllSource(DataSource):
         widths = {axis: np.diff(values) for axis, values in axes.items()}
         measure = _cell_measures(widths)
         full_measure = measure.ravel(order="C")
+        cell_centers = _cell_center_coordinates(axes)
         range_note = None
         if flat_range is not None:
             start, stop = flat_range
@@ -164,16 +165,24 @@ class PAllSource(DataSource):
                 )
             local_measure = full_measure[start:stop]
             local_shape = (stop - start,)
+            local_centers = {
+                f"cell_{axis}": tuple(values[start:stop].tolist())
+                for axis, values in cell_centers.items()
+            }
             range_note = f"rank-local flat C-order range [{start}, {stop})"
         else:
             start, stop = 0, full_measure.size
             local_measure = full_measure
             local_shape = canonical_shape
+            local_centers = {
+                axis: tuple(((values[:-1] + values[1:]) * 0.5).tolist())
+                for axis, values in axes.items()
+            }
         grid = Grid(
             dimensions=len(shape_xyz),
             shape=local_shape,
             bounds={} if flat_range is not None else {axis: tuple(values.tolist()) for axis, values in axes.items()},
-            centers={} if flat_range is not None else {axis: tuple(((values[:-1] + values[1:]) * 0.5).tolist()) for axis, values in axes.items()},
+            centers=local_centers,
             widths={} if flat_range is not None else {axis: tuple(values.tolist()) for axis, values in widths.items()},
             cell_measures=tuple(local_measure.tolist()),
             nonuniform_axes=tuple(
@@ -304,6 +313,18 @@ def _cell_measures(widths: dict[str, np.ndarray]) -> np.ndarray:
     for values in ordered[1:]:
         result = np.multiply.outer(result, values)
     return np.asarray(result)
+
+
+def _cell_center_coordinates(axes: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    centers = {
+        axis: (values[:-1] + values[1:]) * 0.5 for axis, values in axes.items()
+    }
+    ordered_axes = [axis for axis in ("z", "y", "x") if axis in centers]
+    meshes = np.meshgrid(*(centers[axis] for axis in ordered_axes), indexing="ij")
+    return {
+        axis: np.asarray(values).ravel(order="C")
+        for axis, values in zip(ordered_axes, meshes)
+    }
 
 
 def _suffix_int(value: str) -> int:

@@ -147,8 +147,13 @@ class LustreSharedSource(DataSource):
             if mpi_file is not None:
                 mpi_file.Close()
         measures = _global_cell_measures(grid)[start:stop]
+        centers = _global_cell_centers(grid)
         local_grid = Grid(
             dimensions=grid.dimensions, shape=(count,),
+            centers={
+                f"cell_{axis}": tuple(values[start:stop].tolist())
+                for axis, values in centers.items()
+            },
             cell_measures=tuple(measures.tolist()),
             provenance=Provenance(
                 self.family, str(self.path),
@@ -282,3 +287,15 @@ def _global_cell_measures(grid: Grid) -> np.ndarray:
     for values in ordered[1:]:
         result = np.multiply.outer(result, values)
     return np.asarray(result).ravel(order="C")
+
+
+def _global_cell_centers(grid: Grid) -> dict[str, np.ndarray]:
+    ordered_axes = [axis for axis in ("z", "y", "x") if axis in grid.centers]
+    meshes = np.meshgrid(
+        *(np.asarray(grid.centers[axis], dtype=np.float64) for axis in ordered_axes),
+        indexing="ij",
+    )
+    return {
+        axis: np.asarray(values).ravel(order="C")
+        for axis, values in zip(ordered_axes, meshes)
+    }

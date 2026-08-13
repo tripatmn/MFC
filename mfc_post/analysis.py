@@ -12,6 +12,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from .execution import ExecutionContext
+from .heat_release import CHECK_ATOL_W_M3, CHECK_RTOL, CanteraHeatRelease
 from .inspect import inspect_case
 from .models import RunMetadata, State
 from .process import _load_local, _partition_plan, _transformation_provenance
@@ -35,6 +36,7 @@ class ScalarPartial:
     counts: dict[str, int] = field(default_factory=dict)
     quality_maxima: dict[str, float] = field(default_factory=dict)
     source_files: set[str] = field(default_factory=set)
+    heat_release_maxima: list[tuple[float, float, float]] = field(default_factory=list)
 
 
 def analyze_case(
@@ -48,6 +50,7 @@ def analyze_case(
     phase: str | None = None,
     overwrite: bool = False,
     source_family: str = "auto",
+    compute_heat_release: str | None = None,
 ) -> dict[str, Any] | None:
     context = ExecutionContext.create(execution)
     root = Path(case_path).expanduser().resolve()
@@ -67,6 +70,13 @@ def analyze_case(
     _progress(context, f"startup: saves discovered: {discovered_count}")
     config = Model3Configuration.from_metadata(metadata)
     _validate_species(config, metadata)
+    if compute_heat_release not in {None, "cantera"}:
+        raise ValueError("--compute-heat-release supports only 'cantera'")
+    if compute_heat_release and metadata.dimensions != 2:
+        raise ValueError("Cantera heat-release analysis currently requires a 2D case")
+    heat_release = CanteraHeatRelease(config) if compute_heat_release == "cantera" else None
+    if heat_release is not None:
+        _progress(context, "startup: heat release: Cantera TDY evaluation enabled")
     indices, selection = _select_indices(
         report["timeline"], selected_times_us, time_range_us, stride
     )
@@ -86,10 +96,14 @@ def analyze_case(
                     context, context.rank + local_position * context.size + 1,
                     len(indices), saved_index,
                     state_parallel=True,
+                    diagnostic=compute_heat_release,
                 )
                 states = _load_local(source, saved_index, raw_fields, "serial", context)
-                partial = _accumulate(states, config)
-                reduced = _reduce(partial, state_comm, context.mpi, metadata.dimensions or 1)
+                partial = _accumulate(states, config, heat_release)
+                reduced = _reduce(
+                    partial, state_comm, context.mpi, metadata.dimensions or 1,
+                    heat_release_enabled=heat_release is not None,
+                )
                 rows.append(_row(saved_index, report["timeline"], reduced))
             except Exception as exc:
                 errors.append(_error(context, report["family"], saved_index, exc))
@@ -104,18 +118,22 @@ def analyze_case(
             _save_progress(
                 context, position, len(indices), saved_index,
                 state_parallel=False,
+                diagnostic=compute_heat_release,
             )
             local_error = None
             partial = None
             try:
                 states = _load_local(source, saved_index, raw_fields, strategy, context)
-                partial = _accumulate(states, config)
+                partial = _accumulate(states, config, heat_release)
             except Exception as exc:
                 local_error = _error(context, report["family"], saved_index, exc)
             state_errors = [item for item in context.comm.allgather(local_error) if item]
             if state_errors:
                 raise RuntimeError("analysis failed; no output written:\n" + "\n".join(sorted(state_errors)))
-            reduced = _reduce(partial, context.comm, context.mpi, metadata.dimensions or 1)
+            reduced = _reduce(
+                partial, context.comm, context.mpi, metadata.dimensions or 1,
+                heat_release_enabled=heat_release is not None,
+            )
             if context.rank == 0:
                 rows.append(_row(saved_index, report["timeline"], reduced))
 
@@ -130,11 +148,26 @@ def analyze_case(
         {"saved_index": row["saved_index"], "time_us": row["time_us"], **row.pop("quality")}
         for row in rows
     ]
+    if compute_heat_release == "cantera":
+        mismatches = sum(item.get("heat_release_check_mismatch_cells", 0) for item in quality)
+        sign_mismatches = sum(
+            item.get("heat_release_check_sign_mismatch_cells", 0) for item in quality
+        )
+        if mismatches or sign_mismatches:
+            _progress(
+                context,
+                "WARNING: Cantera HRR verification disagreement: "
+                f"magnitude_cells={mismatches}, sign_cells={sign_mismatches}; "
+                "see quality.json",
+            )
     provenance = _provenance(
         root, report, config, context, strategy, indices, selection, stride,
-        source_files, source, metadata, rows,
+        source_files, source, metadata, rows, heat_release,
     )
-    _write_csv(destination / "scalar_timeseries.csv", rows)
+    _write_csv(
+        destination / "scalar_timeseries.csv", rows,
+        include_heat_release=compute_heat_release == "cantera",
+    )
     _atomic_json(destination / "quality.json", {
         "schema_version": "mfc-post.quality/v1",
         "source_family": report["family"],
@@ -242,7 +275,10 @@ def _prepare_output(context: ExecutionContext, destination: Path, overwrite: boo
         raise RuntimeError(errors[0])
 
 
-def _accumulate(states: Iterable[State], config: Model3Configuration) -> ScalarPartial:
+def _accumulate(
+    states: Iterable[State], config: Model3Configuration,
+    heat_release: CanteraHeatRelease | None = None,
+) -> ScalarPartial:
     result = ScalarPartial()
     stoich = _stoich_coefficient(config)
     species_names = _species_lookup(config)
@@ -257,6 +293,33 @@ def _accumulate(states: Iterable[State], config: Model3Configuration) -> ScalarP
             raise ValueError(f"saved index {state.saved_index}: reconstructed field/grid size mismatch")
         finite_weights = np.isfinite(weights) & (weights > 0.0)
         valid_gas = masks["mask.chemistry_valid"] & masks["mask.gas_dominated"] & finite_weights
+        if heat_release is not None:
+            hrr = heat_release.evaluate(state, physical)
+            _add(result.sums, "integrated_heat_release_rate_net_W_per_m", hrr.net)
+            _add(result.sums, "integrated_heat_release_rate_positive_W_per_m", hrr.positive)
+            _add(result.sums, "integrated_heat_release_rate_negative_W_per_m", hrr.negative)
+            _add(result.sums, "area_positive_heat_release_rate", hrr.positive_area)
+            result.counts["heat_release_evaluated_cells"] = (
+                result.counts.get("heat_release_evaluated_cells", 0) + hrr.evaluated_cells
+            )
+            result.counts["heat_release_check_mismatch_cells"] = (
+                result.counts.get("heat_release_check_mismatch_cells", 0)
+                + hrr.check_mismatch_cells
+            )
+            result.counts["heat_release_check_sign_mismatch_cells"] = (
+                result.counts.get("heat_release_check_sign_mismatch_cells", 0)
+                + hrr.check_sign_mismatch_cells
+            )
+            result.quality_maxima["heat_release_check_max_abs_error_W_m3"] = max(
+                result.quality_maxima.get("heat_release_check_max_abs_error_W_m3", 0.0),
+                hrr.check_max_abs_error_W_m3,
+            )
+            result.quality_maxima["heat_release_check_max_relative_error"] = max(
+                result.quality_maxima.get("heat_release_check_max_relative_error", 0.0),
+                hrr.check_max_relative_error,
+            )
+            if hrr.maximum is not None:
+                result.heat_release_maxima.append((hrr.maximum, hrr.x_max, hrr.y_max))
         for species in INTEGRATED_SPECIES:
             values = fields[f"rhoY[{species_names[species]}]"]
             mask = finite_weights & np.isfinite(values)
@@ -356,7 +419,10 @@ def _maximum(mapping: dict[str, float], name: str, values) -> None:
         mapping[name] = max(mapping.get(name, float("-inf")), float(np.max(values)))
 
 
-def _reduce(partial: ScalarPartial, comm, mpi, dimensions: int) -> dict[str, Any] | None:
+def _reduce(
+    partial: ScalarPartial, comm, mpi, dimensions: int,
+    heat_release_enabled: bool = False,
+) -> dict[str, Any] | None:
     sum_op, max_op = (mpi.SUM, mpi.MAX) if mpi else (None, None)
     sum_names = sorted(set().union(*comm.allgather(set(partial.sums))))
     max_names = sorted(set().union(*comm.allgather(set(partial.maxima))))
@@ -367,6 +433,14 @@ def _reduce(partial: ScalarPartial, comm, mpi, dimensions: int) -> dict[str, Any
     counts = {name: comm.reduce(partial.counts.get(name, 0), op=sum_op, root=0) for name in count_names}
     quality = {name: comm.reduce(partial.quality_maxima.get(name, 0.0), op=max_op, root=0) for name in quality_names}
     files = sorted(set().union(*comm.allgather(partial.source_files)))
+    heat_release_candidates = (
+        [
+            candidate
+            for group in comm.allgather(partial.heat_release_maxima)
+            for candidate in group
+        ]
+        if heat_release_enabled else []
+    )
     if comm.rank != 0:
         return None
     spatial_unit = {1: "m", 2: "m2", 3: "m3"}.get(dimensions, "case_measure")
@@ -399,6 +473,17 @@ def _reduce(partial: ScalarPartial, comm, mpi, dimensions: int) -> dict[str, Any
         "quality": {**{name: int(value) for name, value in counts.items()}, **{name: float(value) for name, value in quality.items()}},
         "source_files": files,
     }
+    if any(name.startswith("integrated_heat_release_rate_") for name in sums):
+        candidate = max(
+            heat_release_candidates,
+            key=lambda item: (item[0], -item[1], -item[2]),
+            default=None,
+        )
+        record.update({
+            "max_heat_release_rate_W_m3": candidate[0] if candidate else None,
+            "x_max_heat_release_rate_m": candidate[1] if candidate else None,
+            "y_max_heat_release_rate_m": candidate[2] if candidate else None,
+        })
     return record
 
 
@@ -437,7 +522,7 @@ def _species_lookup(config: Model3Configuration) -> dict[str, str]:
 
 def _provenance(
     root, report, config, context, strategy, indices, selection, stride,
-    source_files, source, metadata, rows,
+    source_files, source, metadata, rows, heat_release,
 ):
     measure = {1: "kg/m2 for integrals and m for measures", 2: "kg/m for integrals and m2 for areas", 3: "kg for integrals and m3 for volumes"}.get(metadata.dimensions)
     return {
@@ -474,6 +559,20 @@ def _provenance(
         "eos_inputs": [asdict(item) for item in config.eos],
         "mask_thresholds": asdict(config.thresholds),
         "transformations": _transformation_provenance(config),
+        **({
+            "heat_release": {
+                "backend": "cantera",
+                "enabled": True,
+                "state": "gas.TDY = reconstructed chemistry-clipped T, chemistry gas density, full normalized Y vector",
+                "mask": "mask.chemistry_valid AND alpha_liq <= 0.5",
+                "definition": "gas.heat_release_rate [W/m^3]",
+                "verification": "-dot(gas.net_production_rates, gas.partial_molar_enthalpies)",
+                "verification_rtol": CHECK_RTOL,
+                "verification_atol_W_m3": CHECK_ATOL_W_M3,
+                "integration": "2D cell area times volumetric rate, assuming unit depth; W/m",
+                "species_order": list(heat_release.species_names),
+            }
+        } if heat_release is not None else {}),
         "diagnostics": {
             "integrated_rhoY": f"raw conservative rhoY integrated over cells with finite rhoY and positive finite cell measure; units {measure}",
             "valid_gas": "mask.chemistry_valid AND mask.gas_dominated",
@@ -510,7 +609,9 @@ def _provenance(
     }
 
 
-def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+def _write_csv(
+    path: Path, rows: list[dict[str, Any]], include_heat_release: bool = False,
+) -> None:
     columns = [
         "saved_index", "simulation_step", "physical_time_s", "time_us",
         *(f"integrated_rhoY_{name}" for name in INTEGRATED_SPECIES),
@@ -525,6 +626,15 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "liquid_area_alpha_gt_0p5", "liquid_area_ratio_A_A0",
         "integrated_rhoY_unit", "spatial_measure_unit",
     ]
+    if include_heat_release:
+        columns.extend([
+            "max_heat_release_rate_W_m3",
+            "x_max_heat_release_rate_m", "y_max_heat_release_rate_m",
+            "integrated_heat_release_rate_net_W_per_m",
+            "integrated_heat_release_rate_positive_W_per_m",
+            "integrated_heat_release_rate_negative_W_per_m",
+            "area_positive_heat_release_rate",
+        ])
     temporary = path.with_name(f".{path.name}.tmp")
     with temporary.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=columns)
@@ -551,10 +661,18 @@ def _progress(context, message):
         print(f"mfc-post analyze: {message}", flush=True)
 
 
-def _save_progress(context, ordinal, total, saved_index, state_parallel):
+def _save_progress(
+    context, ordinal, total, saved_index, state_parallel, diagnostic=None,
+):
     if state_parallel or context.rank == 0:
         print(
             f"mfc-post analyze: progress: save {ordinal}/{total}: "
             f"saved_index={saved_index}, worker_rank={context.rank}",
             flush=True,
         )
+        if diagnostic == "cantera":
+            print(
+                f"mfc-post analyze: progress: Cantera HRR saved_index={saved_index}, "
+                f"worker_rank={context.rank}",
+                flush=True,
+            )

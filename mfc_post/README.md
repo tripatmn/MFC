@@ -123,6 +123,26 @@ include the initial save. MPI runs assign
 whole states to workers when temporal concurrency is favorable and otherwise
 reduce spatial partitions. Rank 0 orders and writes the sole history.
 
+Cantera heat release is opt-in and does not affect ordinary analysis:
+
+```console
+./mfc-post analyze /path/to/case \
+  --selected-times-us 5,6,7,7.5,8,8.5,9,10 \
+  --compute-heat-release cantera \
+  --out-dir /path/to/hrr_analysis
+```
+
+This requires the Cantera Python package and the exact mechanism phase resolved
+from the case metadata. For each chemistry-valid cell with `alpha_liq <= 0.5`,
+the backend sets `gas.TDY` from chemistry-clipped reconstructed temperature,
+chemistry-gas density, and the complete normalized mass-fraction vector in
+Cantera species order. It evaluates `gas.heat_release_rate` in W/m3 and verifies
+it against `-dot(net_production_rates, partial_molar_enthalpies)`. Verification
+counts and errors are written to `quality.json`. Two-dimensional integrals use
+actual `dx*dy` and unit depth, so their units are W/m; the negative integral is
+signed and is therefore nonpositive. HRR contour rendering is not implemented
+yet.
+
 Trend plotting reads only `scalar_timeseries.csv`; it does not rediscover the
 case or open `p_all`. The default/all set writes stable clean temperature,
 product, radical, hot-region, near-stoichiometric, liquid-area-ratio, and

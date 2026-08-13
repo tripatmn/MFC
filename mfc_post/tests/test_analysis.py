@@ -9,7 +9,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from mfc_post.analysis import _select_indices, analyze_case
@@ -133,6 +135,7 @@ class AnalysisTests(unittest.TestCase):
             with (analysis / "scalar_timeseries.csv").open(newline="") as stream:
                 csv_rows = list(csv.DictReader(stream))
             self.assertEqual(len(csv_rows), 3)
+            self.assertNotIn("max_heat_release_rate_W_m3", csv_rows[0])
             quality = json.loads((analysis / "quality.json").read_text())
             self.assertEqual(quality["quality"][0]["total_cells"], 4)
             self.assertEqual(quality["quality"][0]["gas_dominated_cells"], 2)
@@ -219,6 +222,89 @@ class AnalysisTests(unittest.TestCase):
             self.assertAlmostEqual(result["rows"][0]["physical_time_s"], 5.0e-6)
             self.assertIn("saved_index * t_save", result["provenance"]["timeline"]["time_basis"])
 
+    def test_optional_cantera_heat_release_columns_full_species_and_location(self):
+        class FakeGas:
+            species_names = list(SPECIES)
+
+            def __init__(self):
+                self._qdot = 0.0
+
+            @property
+            def TDY(self):
+                raise AssertionError("TDY is write-only in this test")
+
+            @TDY.setter
+            def TDY(self, state):
+                temperature, density, mass_fractions = state
+                self._qdot = float(temperature) * float(density)
+                self.received_species_count = len(mass_fractions)
+
+            @property
+            def heat_release_rate(self):
+                return self._qdot
+
+            @property
+            def net_production_rates(self):
+                return [self._qdot, *([0.0] * (len(SPECIES) - 1))]
+
+            @property
+            def partial_molar_enthalpies(self):
+                return [-1.0, *([0.0] * (len(SPECIES) - 1))]
+
+        fake_cantera = types.SimpleNamespace(
+            Solution=lambda path, phase: FakeGas(),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _case(root)
+            simulation = root / "simulation.inp"
+            simulation.write_text(simulation.read_text().replace("m=3\nn=0", "m=1\nn=1"))
+            for saved_index in range(3):
+                state = root / "p_all" / "p0" / str(saved_index)
+                _record(state / "x_cb.dat", [0.0, 1.0, 2.0])
+                _record(state / "y_cb.dat", [0.0, 1.0, 2.0])
+                fractions = {
+                    "NC12H26": 0.05, "O2": 0.20, "OH": 0.01, "HO2": 0.01,
+                    "H2O2": 0.01, "CO": 0.10, "CO2": 0.20, "H2O": 0.42,
+                }
+                fields = (
+                    [0.0, 0.1, 1.0, 0.0], [1.0] * 4,
+                    [0.0] * 4, [0.0] * 4, [1.0e6] * 4,
+                    [0.0, 0.2, 0.6, 0.0], [1.0, 0.8, 0.4, 1.0],
+                    [1.0] * 4, [1.0] * 4,
+                    *([fractions[name]] * 4 for name in SPECIES),
+                )
+                for index, values in enumerate(fields, 1):
+                    _record(state / f"q_cons_vf{index}.dat", values)
+            with mock.patch.dict(sys.modules, {"cantera": fake_cantera}):
+                result = analyze_case(
+                    root, selected_times_us=(5.0,), execution="serial",
+                    compute_heat_release="cantera", out_dir=root / "hrr",
+                )
+            row = result["rows"][0]
+            for column in (
+                "max_heat_release_rate_W_m3", "x_max_heat_release_rate_m",
+                "y_max_heat_release_rate_m", "integrated_heat_release_rate_net_W_per_m",
+                "integrated_heat_release_rate_positive_W_per_m",
+                "integrated_heat_release_rate_negative_W_per_m",
+                "area_positive_heat_release_rate",
+            ):
+                self.assertIn(column, row)
+            self.assertGreater(row["max_heat_release_rate_W_m3"], 0.0)
+            self.assertEqual(row["x_max_heat_release_rate_m"], 0.5)
+            self.assertEqual(row["y_max_heat_release_rate_m"], 0.5)
+            self.assertEqual(row["integrated_heat_release_rate_negative_W_per_m"], 0.0)
+            self.assertEqual(row["area_positive_heat_release_rate"], 3.0)
+            with (root / "hrr" / "scalar_timeseries.csv").open(newline="") as stream:
+                columns = tuple(csv.DictReader(stream).fieldnames or ())
+            self.assertIn("max_heat_release_rate_W_m3", columns)
+            quality = result["quality"][0]
+            self.assertEqual(quality["heat_release_evaluated_cells"], 3)
+            self.assertEqual(quality["heat_release_check_mismatch_cells"], 0)
+            provenance = result["provenance"]["heat_release"]
+            self.assertEqual(provenance["species_order"], list(SPECIES))
+            self.assertEqual(provenance["definition"], "gas.heat_release_rate [W/m^3]")
+
     def test_plot_help_and_cli_failure_are_explicit(self):
         repository = Path(__file__).resolve().parents[2]
         help_result = subprocess.run(
@@ -233,6 +319,7 @@ class AnalysisTests(unittest.TestCase):
         )
         self.assertEqual(analyze_help.returncode, 0, analyze_help.stderr)
         self.assertIn("--source", analyze_help.stdout)
+        self.assertIn("--compute-heat-release", analyze_help.stdout)
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             exit_code = main(["plot", "/definitely/missing/scalar_timeseries.csv"])
