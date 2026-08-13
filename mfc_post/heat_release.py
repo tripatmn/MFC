@@ -31,20 +31,22 @@ class HeatReleaseResult:
 
 
 class CanteraHeatRelease:
-    def __init__(self, config: Model3Configuration):
-        try:
-            import cantera as ct
-        except ImportError as exc:
-            raise ValueError(
-                "--compute-heat-release cantera requires the Cantera Python package"
-            ) from exc
-        try:
-            self.gas = ct.Solution(config.mechanism_path, config.mechanism_phase)
-        except Exception as exc:
-            raise ValueError(
-                f"failed to load Cantera phase {config.mechanism_phase!r} from "
-                f"{config.mechanism_path}: {exc}"
-            ) from exc
+    def __init__(self, config: Model3Configuration, gas=None):
+        if gas is None:
+            try:
+                import cantera as ct
+            except ImportError as exc:
+                raise ValueError(
+                    "--compute-heat-release cantera requires the Cantera Python package"
+                ) from exc
+            try:
+                gas = ct.Solution(config.mechanism_path, config.mechanism_phase)
+            except Exception as exc:
+                raise ValueError(
+                    f"failed to load Cantera phase {config.mechanism_phase!r} from "
+                    f"{config.mechanism_path}: {exc}"
+                ) from exc
+        self.gas = gas
         cantera_names = tuple(self.gas.species_names)
         missing = [name for name in cantera_names if name not in config.species_names]
         extra = [name for name in config.species_names if name not in cantera_names]

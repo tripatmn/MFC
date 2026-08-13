@@ -14,6 +14,8 @@ import numpy as np
 from .execution import ExecutionContext
 from .heat_release import CHECK_ATOL_W_M3, CHECK_RTOL, CanteraHeatRelease
 from .inspect import inspect_case
+from .config import load_parameters
+from .mechanism import load_cantera_mechanism
 from .models import RunMetadata, State
 from .process import _load_local, _partition_plan, _transformation_provenance
 from .reconstruction import Model3Configuration, reconstruct_model3
@@ -59,9 +61,24 @@ def analyze_case(
         raise ValueError("--stride must be a positive integer")
     if selected_times_us is not None and time_range_us is not None:
         raise ValueError("--selected-times-us and --time-range-us are mutually exclusive")
+    if compute_heat_release not in {None, "cantera"}:
+        raise ValueError("--compute-heat-release supports only 'cantera'")
 
     _progress(context, f"startup: case path: {root}")
-    inspection = inspect_case(root, mechanism=mechanism, phase=phase)
+    loaded_mechanism = None
+    if compute_heat_release == "cantera":
+        params, _ = load_parameters(root)
+        loaded_mechanism = load_cantera_mechanism(root, params, mechanism, phase)
+        _progress(
+            context,
+            "startup: Cantera mechanism: "
+            f"{loaded_mechanism.metadata.path}, phase={loaded_mechanism.metadata.phase}, "
+            f"species={len(loaded_mechanism.metadata.species_names)}",
+        )
+    inspection = inspect_case(
+        root, mechanism=mechanism, phase=phase,
+        resolved_mechanism=loaded_mechanism.metadata if loaded_mechanism else None,
+    )
     metadata = _metadata(inspection)
     source, report = select_raw_source(root, metadata, inspection, source_family)
     discovered_count = len(report["timeline"]["saved_indices"])
@@ -70,11 +87,12 @@ def analyze_case(
     _progress(context, f"startup: saves discovered: {discovered_count}")
     config = Model3Configuration.from_metadata(metadata)
     _validate_species(config, metadata)
-    if compute_heat_release not in {None, "cantera"}:
-        raise ValueError("--compute-heat-release supports only 'cantera'")
     if compute_heat_release and metadata.dimensions != 2:
         raise ValueError("Cantera heat-release analysis currently requires a 2D case")
-    heat_release = CanteraHeatRelease(config) if compute_heat_release == "cantera" else None
+    heat_release = (
+        CanteraHeatRelease(config, loaded_mechanism.gas)
+        if loaded_mechanism is not None else None
+    )
     if heat_release is not None:
         _progress(context, "startup: heat release: Cantera TDY evaluation enabled")
     indices, selection = _select_indices(

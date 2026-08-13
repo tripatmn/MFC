@@ -8,7 +8,7 @@ from typing import Any
 
 from .config import bool_param, int_param, load_parameters
 from .equations import build_equation_layout
-from .mechanism import resolve_mechanism
+from .mechanism import MechanismMetadata, resolve_mechanism
 from .models import RunMetadata, SourceReport, to_dict
 from .sources import BinarySource, DAsciiSource, LustrePerProcessSource, LustreSharedSource, PAllSource, SiloSource
 
@@ -17,16 +17,23 @@ def inspect_case(
     case_path: str | Path,
     mechanism: str | Path | None = None,
     phase: str | None = None,
+    resolved_mechanism: MechanismMetadata | None = None,
 ) -> dict[str, Any]:
     root = Path(case_path).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"case directory does not exist: {root}")
     params, parameter_sources = load_parameters(root)
     observed_size = _observed_raw_size(root)
-    species_names, species_warnings = _recover_species(root, params, observed_size, mechanism, phase)
+    species_names, species_warnings = _recover_species(
+        root, params, observed_size, mechanism, phase, resolved_mechanism,
+    )
     if species_names:
         params["species_names"] = species_names
         params["num_species"] = len(species_names)
+        if resolved_mechanism is not None:
+            # Explicit HRR requests establish that the stored trailing equations
+            # are the selected mechanism's global chemistry-species block.
+            params["chemistry"] = True
     layout = build_equation_layout(params, observed_size)
     n, p = int_param(params, "n", 0), int_param(params, "p", 0)
     dimensions = 1 + int(n > 0) + int(p > 0) if "m" in params else None
@@ -88,12 +95,15 @@ def _observed_raw_size(root: Path) -> int | None:
 def _recover_species(
     root: Path, params: dict[str, Any], observed_size: int | None,
     mechanism_override: str | Path | None = None, phase_override: str | None = None,
+    resolved_mechanism: MechanismMetadata | None = None,
 ) -> tuple[list[str], list[str]]:
-    if not bool_param(params, "chemistry"):
+    if resolved_mechanism is None and not bool_param(params, "chemistry"):
         return [], []
     warnings: list[str] = []
     try:
-        resolved = resolve_mechanism(root, params, mechanism_override, phase_override)
+        resolved = resolved_mechanism or resolve_mechanism(
+            root, params, mechanism_override, phase_override,
+        )
         if observed_size is not None:
             params["num_species"] = len(resolved.species_names)
         params["cantera_file"] = resolved.path

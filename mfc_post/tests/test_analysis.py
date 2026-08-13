@@ -225,6 +225,8 @@ class AnalysisTests(unittest.TestCase):
     def test_optional_cantera_heat_release_columns_full_species_and_location(self):
         class FakeGas:
             species_names = list(SPECIES)
+            molecular_weights = [170.0, 32.0, 17.0, 33.0, 34.0, 28.0, 44.0, 18.0]
+            name = "gas"
 
             def __init__(self):
                 self._qdot = 0.0
@@ -251,14 +253,18 @@ class AnalysisTests(unittest.TestCase):
             def partial_molar_enthalpies(self):
                 return [-1.0, *([0.0] * (len(SPECIES) - 1))]
 
-        fake_cantera = types.SimpleNamespace(
-            Solution=lambda path, phase: FakeGas(),
-        )
+        solution = mock.Mock(side_effect=lambda path, phase=None: FakeGas())
+        fake_cantera = types.SimpleNamespace(Solution=solution, gas_constant=8314.46261815324)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _case(root)
             simulation = root / "simulation.inp"
-            simulation.write_text(simulation.read_text().replace("m=3\nn=0", "m=1\nn=1"))
+            simulation.write_text(
+                simulation.read_text()
+                .replace("m=3\nn=0", "m=1\nn=1")
+                .replace("chemistry=T", "chemistry=F")
+                .replace("cantera_file='mechanism.yaml'", "cantera_file='missing.yaml'")
+            )
             for saved_index in range(3):
                 state = root / "p_all" / "p0" / str(saved_index)
                 _record(state / "x_cb.dat", [0.0, 1.0, 2.0])
@@ -279,8 +285,10 @@ class AnalysisTests(unittest.TestCase):
             with mock.patch.dict(sys.modules, {"cantera": fake_cantera}):
                 result = analyze_case(
                     root, selected_times_us=(5.0,), execution="serial",
-                    compute_heat_release="cantera", out_dir=root / "hrr",
+                    compute_heat_release="cantera", mechanism=root / "mechanism.yaml",
+                    phase="gas", out_dir=root / "hrr",
                 )
+            solution.assert_called_once_with(str((root / "mechanism.yaml").resolve()), "gas")
             row = result["rows"][0]
             for column in (
                 "max_heat_release_rate_W_m3", "x_max_heat_release_rate_m",
