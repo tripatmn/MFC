@@ -1154,7 +1154,7 @@ contains
         end if
 
 
-        if (chemistry .and. chem_params%reactions) then
+        if (chemistry .and. chem_params%reactions .and. chem_params%reaction_substeps == 0) then
             call nvtxStartRange("RHS-CHEM-REACTIONS")
             call s_compute_chemistry_reaction_flux(rhs_vf, q_cons_qp%vf, q_T_sf, q_prim_qp%vf, idwint, t_step, stage, &
                                                    q_rk_stored, rk_a, rk_b, rk_c, rk_d, rk_dt, &

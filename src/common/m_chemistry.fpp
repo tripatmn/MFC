@@ -15,6 +15,7 @@ module m_chemistry
 
     use m_thermochem, only: &
         num_species, molecular_weights, get_temperature, get_net_production_rates, &
+        get_creation_destruction_rates, &
         gas_constant, get_mixture_molecular_weight, get_mixture_energy_mass, &
         get_mixture_specific_heat_cp_mass, get_mixture_enthalpy_mass, &
         get_species_enthalpies_rt
@@ -42,6 +43,11 @@ module m_chemistry
     integer, dimension(3) :: offsets
     $:GPU_DECLARE(create='[offsets]')
     real(wp), parameter :: chem_rho_g_min = 1.0e-14_wp
+    real(wp), parameter :: aqss_sumY_norm_tol = 1.0e-10_wp
+    real(wp), parameter :: aqss_sumY_abort_tol = 1.0e-5_wp
+    real(wp), parameter :: aqss_negative_roundoff_tol = 1.0e-14_wp
+    real(wp), parameter :: aqss_pre_sumY_temp_norm_tol = 1.0e-3_wp
+    real(wp), parameter :: aqss_pre_negative_abort_tol = 1.0e-3_wp
 
 contains
 
@@ -83,6 +89,34 @@ contains
 
     end function s_reaction_heat_gamma
 
+    real(wp) function s_chemistry_pi_inf(fluid_id)
+        $:GPU_ROUTINE(function_name='s_chemistry_pi_inf',parallelism='[seq]', &
+            & cray_inline=True)
+
+        integer, intent(in) :: fluid_id
+
+#ifdef MFC_SIMULATION
+        s_chemistry_pi_inf = pi_infs(fluid_id)
+#else
+        s_chemistry_pi_inf = fluid_pp(fluid_id)%pi_inf
+#endif
+
+    end function s_chemistry_pi_inf
+
+    real(wp) function s_chemistry_qv(fluid_id)
+        $:GPU_ROUTINE(function_name='s_chemistry_qv',parallelism='[seq]', &
+            & cray_inline=True)
+
+        integer, intent(in) :: fluid_id
+
+#ifdef MFC_SIMULATION
+        s_chemistry_qv = qvs(fluid_id)
+#else
+        s_chemistry_qv = fluid_pp(fluid_id)%qv
+#endif
+
+    end function s_chemistry_qv
+
     !> @brief GPU-safe typed finite check.
     logical function s_is_finite_wp(x)
         $:GPU_ROUTINE(function_name='s_is_finite_wp',parallelism='[seq]', &
@@ -117,6 +151,116 @@ contains
         end if
 
     end subroutine s_compute_chemistry_gas_density
+
+    !> @brief Computes stored and intrinsic gas density for Model-3 chemistry.
+    subroutine s_compute_chemistry_gas_alpha_density(q_cons_vf, x, y, z, rho_g, alpha_g, rho_g_intrinsic)
+        $:GPU_ROUTINE(function_name='s_compute_chemistry_gas_alpha_density',parallelism='[seq]', &
+            & cray_inline=True)
+
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
+        integer, intent(in) :: x, y, z
+        real(wp), intent(out) :: rho_g, alpha_g, rho_g_intrinsic
+
+        integer :: i, fluid_id
+
+        rho_g = 0._wp
+        alpha_g = 1._wp
+
+        if (num_fluids > 1 .and. model_eqns == 3) then
+            alpha_g = 0._wp
+            if (chem_gas_num_fluids <= 0) then
+                fluid_id = chem_gas_fluid_id
+                rho_g = q_cons_vf(contxb + fluid_id - 1)%sf(x, y, z)
+                alpha_g = q_cons_vf(advxb + fluid_id - 1)%sf(x, y, z)
+            else
+                do i = 1, chem_gas_num_fluids
+                    fluid_id = chem_gas_fluid_ids(i)
+                    rho_g = rho_g + q_cons_vf(contxb + fluid_id - 1)%sf(x, y, z)
+                    alpha_g = alpha_g + q_cons_vf(advxb + fluid_id - 1)%sf(x, y, z)
+                end do
+            end if
+            alpha_g = min(max(alpha_g, 0._wp), 1._wp)
+            if (alpha_g > sgm_eps) then
+                rho_g_intrinsic = rho_g/alpha_g
+            else
+                rho_g_intrinsic = 0._wp
+            end if
+        else
+            rho_g = q_cons_vf(contxb)%sf(x, y, z)
+            rho_g_intrinsic = rho_g
+        end if
+
+    end subroutine s_compute_chemistry_gas_alpha_density
+
+    !> @brief Recovers the Model-3 gas pressure implied by selected gas internal-energy equations.
+    subroutine s_compute_chemistry_gas_pressure(q_cons_vf, x, y, z, pres_g)
+        $:GPU_ROUTINE(function_name='s_compute_chemistry_gas_pressure',parallelism='[seq]', &
+            & cray_inline=True)
+
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
+        integer, intent(in) :: x, y, z
+        real(wp), intent(out) :: pres_g
+
+        integer :: i, fluid_id, count_g
+        real(wp) :: alpha_i, p_i, weight_i, p_weight_sum, weight_sum
+
+        pres_g = 0._wp
+
+        if (num_fluids > 1 .and. model_eqns == 3) then
+            p_weight_sum = 0._wp
+            weight_sum = 0._wp
+            count_g = max(1, chem_gas_num_fluids)
+            do i = 1, count_g
+                if (chem_gas_num_fluids <= 0) then
+                    fluid_id = chem_gas_fluid_id
+                else
+                    fluid_id = chem_gas_fluid_ids(i)
+                end if
+                alpha_i = q_cons_vf(advxb + fluid_id - 1)%sf(x, y, z)
+                if (alpha_i > sgm_eps) then
+                    p_i = ((q_cons_vf(intxb + fluid_id - 1)%sf(x, y, z) - &
+                            q_cons_vf(contxb + fluid_id - 1)%sf(x, y, z)*s_chemistry_qv(fluid_id))/alpha_i - &
+                           s_chemistry_pi_inf(fluid_id))/s_reaction_heat_gamma(fluid_id)
+                    weight_i = alpha_i*s_reaction_heat_gamma(fluid_id)
+                    p_weight_sum = p_weight_sum + weight_i*p_i
+                    weight_sum = weight_sum + weight_i
+                end if
+            end do
+            if (weight_sum > sgm_eps) pres_g = p_weight_sum/weight_sum
+        end if
+
+    end subroutine s_compute_chemistry_gas_pressure
+
+    !> @brief Recovers chemistry temperature from the current Model-3 gas state.
+    subroutine s_compute_chemistry_reactor_temperature(q_cons_vf, q_T_sf, x, y, z, rho_intrinsic, Ys, T)
+        $:GPU_ROUTINE(function_name='s_compute_chemistry_reactor_temperature',parallelism='[seq]', &
+            & cray_inline=True)
+
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
+        type(scalar_field), intent(in) :: q_T_sf
+        integer, intent(in) :: x, y, z
+        real(wp), intent(in) :: rho_intrinsic
+        real(wp), dimension(num_species), intent(in) :: Ys
+        real(wp), intent(out) :: T
+
+        real(wp) :: pres_g, mix_mol_weight, T_candidate
+
+        T = q_T_sf%sf(x, y, z)
+
+        if (chem_fixed_T_enable .and. num_fluids > 1) then
+            T = chem_fixed_T
+        elseif (num_fluids > 1 .and. model_eqns == 3 .and. rho_intrinsic > chem_rho_g_min) then
+            call s_compute_chemistry_gas_pressure(q_cons_vf, x, y, z, pres_g)
+            if (pres_g > 0._wp .and. s_is_finite_wp(pres_g)) then
+                call get_mixture_molecular_weight(Ys, mix_mol_weight)
+                T_candidate = pres_g*mix_mol_weight/(gas_constant*rho_intrinsic)
+                if (T_candidate > 0._wp .and. s_is_finite_wp(T_candidate)) T = T_candidate
+            end if
+        end if
+
+        T = min(max(T, chem_T_min), chem_T_max)
+
+    end subroutine s_compute_chemistry_reactor_temperature
 
     !> @brief Computes mixture viscosities for left and right states and inverts them for use as reciprocal Reynolds numbers.
     subroutine compute_viscosity_and_inversion(T_L, Ys_L, T_R, Ys_R, Re_L, Re_R)
@@ -878,6 +1022,632 @@ contains
         end if
 
     end subroutine s_compute_chemistry_reaction_flux
+
+    subroutine s_chemistry_reaction_substep(q_cons_vf, q_T_sf, dtime, bounds, t_step)
+
+        type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
+        type(scalar_field), intent(inout) :: q_T_sf
+        real(wp), intent(in) :: dtime
+        type(int_bounds_info), dimension(1:3), intent(in) :: bounds
+        integer, intent(in) :: t_step
+
+        integer :: x, y, z, eqn, s, nsub
+        integer :: abort_flag, pre_norm_flag, gas_idx, fluid_id, count_g
+        integer :: local_abort_reason, local_abort_species, local_fluid_id
+        integer :: diag_abort_reason, diag_abort_x, diag_abort_y, diag_abort_z
+        integer :: diag_abort_species, diag_abort_fluid_id
+        real(wp) :: rho_g, alpha_g, rho_react, rho_species
+        real(wp) :: rho, energy, T, T_new, dt_sub, Ysum, Ysum0, Yerr0
+        real(wp) :: Ysum_raw, Ysum_repaired, Ysum_write, Ywrite, closure_delta
+        real(wp) :: r, r2, wr, mw, loss_i, prod_p, loss_p, Lbar, pbar
+        real(wp) :: source_vol_scale
+        real(wp) :: minY, minY_after, diag_pre_sumY_err, diag_post_sumY_err
+        real(wp) :: diag_minY, diag_species_mass_before, diag_species_mass_after
+        real(wp) :: diag_heat_pos_sum, diag_heat_neg_sum, diag_heat_abs_sum
+        real(wp) :: local_abort_score, local_pre_sumY, local_post_sumY
+        real(wp) :: local_pre_minY, local_post_minY
+        real(wp) :: local_Y_before, local_Y_after, local_pressure
+        real(wp) :: diag_abort_score, diag_abort_pre_sumY, diag_abort_post_sumY
+        real(wp) :: diag_abort_pre_minY, diag_abort_post_minY
+        real(wp) :: diag_abort_Y_before, diag_abort_Y_after
+        real(wp) :: diag_abort_alpha_g, diag_abort_rho_stored, diag_abort_rho_intrinsic
+        real(wp) :: diag_abort_pressure, diag_abort_temperature
+        real(wp) :: diag_pre_norm_score, diag_pre_norm_sumY, diag_pre_norm_minY
+        real(wp) :: diag_pre_norm_repaired_sumY
+        real(wp) :: h_k, qdot_h_sub, mass_rate_k, heat_sub
+        real(wp) :: heat_weight, heat_weight_denom
+        integer :: diag_pre_norm_x, diag_pre_norm_y, diag_pre_norm_z, diag_pre_norm_species
+        real(wp), parameter :: y_floor = 1.e-16_wp
+        logical :: model3_gas
+        character(len=32) :: diag_abort_reason_label
+
+        #:if not MFC_CASE_OPTIMIZATION and USING_AMD
+            real(wp), dimension(10) :: Ys, Ys_rate, Ys_cons, Ys_initial, cdot, ddot, y0, prod0, Lloss, alp, h_rt
+        #:else
+            real(wp), dimension(num_species) :: Ys, Ys_rate, Ys_cons, Ys_initial, cdot, ddot, y0, prod0, Lloss, alp, h_rt
+        #:endif
+
+        if (chem_params%reaction_substeps <= 0) return
+
+        model3_gas = num_fluids > 1 .and. model_eqns == 3
+        nsub = chem_params%reaction_substeps
+        if (nsub < 1) return
+        dt_sub = dtime/real(nsub, wp)
+
+        diag_pre_sumY_err = 0._wp
+        diag_post_sumY_err = 0._wp
+        diag_minY = huge(1._wp)
+        diag_species_mass_before = 0._wp
+        diag_species_mass_after = 0._wp
+        diag_heat_pos_sum = 0._wp
+        diag_heat_neg_sum = 0._wp
+        diag_heat_abs_sum = 0._wp
+        abort_flag = 0
+        pre_norm_flag = 0
+        diag_abort_score = -1._wp
+        diag_abort_reason = 0
+        diag_abort_x = -1
+        diag_abort_y = -1
+        diag_abort_z = -1
+        diag_abort_species = -1
+        diag_abort_fluid_id = -1
+        diag_abort_pre_sumY = 0._wp
+        diag_abort_post_sumY = 0._wp
+        diag_abort_pre_minY = 0._wp
+        diag_abort_post_minY = 0._wp
+        diag_abort_Y_before = 0._wp
+        diag_abort_Y_after = 0._wp
+        diag_abort_alpha_g = 0._wp
+        diag_abort_rho_stored = 0._wp
+        diag_abort_rho_intrinsic = 0._wp
+        diag_abort_pressure = 0._wp
+        diag_abort_temperature = 0._wp
+        diag_pre_norm_score = -1._wp
+        diag_pre_norm_sumY = 0._wp
+        diag_pre_norm_minY = 0._wp
+        diag_pre_norm_repaired_sumY = 0._wp
+        diag_pre_norm_x = -1
+        diag_pre_norm_y = -1
+        diag_pre_norm_z = -1
+        diag_pre_norm_species = -1
+
+        $:GPU_PARALLEL_LOOP(collapse=3, &
+            private='[Ys, Ys_rate, Ys_cons, Ys_initial, cdot, ddot, y0, prod0, Lloss, alp, h_rt, eqn, s, gas_idx, fluid_id, count_g, local_abort_reason, local_abort_species, local_fluid_id, rho_g, alpha_g, rho_react, rho_species, rho, energy, T, T_new, Ysum, Ysum0, Yerr0, Ysum_raw, Ysum_repaired, Ysum_write, Ywrite, closure_delta, r, r2, wr, mw, loss_i, prod_p, loss_p, Lbar, pbar, source_vol_scale, minY, minY_after, local_abort_score, local_pre_sumY, local_post_sumY, local_pre_minY, local_post_minY, local_Y_before, local_Y_after, local_pressure, h_k, qdot_h_sub, mass_rate_k, heat_sub, heat_weight, heat_weight_denom]', &
+            reduction='[[diag_pre_sumY_err, diag_post_sumY_err], [diag_species_mass_before, diag_species_mass_after, diag_heat_pos_sum, diag_heat_neg_sum, diag_heat_abs_sum], [abort_flag, pre_norm_flag], [diag_minY]]', &
+            reductionOp='[MAX, +, MAX, MIN]', &
+            copy='[diag_abort_score, diag_abort_reason, diag_abort_x, diag_abort_y, diag_abort_z, diag_abort_species, diag_abort_fluid_id, diag_abort_pre_sumY, diag_abort_post_sumY, diag_abort_pre_minY, diag_abort_post_minY, diag_abort_Y_before, diag_abort_Y_after, diag_abort_alpha_g, diag_abort_rho_stored, diag_abort_rho_intrinsic, diag_abort_pressure, diag_abort_temperature, diag_pre_norm_score, diag_pre_norm_sumY, diag_pre_norm_minY, diag_pre_norm_repaired_sumY, diag_pre_norm_x, diag_pre_norm_y, diag_pre_norm_z, diag_pre_norm_species]', &
+            copyin='[bounds, dt_sub, nsub, model3_gas]')
+        do z = bounds(3)%beg, bounds(3)%end
+            do y = bounds(2)%beg, bounds(2)%end
+                do x = bounds(1)%beg, bounds(1)%end
+                    local_abort_reason = 0
+                    local_abort_species = -1
+                    local_abort_score = -1._wp
+                    local_pre_sumY = 0._wp
+                    local_post_sumY = 0._wp
+                    local_pre_minY = huge(1._wp)
+                    local_post_minY = huge(1._wp)
+                    local_Y_before = 0._wp
+                    local_Y_after = 0._wp
+                    local_pressure = 0._wp
+                    local_fluid_id = 1
+                    T = 0._wp
+                    T_new = 0._wp
+
+                    if (model3_gas) then
+                        call s_compute_chemistry_gas_alpha_density(q_cons_vf, x, y, z, rho_g, alpha_g, rho_react)
+                        rho_species = rho_g
+                        source_vol_scale = alpha_g
+                        if (chem_gas_num_fluids <= 0) then
+                            local_fluid_id = chem_gas_fluid_id
+                        else
+                            local_fluid_id = chem_gas_fluid_ids(1)
+                        end if
+                        if (rho_g <= chem_rho_g_min .or. rho_react <= chem_rho_g_min .or. alpha_g <= sgm_eps) cycle
+                    else
+                        rho = q_cons_vf(contxb)%sf(x, y, z)
+                        rho_species = rho
+                        rho_react = rho
+                        source_vol_scale = 1._wp
+                        alpha_g = 1._wp
+                        if (rho <= chem_rho_g_min) cycle
+                    end if
+
+                    Ysum = 0._wp
+                    Ysum_raw = 0._wp
+                    minY = huge(1._wp)
+                    $:GPU_LOOP(parallelism='[seq]')
+                    do eqn = chemxb, chemxe
+                        Ys_cons(eqn - chemxb + 1) = q_cons_vf(eqn)%sf(x, y, z)/rho_species
+                        Ys(eqn - chemxb + 1) = Ys_cons(eqn - chemxb + 1)
+                        Ysum_raw = Ysum_raw + Ys_cons(eqn - chemxb + 1)
+                        if (Ys_cons(eqn - chemxb + 1) < minY) then
+                            minY = Ys_cons(eqn - chemxb + 1)
+                            local_abort_species = eqn - chemxb + 1
+                        end if
+                        diag_species_mass_before = diag_species_mass_before + q_cons_vf(eqn)%sf(x, y, z)
+                        Ys(eqn - chemxb + 1) = max(0._wp, Ys(eqn - chemxb + 1))
+                        Ysum = Ysum + Ys(eqn - chemxb + 1)
+                    end do
+                    Ysum_repaired = Ysum
+
+                    Yerr0 = max(abs(Ysum_raw - 1._wp), abs(Ysum_repaired - 1._wp))
+                    local_pre_sumY = Ysum_raw
+                    local_pre_minY = minY
+                    diag_pre_sumY_err = max(diag_pre_sumY_err, Yerr0)
+                    diag_minY = min(diag_minY, minY)
+                    if (minY < -aqss_pre_negative_abort_tol) then
+                        abort_flag = 1
+                        if (abs(minY) > local_abort_score) then
+                            local_abort_reason = 1
+                            if (local_abort_species < 1) local_abort_species = 1
+                            local_abort_score = abs(minY)
+                            local_Y_before = minY
+                            local_Y_after = minY
+                        end if
+                        if (local_abort_reason > 0 .and. local_abort_score > diag_abort_score) then
+                            diag_abort_score = local_abort_score
+                            diag_abort_reason = local_abort_reason
+                            diag_abort_x = x
+                            diag_abort_y = y
+                            diag_abort_z = z
+                            diag_abort_species = local_abort_species
+                            diag_abort_fluid_id = local_fluid_id
+                            diag_abort_pre_sumY = local_pre_sumY
+                            diag_abort_post_sumY = local_post_sumY
+                            diag_abort_pre_minY = local_pre_minY
+                            diag_abort_post_minY = local_post_minY
+                            diag_abort_Y_before = local_Y_before
+                            diag_abort_Y_after = local_Y_after
+                            diag_abort_alpha_g = alpha_g
+                            diag_abort_rho_stored = rho_species
+                            diag_abort_rho_intrinsic = rho_react
+                            diag_abort_pressure = local_pressure
+                            diag_abort_temperature = T
+                        end if
+                        cycle
+                    end if
+                    if ((.not. s_is_finite_wp(Ysum_raw)) .or. (.not. s_is_finite_wp(Ysum_repaired)) .or. &
+                        Yerr0 > aqss_pre_sumY_temp_norm_tol .or. Ysum_repaired <= y_floor) then
+                        abort_flag = 1
+                        if ((.not. s_is_finite_wp(Ysum_raw)) .or. (.not. s_is_finite_wp(Ysum_repaired))) then
+                            local_abort_reason = 2
+                            local_abort_species = 1
+                            local_abort_score = huge(1._wp)
+                            local_Y_before = Ys(1)
+                            local_Y_after = Ys(1)
+                        elseif (max(Yerr0, 0._wp) > local_abort_score) then
+                            local_abort_reason = 2
+                            local_abort_species = 1
+                            local_abort_score = max(Yerr0, 0._wp)
+                            local_Y_before = Ys(1)
+                            local_Y_after = Ys(1)
+                        end if
+                        if (local_abort_reason > 0 .and. local_abort_score > diag_abort_score) then
+                            diag_abort_score = local_abort_score
+                            diag_abort_reason = local_abort_reason
+                            diag_abort_x = x
+                            diag_abort_y = y
+                            diag_abort_z = z
+                            diag_abort_species = local_abort_species
+                            diag_abort_fluid_id = local_fluid_id
+                            diag_abort_pre_sumY = local_pre_sumY
+                            diag_abort_post_sumY = local_post_sumY
+                            diag_abort_pre_minY = local_pre_minY
+                            diag_abort_post_minY = local_post_minY
+                            diag_abort_Y_before = local_Y_before
+                            diag_abort_Y_after = local_Y_after
+                            diag_abort_alpha_g = alpha_g
+                            diag_abort_rho_stored = rho_species
+                            diag_abort_rho_intrinsic = rho_react
+                            diag_abort_pressure = local_pressure
+                            diag_abort_temperature = T
+                        end if
+                        cycle
+                    end if
+
+                    if (Yerr0 > aqss_sumY_norm_tol) then
+                        pre_norm_flag = 1
+                        if (Yerr0 > diag_pre_norm_score) then
+                            diag_pre_norm_score = Yerr0
+                            diag_pre_norm_sumY = Ysum_raw
+                            diag_pre_norm_minY = minY
+                            diag_pre_norm_repaired_sumY = 1._wp
+                            diag_pre_norm_x = x
+                            diag_pre_norm_y = y
+                            diag_pre_norm_z = z
+                            diag_pre_norm_species = local_abort_species
+                        end if
+                    end if
+                    $:GPU_LOOP(parallelism='[seq]')
+                    do eqn = 1, num_species
+                        Ys(eqn) = Ys(eqn)/Ysum_repaired
+                        Ys_initial(eqn) = Ys(eqn)
+                    end do
+
+                    if (model3_gas) then
+                        call s_compute_chemistry_reactor_temperature(q_cons_vf, q_T_sf, x, y, z, rho_react, Ys, T)
+                        call s_compute_chemistry_gas_pressure(q_cons_vf, x, y, z, local_pressure)
+                    else
+                        energy = q_cons_vf(E_idx)%sf(x, y, z)/rho_react
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = momxb, momxe
+                            energy = energy - 0.5_wp*(q_cons_vf(eqn)%sf(x, y, z)/rho_react)**2
+                        end do
+                        T = q_T_sf%sf(x, y, z)
+                        call get_temperature(energy, T, Ys, .true., T_new)
+                        T = min(max(T_new, chem_T_min), chem_T_max)
+                    end if
+
+                    do s = 1, nsub
+                        Ysum0 = 0._wp
+                        local_pre_minY = huge(1._wp)
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = 1, num_species
+                            y0(eqn) = Ys(eqn)
+                            Ysum0 = Ysum0 + y0(eqn)
+                            local_pre_minY = min(local_pre_minY, y0(eqn))
+                        end do
+                        local_pre_sumY = Ysum0
+
+                        if (abs(Ysum0 - 1._wp) <= aqss_sumY_norm_tol .and. Ysum0 > y_floor) then
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do eqn = 1, num_species
+                                Ys_rate(eqn) = y0(eqn)/Ysum0
+                            end do
+                        elseif (abs(Ysum0 - 1._wp) <= aqss_sumY_abort_tol) then
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do eqn = 1, num_species
+                                Ys_rate(eqn) = y0(eqn)
+                            end do
+                        else
+                            abort_flag = 1
+                            if (abs(Ysum0 - 1._wp) > local_abort_score) then
+                                local_abort_reason = 3
+                                local_abort_species = 1
+                                local_abort_score = abs(Ysum0 - 1._wp)
+                                local_Y_before = y0(1)
+                                local_Y_after = y0(1)
+                            end if
+                            cycle
+                        end if
+
+                        call get_creation_destruction_rates(rho_react, T, Ys_rate, cdot, ddot)
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = 1, num_species
+                            #:if USING_AMD
+                                mw = molecular_weights_nonparameter(eqn)
+                            #:else
+                                mw = molecular_weights(eqn)
+                            #:endif
+                            wr = mw/rho_react
+                            prod0(eqn) = wr*cdot(eqn)
+                            loss_i = wr*ddot(eqn)
+                            Lloss(eqn) = loss_i/max(Ys_rate(eqn), y_floor)
+                            r = dt_sub*Lloss(eqn)
+                            r2 = r*r
+                            alp(eqn) = (180._wp + 60._wp*r + 11._wp*r2 + r2*r)/ &
+                                       (360._wp + 60._wp*r + 12._wp*r2 + r2*r)
+                            Ys(eqn) = y0(eqn) + dt_sub*(prod0(eqn) - loss_i)/(1._wp + alp(eqn)*dt_sub*Lloss(eqn))
+                            if (Ys(eqn) < -aqss_negative_roundoff_tol) then
+                                abort_flag = 1
+                                if (abs(Ys(eqn)) > local_abort_score) then
+                                    local_abort_reason = 4
+                                    local_abort_species = eqn
+                                    local_abort_score = abs(Ys(eqn))
+                                    local_Y_before = y0(eqn)
+                                    local_Y_after = Ys(eqn)
+                                end if
+                            end if
+                            Ys(eqn) = max(0._wp, Ys(eqn))
+                        end do
+
+                        Ysum = 0._wp
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = 1, num_species
+                            Ysum = Ysum + Ys(eqn)
+                        end do
+                        if (abs(Ysum - 1._wp) <= aqss_sumY_norm_tol .and. Ysum > y_floor) then
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do eqn = 1, num_species
+                                Ys_rate(eqn) = Ys(eqn)/Ysum
+                            end do
+                        else
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do eqn = 1, num_species
+                                Ys_rate(eqn) = Ys(eqn)
+                            end do
+                        end if
+
+                        if (model3_gas) then
+                            call s_compute_chemistry_reactor_temperature(q_cons_vf, q_T_sf, x, y, z, rho_react, Ys_rate, T_new)
+                        else
+                            call get_temperature(energy, T, Ys_rate, .true., T_new)
+                            T_new = min(max(T_new, chem_T_min), chem_T_max)
+                        end if
+
+                        call get_creation_destruction_rates(rho_react, T_new, Ys_rate, cdot, ddot)
+                        qdot_h_sub = 0._wp
+                        if (chem_reaction_heat_enable .and. model3_gas) call get_species_enthalpies_rt(T_new, h_rt)
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = 1, num_species
+                            #:if USING_AMD
+                                mw = molecular_weights_nonparameter(eqn)
+                            #:else
+                                mw = molecular_weights(eqn)
+                            #:endif
+                            wr = mw/rho_react
+                            prod_p = wr*cdot(eqn)
+                            loss_p = wr*ddot(eqn)
+                            Lbar = 0.5_wp*(Lloss(eqn) + loss_p/max(Ys_rate(eqn), y_floor))
+                            pbar = alp(eqn)*prod_p + (1._wp - alp(eqn))*prod0(eqn)
+                            Ys(eqn) = y0(eqn) + dt_sub*(pbar - Lbar*y0(eqn))/(1._wp + alp(eqn)*dt_sub*Lbar)
+                            if (Ys(eqn) < -aqss_negative_roundoff_tol) then
+                                abort_flag = 1
+                                if (abs(Ys(eqn)) > local_abort_score) then
+                                    local_abort_reason = 5
+                                    local_abort_species = eqn
+                                    local_abort_score = abs(Ys(eqn))
+                                    local_Y_before = y0(eqn)
+                                    local_Y_after = Ys(eqn)
+                                end if
+                            end if
+                            Ys(eqn) = max(0._wp, Ys(eqn))
+                            if (chem_reaction_heat_enable .and. model3_gas) then
+                                mass_rate_k = rho_react*(Ys(eqn) - y0(eqn))/dt_sub
+                                h_k = h_rt(eqn)*gas_constant*T_new/mw
+                                qdot_h_sub = qdot_h_sub - h_k*mass_rate_k
+                            end if
+                        end do
+
+                        if (chem_reaction_heat_enable .and. model3_gas .and. s_is_finite_wp(qdot_h_sub)) then
+                            heat_sub = source_vol_scale*qdot_h_sub*dt_sub
+                            q_cons_vf(E_idx)%sf(x, y, z) = q_cons_vf(E_idx)%sf(x, y, z) + heat_sub
+                            diag_heat_pos_sum = diag_heat_pos_sum + max(heat_sub, 0._wp)
+                            diag_heat_neg_sum = diag_heat_neg_sum + min(heat_sub, 0._wp)
+                            diag_heat_abs_sum = diag_heat_abs_sum + abs(heat_sub)
+
+                            heat_weight_denom = 0._wp
+                            count_g = max(1, chem_gas_num_fluids)
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do gas_idx = 1, count_g
+                                if (chem_gas_num_fluids <= 0) then
+                                    fluid_id = chem_gas_fluid_id
+                                else
+                                    fluid_id = chem_gas_fluid_ids(gas_idx)
+                                end if
+                                heat_weight_denom = heat_weight_denom + &
+                                                    q_cons_vf(advxb + fluid_id - 1)%sf(x, y, z)* &
+                                                    s_reaction_heat_gamma(fluid_id)
+                            end do
+
+                            if (heat_weight_denom > sgm_eps) then
+                                $:GPU_LOOP(parallelism='[seq]')
+                                do gas_idx = 1, count_g
+                                    if (chem_gas_num_fluids <= 0) then
+                                        fluid_id = chem_gas_fluid_id
+                                    else
+                                        fluid_id = chem_gas_fluid_ids(gas_idx)
+                                    end if
+                                    heat_weight = q_cons_vf(advxb + fluid_id - 1)%sf(x, y, z)* &
+                                                  s_reaction_heat_gamma(fluid_id)/heat_weight_denom
+                                    q_cons_vf(intxb + fluid_id - 1)%sf(x, y, z) = &
+                                        q_cons_vf(intxb + fluid_id - 1)%sf(x, y, z) + heat_sub*heat_weight
+                                end do
+                            end if
+                        end if
+
+                        Ysum = 0._wp
+                        minY_after = huge(1._wp)
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = 1, num_species
+                            Ysum = Ysum + Ys(eqn)
+                            minY_after = min(minY_after, Ys(eqn))
+                        end do
+                        local_post_sumY = Ysum
+                        local_post_minY = minY_after
+                        if ((.not. s_is_finite_wp(Ysum)) .or. abs(Ysum - 1._wp) > aqss_sumY_abort_tol) then
+                            abort_flag = 1
+                            if (max(abs(Ysum - 1._wp), 0._wp) > local_abort_score) then
+                                local_abort_reason = 6
+                                local_abort_species = 1
+                                local_abort_score = max(abs(Ysum - 1._wp), 0._wp)
+                                local_Y_before = y0(1)
+                                local_Y_after = Ys(1)
+                            end if
+                        end if
+                        diag_post_sumY_err = max(diag_post_sumY_err, abs(Ysum - 1._wp))
+                        diag_minY = min(diag_minY, minY_after)
+
+                        if (abs(Ysum - 1._wp) <= aqss_sumY_norm_tol .and. Ysum > y_floor) then
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do eqn = 1, num_species
+                                Ys_rate(eqn) = Ys(eqn)/Ysum
+                            end do
+                        else
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do eqn = 1, num_species
+                                Ys_rate(eqn) = Ys(eqn)
+                            end do
+                        end if
+
+                        if (model3_gas) then
+                            call s_compute_chemistry_reactor_temperature(q_cons_vf, q_T_sf, x, y, z, rho_react, Ys_rate, T)
+                        else
+                            call get_temperature(energy, T, Ys_rate, .true., T_new)
+                            T = min(max(T_new, chem_T_min), chem_T_max)
+                        end if
+                    end do
+
+                    Ysum_write = 0._wp
+                    local_post_minY = huge(1._wp)
+                    $:GPU_LOOP(parallelism='[seq]')
+                    do eqn = 1, num_species
+                        Ywrite = Ys_cons(eqn) + Ys(eqn) - Ys_initial(eqn)
+                        Ysum_write = Ysum_write + Ywrite
+                        if (Ywrite < local_post_minY) local_post_minY = Ywrite
+                        if (Ys_cons(eqn) >= -aqss_negative_roundoff_tol) then
+                            if (Ywrite < -aqss_negative_roundoff_tol .and. abs(Ywrite) > local_abort_score) then
+                                local_abort_reason = 7
+                                local_abort_species = eqn
+                                local_abort_score = abs(Ywrite)
+                                local_Y_before = Ys_cons(eqn)
+                                local_Y_after = Ywrite
+                            end if
+                        elseif (Ywrite < Ys_cons(eqn) - aqss_negative_roundoff_tol .and. &
+                                abs(Ywrite - Ys_cons(eqn)) > local_abort_score) then
+                            local_abort_reason = 8
+                            local_abort_species = eqn
+                            local_abort_score = abs(Ywrite - Ys_cons(eqn))
+                            local_Y_before = Ys_cons(eqn)
+                            local_Y_after = Ywrite
+                        end if
+                    end do
+                    closure_delta = abs(Ysum_write - Ysum_raw)
+                    if (closure_delta > aqss_sumY_abort_tol .and. closure_delta > local_abort_score) then
+                        local_abort_reason = 9
+                        local_abort_species = 1
+                        local_abort_score = closure_delta
+                        local_Y_before = Ys_cons(1)
+                        local_Y_after = Ys_cons(1) + Ys(1) - Ys_initial(1)
+                    end if
+                    if (local_abort_reason == 0 .or. local_abort_reason >= 7) then
+                        local_pre_sumY = Ysum_raw
+                        local_post_sumY = Ysum_write
+                        local_pre_minY = minY
+                    end if
+
+                    if (local_abort_reason > 0 .and. local_abort_score > diag_abort_score) then
+                        diag_abort_score = local_abort_score
+                        diag_abort_reason = local_abort_reason
+                        diag_abort_x = x
+                        diag_abort_y = y
+                        diag_abort_z = z
+                        diag_abort_species = local_abort_species
+                        diag_abort_fluid_id = local_fluid_id
+                        diag_abort_pre_sumY = local_pre_sumY
+                        diag_abort_post_sumY = local_post_sumY
+                        diag_abort_pre_minY = local_pre_minY
+                        diag_abort_post_minY = local_post_minY
+                        diag_abort_Y_before = local_Y_before
+                        diag_abort_Y_after = local_Y_after
+                        diag_abort_alpha_g = alpha_g
+                        diag_abort_rho_stored = rho_species
+                        diag_abort_rho_intrinsic = rho_react
+                        diag_abort_pressure = local_pressure
+                        diag_abort_temperature = T
+                    end if
+
+                    $:GPU_LOOP(parallelism='[seq]')
+                    do eqn = chemxb, chemxe
+                        q_cons_vf(eqn)%sf(x, y, z) = rho_species*(Ys_cons(eqn - chemxb + 1) + &
+                                                                  Ys(eqn - chemxb + 1) - &
+                                                                  Ys_initial(eqn - chemxb + 1))
+                        diag_species_mass_after = diag_species_mass_after + q_cons_vf(eqn)%sf(x, y, z)
+                    end do
+                    q_T_sf%sf(x, y, z) = T
+                end do
+            end do
+        end do
+        $:END_GPU_PARALLEL_LOOP()
+
+        if (chem_reaction_heat_diag .and. s_reaction_heat_diag_active(t_step)) then
+            print '(" AQSS_DIAG rank=", I6, " t_step=", I8, " nsub=", I8, &
+                    &" max_pre_sumY_err=", ES16.6, " max_post_sumY_err=", ES16.6, &
+                    &" minY=", ES16.6, " species_mass_before=", ES16.6, &
+                    &" species_mass_after=", ES16.6, " heat_pos_sum=", ES16.6, &
+                    &" heat_neg_sum=", ES16.6, " heat_abs_sum=", ES16.6)', &
+                proc_rank, t_step, nsub, diag_pre_sumY_err, diag_post_sumY_err, &
+                diag_minY, diag_species_mass_before, diag_species_mass_after, &
+                diag_heat_pos_sum, diag_heat_neg_sum, diag_heat_abs_sum
+            call flush (output_unit)
+        end if
+
+        if (pre_norm_flag > 0) then
+            print '(" AQSS_PRE_REPAIR rank=", I6, " t_step=", I8, " i=", I8, &
+                    &" j=", I8, " k=", I8, " min_species=", I4, &
+                    &" minY_before=", ES16.6, " sumY_before=", ES16.6, &
+                    &" repaired_sumY=", ES16.6)', &
+                proc_rank, t_step, diag_pre_norm_x, diag_pre_norm_y, diag_pre_norm_z, &
+                diag_pre_norm_species, diag_pre_norm_minY, diag_pre_norm_sumY, diag_pre_norm_repaired_sumY
+            call flush (output_unit)
+        end if
+
+        if (abort_flag > 0) then
+            select case (diag_abort_reason)
+                case (1)
+                    diag_abort_reason_label = "pre_negative"
+                case (2)
+                    diag_abort_reason_label = "pre_closure"
+                case (3)
+                    diag_abort_reason_label = "substep_input_closure"
+                case (4)
+                    diag_abort_reason_label = "predictor_negative"
+                case (5)
+                    diag_abort_reason_label = "corrector_negative"
+                case (6)
+                    diag_abort_reason_label = "post_closure"
+                case (7)
+                    diag_abort_reason_label = "post_new_negative"
+                case (8)
+                    diag_abort_reason_label = "post_worse_negative"
+                case (9)
+                    diag_abort_reason_label = "post_closure_delta"
+                case default
+                    diag_abort_reason_label = "unknown"
+            end select
+            if (diag_abort_reason == 1 .or. diag_abort_reason == 2) then
+                print '(" AQSS_PRE_ABORT rank=", I6, " t_step=", I8, &
+                        &" reason=", I2, 1X, A, " i=", I8, " j=", I8, " k=", I8, &
+                        &" species=", I4, " Y_before=", ES16.6, &
+                        &" sumY_before=", ES16.6, " minY_before=", ES16.6, &
+                        &" pre_sumY_tol=", ES16.6, " pre_minY_tol=", ES16.6)', &
+                    proc_rank, t_step, diag_abort_reason, trim(diag_abort_reason_label), &
+                    diag_abort_x, diag_abort_y, diag_abort_z, diag_abort_species, &
+                    diag_abort_Y_before, diag_abort_pre_sumY, diag_abort_pre_minY, &
+                    aqss_pre_sumY_temp_norm_tol, -aqss_pre_negative_abort_tol
+                call flush (output_unit)
+            end if
+            if (diag_abort_reason >= 3) then
+                print '(" AQSS_POST_ABORT rank=", I6, " t_step=", I8, &
+                        &" reason=", I2, 1X, A, " i=", I8, " j=", I8, " k=", I8, &
+                        &" species=", I4, " Y_before=", ES16.6, " Y_after=", ES16.6, &
+                        &" sumY_before=", ES16.6, " sumY_after=", ES16.6, &
+                        &" closure_delta=", ES16.6)', &
+                    proc_rank, t_step, diag_abort_reason, trim(diag_abort_reason_label), &
+                    diag_abort_x, diag_abort_y, diag_abort_z, diag_abort_species, &
+                    diag_abort_Y_before, diag_abort_Y_after, diag_abort_pre_sumY, &
+                    diag_abort_post_sumY, abs(diag_abort_post_sumY - diag_abort_pre_sumY)
+                call flush (output_unit)
+            end if
+            print '(" AQSS_ABORT_DETAIL rank=", I6, " t_step=", I8, " nsub=", I8, &
+                    &" reason=", I2, 1X, A, " i=", I8, " j=", I8, " k=", I8, &
+                    &" fluid_id=", I4, " species=", I4, " species_name=unavailable")', &
+                proc_rank, t_step, nsub, diag_abort_reason, trim(diag_abort_reason_label), &
+                diag_abort_x, diag_abort_y, diag_abort_z, diag_abort_fluid_id, diag_abort_species
+            print '(" AQSS_ABORT_SPECIES Y_before=", ES16.6, " Y_after=", ES16.6, &
+                    &" sumY_before=", ES16.6, " sumY_after=", ES16.6, &
+                    &" minY_before=", ES16.6, " minY_after=", ES16.6, &
+                    &" max_abs_sumY_err=", ES16.6, " worst_score=", ES16.6)', &
+                diag_abort_Y_before, diag_abort_Y_after, diag_abort_pre_sumY, diag_abort_post_sumY, &
+                diag_abort_pre_minY, diag_abort_post_minY, &
+                max(diag_pre_sumY_err, diag_post_sumY_err), diag_abort_score
+            print '(" AQSS_ABORT_THERMO alpha_g=", ES16.6, " rho_g_stored=", ES16.6, &
+                    &" rho_g_intrinsic=", ES16.6, " pressure=", ES16.6, &
+                    &" temperature=", ES16.6, " heat_pos_sum=", ES16.6, &
+                    &" heat_neg_sum=", ES16.6, " heat_abs_sum=", ES16.6)', &
+                diag_abort_alpha_g, diag_abort_rho_stored, diag_abort_rho_intrinsic, &
+                diag_abort_pressure, diag_abort_temperature, &
+                diag_heat_pos_sum, diag_heat_neg_sum, diag_heat_abs_sum
+            call flush (output_unit)
+            if (diag_abort_reason == 1 .or. diag_abort_reason == 2) then
+                call s_mpi_abort("AQSS pre-chemistry species state exceeded temporary normalization guardrail.")
+            else
+                call s_mpi_abort("AQSS found post-chemistry species closure or non-roundoff negative species.")
+            end if
+        end if
+
+    end subroutine s_chemistry_reaction_substep
 
     !> @brief Computes species mass diffusion fluxes at cell interfaces using mixture-averaged diffusivities.
     subroutine s_compute_chemistry_diffusion_flux(idir, q_prim_qp, flux_src_vf, irx, iry, irz, t_step, stage)

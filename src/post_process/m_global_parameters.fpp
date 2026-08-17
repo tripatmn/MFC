@@ -445,6 +445,7 @@ contains
 
         chem_params%gamma_method = 1
         chem_params%transport_model = 1
+        chem_params%reaction_substeps = 0
 
         ! Fluids physical parameters
         do i = 1, num_fluids_max

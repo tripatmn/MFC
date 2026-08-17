@@ -684,6 +684,7 @@ contains
         chem_params%reactions = .false.
         chem_params%gamma_method = 1
         chem_params%transport_model = 1
+        chem_params%reaction_substeps = 0
         chem_gas_fluid_id = 1
         chem_gas_num_fluids = 0
         chem_gas_fluid_ids(:) = 0

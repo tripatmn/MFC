@@ -24,7 +24,7 @@ module m_variables_conversion
         num_species, get_temperature, get_pressure, gas_constant, &
         get_mixture_molecular_weight, get_mixture_energy_mass
 
-    use m_chemistry, only: s_compute_chemistry_gas_density
+    use m_chemistry, only: s_compute_chemistry_gas_density, s_compute_chemistry_gas_alpha_density
 
     implicit none
 
@@ -677,7 +677,7 @@ contains
             real(wp) :: Ys_T(1:num_species)
         #:endif
         real(wp), dimension(2) :: Re_K
-        real(wp) :: rho_K, gamma_K, pi_inf_K, qv_K, dyn_pres_K, rho_g
+        real(wp) :: rho_K, gamma_K, pi_inf_K, qv_K, dyn_pres_K, rho_g, alpha_g, rho_g_intrinsic
         real(wp) :: Y_sum, mix_mol_weight, T_chem
 
         real(wp) :: vftmp, nbub_sc
@@ -713,7 +713,7 @@ contains
             end if
         end if
 
-        $:GPU_PARALLEL_LOOP(collapse=3, private='[alpha_K, alpha_rho_K, Re_K, nRtmp, rho_K, gamma_K, pi_inf_K,qv_K, dyn_pres_K, rho_g, Y_sum, rhoYks, Ys_T, gas_idx, fluid_id, B, pres, vftmp, nbub_sc, G_K, T, mix_mol_weight, T_chem, pres_mag, Ga, B2, m2, S, W, dW, E, D, f, dGa_dW, dp_dW, df_dW, iter ]')
+        $:GPU_PARALLEL_LOOP(collapse=3, private='[alpha_K, alpha_rho_K, Re_K, nRtmp, rho_K, gamma_K, pi_inf_K,qv_K, dyn_pres_K, rho_g, alpha_g, rho_g_intrinsic, Y_sum, rhoYks, Ys_T, gas_idx, fluid_id, B, pres, vftmp, nbub_sc, G_K, T, mix_mol_weight, T_chem, pres_mag, Ga, B2, m2, S, W, dW, E, D, f, dGa_dW, dp_dW, df_dW, iter ]')
         do l = ibounds(3)%beg, ibounds(3)%end
             do k = ibounds(2)%beg, ibounds(2)%end
                 do j = ibounds(1)%beg, ibounds(1)%end
@@ -834,8 +834,14 @@ contains
                             qK_prim_vf(i)%sf(j, k, l) = max(0._wp, qK_cons_vf(i)%sf(j, k, l)/rho_K)
                         end do
                     elseif (chemistry) then
-                        call s_compute_chemistry_gas_density(qK_cons_vf, j, k, l, rho_g)
+                        if (num_fluids > 1 .and. model_eqns == 3) then
+                            call s_compute_chemistry_gas_alpha_density(qK_cons_vf, j, k, l, rho_g, alpha_g, rho_g_intrinsic)
+                        else
+                            call s_compute_chemistry_gas_density(qK_cons_vf, j, k, l, rho_g)
+                            rho_g_intrinsic = rho_g
+                        end if
                         rho_g = max(rho_g, sgm_eps)
+                        rho_g_intrinsic = max(rho_g_intrinsic, sgm_eps)
 
                         $:GPU_LOOP(parallelism='[seq]')
                         do i = 1, contxe
@@ -924,7 +930,7 @@ contains
                                 end do
 
                                 call get_mixture_molecular_weight(Ys_T, mix_mol_weight)
-                                T_chem = pres*mix_mol_weight/(gas_constant*rho_g)
+                                T_chem = pres*mix_mol_weight/(gas_constant*rho_g_intrinsic)
                                 if ((mix_mol_weight == mix_mol_weight) .and. &
                                     (abs(mix_mol_weight) <= huge(mix_mol_weight)) .and. &
                                     (mix_mol_weight > 0._wp) .and. &

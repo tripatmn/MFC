@@ -132,7 +132,7 @@ contains
                 call MPI_BCAST(chem_params%${VAR}$, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
             #:endfor
 
-            #:for VAR in [ 'gamma_method', 'transport_model' ]
+            #:for VAR in [ 'gamma_method', 'transport_model', 'reaction_substeps' ]
                 call MPI_BCAST(chem_params%${VAR}$, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
             #:endfor
         end if

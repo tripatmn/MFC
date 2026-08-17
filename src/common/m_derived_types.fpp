@@ -469,6 +469,7 @@ module m_derived_types
         !> gamma_method = 2: c_p / c_v where c_p, c_v are specific heats.
         integer :: gamma_method
         integer :: transport_model
+        integer :: reaction_substeps
     end type chemistry_parameters
 
     !> Lagrangian bubble parameters
@@ -508,4 +509,3 @@ module m_derived_types
     end type
 
 end module m_derived_types
-

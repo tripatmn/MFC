@@ -875,6 +875,12 @@ contains
             call s_apply_evap_to_fuel_species(q_cons_ts(1)%vf, dt, t_step, 0)
         end if
 
+        if (chemistry .and. chem_params%reactions .and. chem_params%reaction_substeps > 0) then
+            call s_chemistry_reaction_substep(q_cons_ts(1)%vf, q_T_sf, dt, idwint, t_step)
+            call s_convert_conservative_to_primitive_variables(q_cons_ts(1)%vf, q_T_sf, q_prim_vf, idwint, &
+                                                               t_step, 0, "AQSS")
+        end if
+
         ! Time-stepping loop controls
         t_step = t_step + 1
 
