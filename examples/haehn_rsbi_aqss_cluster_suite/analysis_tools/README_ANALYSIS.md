@@ -2,6 +2,11 @@
 
 These tools analyze completed cluster run folders. They do not run MFC, do not submit jobs, and do not require Cantera.
 
+Use the right analyzer for the data source:
+
+- `analyze_haehn_rsbi_log.py`: stdout/stderr AQSS diagnostics.
+- `analyze_haehn_raw_d.py`: physical fields from ASCII `D/*.dat` output tables.
+
 ## Log Analysis
 
 Parse stdout/stderr logs and AQSS diagnostic lines:
@@ -50,3 +55,16 @@ python3 examples/haehn_rsbi_aqss_cluster_suite/analysis_tools/inspect_haehn_outp
 ```
 
 Read `analysis_out/summary.md` first. A run with only `AQSS_PRE_REPAIR` and zero heat activity is still an interface-stability diagnostic. A run with `AQSS_POST_ABORT` is an AQSS-created invalidity and should be treated separately.
+
+## Raw D Field Analysis
+
+For physical fields, temperature reconstruction, and PNG plots from raw `D/*.dat` tables, use:
+
+```bash
+python3 examples/haehn_rsbi_aqss_cluster_suite/analysis_tools/analyze_haehn_raw_d.py \
+  --run-dir /path/to/run/folder \
+  --output-dir /path/to/run/folder/raw_d_analysis \
+  --steps all
+```
+
+See `README_RAW_D_ANALYSIS.md` for the full cpd120 t650 command and cropped bubble-region example.
