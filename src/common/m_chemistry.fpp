@@ -50,6 +50,7 @@ module m_chemistry
     real(wp), parameter :: aqss_pre_negative_abort_tol = 1.0e-3_wp
     real(wp), parameter :: aqss_post_sumY_repair_tol = 1.0e-3_wp
     real(wp), parameter :: aqss_post_negative_repair_tol = 1.0e-12_wp
+    real(wp), parameter :: aqss_adap_stiff_target = 5.0e-1_wp
 
 contains
 
@@ -1033,11 +1034,13 @@ contains
         type(int_bounds_info), dimension(1:3), intent(in) :: bounds
         integer, intent(in) :: t_step
 
-        integer :: x, y, z, eqn, s, nsub
+        integer :: x, y, z, eqn, s, base_nsub, cap_nsub, nsub
         integer :: abort_flag, pre_norm_flag, post_repair_flag, gas_idx, fluid_id, count_g
         integer :: local_abort_reason, local_abort_species, local_fluid_id
         integer :: diag_abort_reason, diag_abort_x, diag_abort_y, diag_abort_z
         integer :: diag_abort_species, diag_abort_fluid_id
+        integer :: diag_adap_min_nsub, diag_adap_max_nsub
+        integer :: diag_adap_count_base, diag_adap_count_max, diag_adap_cell_count
         real(wp) :: rho_g, alpha_g, rho_react, rho_species
         real(wp) :: rho, energy, T, T_new, dt_sub, Ysum, Ysum0, Yerr0
         real(wp) :: Ysum_raw, Ysum_repaired, Ysum_write, Ywrite, closure_delta
@@ -1046,6 +1049,7 @@ contains
         real(wp) :: minY, minY_after, diag_pre_sumY_err, diag_post_sumY_err
         real(wp) :: diag_minY, diag_species_mass_before, diag_species_mass_after
         real(wp) :: diag_heat_pos_sum, diag_heat_neg_sum, diag_heat_abs_sum
+        real(wp) :: diag_adap_avg_nsub, stiff_max, cell_stiff
         real(wp) :: local_abort_score, local_pre_sumY, local_post_sumY
         real(wp) :: local_pre_minY, local_post_minY
         real(wp) :: local_Y_before, local_Y_after, local_pressure
@@ -1064,7 +1068,7 @@ contains
         integer :: diag_pre_norm_x, diag_pre_norm_y, diag_pre_norm_z, diag_pre_norm_species
         integer :: diag_post_repair_x, diag_post_repair_y, diag_post_repair_z
         real(wp), parameter :: y_floor = 1.e-16_wp
-        logical :: model3_gas, local_species_finite
+        logical :: model3_gas, adap_active, local_species_finite
         character(len=32) :: diag_abort_reason_label
 
         #:if not MFC_CASE_OPTIMIZATION and USING_AMD
@@ -1076,9 +1080,11 @@ contains
         if (chem_params%reaction_substeps <= 0) return
 
         model3_gas = num_fluids > 1 .and. model_eqns == 3
-        nsub = chem_params%reaction_substeps
-        if (nsub < 1) return
-        dt_sub = dtime/real(nsub, wp)
+        base_nsub = chem_params%reaction_substeps
+        if (base_nsub < 1) return
+        cap_nsub = max(base_nsub, chem_params%reaction_substeps_max)
+        adap_active = chem_params%adap_substeps .and. cap_nsub > base_nsub
+        nsub = base_nsub
 
         diag_pre_sumY_err = 0._wp
         diag_post_sumY_err = 0._wp
@@ -1088,6 +1094,12 @@ contains
         diag_heat_pos_sum = 0._wp
         diag_heat_neg_sum = 0._wp
         diag_heat_abs_sum = 0._wp
+        diag_adap_min_nsub = huge(1)
+        diag_adap_max_nsub = 0
+        diag_adap_count_base = 0
+        diag_adap_count_max = 0
+        diag_adap_cell_count = 0
+        diag_adap_avg_nsub = 0._wp
         abort_flag = 0
         pre_norm_flag = 0
         diag_abort_score = -1._wp
@@ -1126,10 +1138,90 @@ contains
         diag_post_repair_y = -1
         diag_post_repair_z = -1
 
+        if (adap_active) then
+            stiff_max = 0._wp
+            $:GPU_PARALLEL_LOOP(collapse=3, &
+                private='[Ys, cdot, eqn, rho_g, alpha_g, rho_react, rho_species, rho, energy, T, T_new, Ysum, Ysum_raw, Ysum_repaired, Yerr0, minY, wr, mw, cell_stiff]', &
+                reduction='[[stiff_max]]', reductionOp='[MAX]', copyin='[bounds, dtime, model3_gas]')
+            do z = bounds(3)%beg, bounds(3)%end
+                do y = bounds(2)%beg, bounds(2)%end
+                    do x = bounds(1)%beg, bounds(1)%end
+                        if (model3_gas) then
+                            call s_compute_chemistry_gas_alpha_density(q_cons_vf, x, y, z, rho_g, alpha_g, rho_react)
+                            rho_species = rho_g
+                            if (rho_g <= chem_rho_g_min .or. rho_react <= chem_rho_g_min .or. alpha_g <= sgm_eps) cycle
+                        else
+                            rho = q_cons_vf(contxb)%sf(x, y, z)
+                            rho_species = rho
+                            rho_react = rho
+                            if (rho <= chem_rho_g_min) cycle
+                        end if
+
+                        Ysum = 0._wp
+                        Ysum_raw = 0._wp
+                        minY = huge(1._wp)
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = chemxb, chemxe
+                            Ys(eqn - chemxb + 1) = q_cons_vf(eqn)%sf(x, y, z)/rho_species
+                            Ysum_raw = Ysum_raw + Ys(eqn - chemxb + 1)
+                            minY = min(minY, Ys(eqn - chemxb + 1))
+                            Ys(eqn - chemxb + 1) = max(0._wp, Ys(eqn - chemxb + 1))
+                            Ysum = Ysum + Ys(eqn - chemxb + 1)
+                        end do
+                        Ysum_repaired = Ysum
+                        Yerr0 = max(abs(Ysum_raw - 1._wp), abs(Ysum_repaired - 1._wp))
+
+                        if (minY < -aqss_pre_negative_abort_tol) cycle
+                        if ((.not. s_is_finite_wp(Ysum_raw)) .or. (.not. s_is_finite_wp(Ysum_repaired)) .or. &
+                            Yerr0 > aqss_pre_sumY_temp_norm_tol .or. Ysum_repaired <= y_floor) cycle
+
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = 1, num_species
+                            Ys(eqn) = Ys(eqn)/Ysum_repaired
+                        end do
+
+                        if (model3_gas) then
+                            call s_compute_chemistry_reactor_temperature(q_cons_vf, q_T_sf, x, y, z, rho_react, Ys, T)
+                        else
+                            energy = q_cons_vf(E_idx)%sf(x, y, z)/rho_react
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do eqn = momxb, momxe
+                                energy = energy - 0.5_wp*(q_cons_vf(eqn)%sf(x, y, z)/rho_react)**2
+                            end do
+                            T = q_T_sf%sf(x, y, z)
+                            call get_temperature(energy, T, Ys, .true., T_new)
+                            T = min(max(T_new, chem_T_min), chem_T_max)
+                        end if
+
+                        call get_net_production_rates(rho_react, T, Ys, cdot)
+                        cell_stiff = 0._wp
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = 1, num_species
+                            #:if USING_AMD
+                                mw = molecular_weights_nonparameter(eqn)
+                            #:else
+                                mw = molecular_weights(eqn)
+                            #:endif
+                            wr = mw/rho_react
+                            cell_stiff = max(cell_stiff, dtime*abs(wr*cdot(eqn))/max(Ys(eqn), y_floor))
+                        end do
+                        stiff_max = max(stiff_max, cell_stiff)
+                    end do
+                end do
+            end do
+            $:END_GPU_PARALLEL_LOOP()
+
+            nsub = ceiling(max(real(base_nsub, wp), min(real(cap_nsub, wp), &
+                           stiff_max/aqss_adap_stiff_target)))
+            nsub = min(cap_nsub, max(base_nsub, nsub))
+        end if
+
+        dt_sub = dtime/real(nsub, wp)
+
         $:GPU_PARALLEL_LOOP(collapse=3, &
             private='[Ys, Ys_rate, Ys_cons, Ys_initial, cdot, ddot, y0, prod0, Lloss, alp, h_rt, eqn, s, gas_idx, fluid_id, count_g, local_abort_reason, local_abort_species, local_fluid_id, rho_g, alpha_g, rho_react, rho_species, rho, energy, T, T_new, Ysum, Ysum0, Yerr0, Ysum_raw, Ysum_repaired, Ysum_write, Ywrite, closure_delta, r, r2, wr, mw, loss_i, prod_p, loss_p, Lbar, pbar, source_vol_scale, minY, minY_after, local_abort_score, local_pre_sumY, local_post_sumY, local_pre_minY, local_post_minY, local_Y_before, local_Y_after, local_pressure, local_species_finite, local_post_repair_score, local_post_repair_sumY_before, local_post_repair_minY_before, h_k, qdot_h_sub, mass_rate_k, heat_sub, heat_weight, heat_weight_denom]', &
-            reduction='[[diag_pre_sumY_err, diag_post_sumY_err], [diag_species_mass_before, diag_species_mass_after, diag_heat_pos_sum, diag_heat_neg_sum, diag_heat_abs_sum], [abort_flag, pre_norm_flag, post_repair_flag], [diag_minY]]', &
-            reductionOp='[MAX, +, MAX, MIN]', &
+            reduction='[[diag_pre_sumY_err, diag_post_sumY_err], [diag_species_mass_before, diag_species_mass_after, diag_heat_pos_sum, diag_heat_neg_sum, diag_heat_abs_sum], [abort_flag, pre_norm_flag, post_repair_flag], [diag_minY], [diag_adap_cell_count]]', &
+            reductionOp='[MAX, +, MAX, MIN, +]', &
             copy='[diag_abort_score, diag_abort_reason, diag_abort_x, diag_abort_y, diag_abort_z, diag_abort_species, diag_abort_fluid_id, diag_abort_pre_sumY, diag_abort_post_sumY, diag_abort_pre_minY, diag_abort_post_minY, diag_abort_Y_before, diag_abort_Y_after, diag_abort_alpha_g, diag_abort_rho_stored, diag_abort_rho_intrinsic, diag_abort_pressure, diag_abort_temperature, diag_pre_norm_score, diag_pre_norm_sumY, diag_pre_norm_minY, diag_pre_norm_repaired_sumY, diag_pre_norm_x, diag_pre_norm_y, diag_pre_norm_z, diag_pre_norm_species, diag_post_repair_score, diag_post_repair_sumY_before, diag_post_repair_sumY_after, diag_post_repair_minY_before, diag_post_repair_minY_after, diag_post_repair_x, diag_post_repair_y, diag_post_repair_z]', &
             copyin='[bounds, dt_sub, nsub, model3_gas]')
         do z = bounds(3)%beg, bounds(3)%end
@@ -1296,6 +1388,8 @@ contains
                         call get_temperature(energy, T, Ys, .true., T_new)
                         T = min(max(T_new, chem_T_min), chem_T_max)
                     end if
+
+                    diag_adap_cell_count = diag_adap_cell_count + 1
 
                     do s = 1, nsub
                         Ysum0 = 0._wp
@@ -1621,6 +1715,25 @@ contains
                 proc_rank, t_step, nsub, diag_pre_sumY_err, diag_post_sumY_err, &
                 diag_minY, diag_species_mass_before, diag_species_mass_after, &
                 diag_heat_pos_sum, diag_heat_neg_sum, diag_heat_abs_sum
+            call flush (output_unit)
+            if (diag_adap_cell_count > 0) then
+                diag_adap_min_nsub = nsub
+                diag_adap_max_nsub = nsub
+                diag_adap_avg_nsub = real(nsub, wp)
+                if (nsub == base_nsub) diag_adap_count_base = diag_adap_cell_count
+                if (nsub == cap_nsub) diag_adap_count_max = diag_adap_cell_count
+            else
+                diag_adap_min_nsub = 0
+                diag_adap_max_nsub = 0
+                diag_adap_avg_nsub = 0._wp
+            end if
+            print '(" AQSS_ADAPT_DIAG rank=", I6, " t_step=", I8, " adaptive=", L1, &
+                    &" base_nsub=", I8, " cap_nsub=", I8, " selected_min=", I8, &
+                    &" selected_max=", I8, " selected_avg=", ES16.6, &
+                    &" count_base=", I8, " count_max=", I8, " active_cells=", I8)', &
+                proc_rank, t_step, adap_active, base_nsub, cap_nsub, diag_adap_min_nsub, &
+                diag_adap_max_nsub, diag_adap_avg_nsub, diag_adap_count_base, &
+                diag_adap_count_max, diag_adap_cell_count
             call flush (output_unit)
         end if
 

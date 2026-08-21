@@ -128,11 +128,11 @@ contains
         call MPI_BCAST(chem_reaction_heat_limit_frac, 1, mpi_p, 0, MPI_COMM_WORLD, ierr)
 
         if (chemistry) then
-            #:for VAR in [ 'diffusion', 'reactions' ]
+            #:for VAR in [ 'diffusion', 'reactions', 'adap_substeps' ]
                 call MPI_BCAST(chem_params%${VAR}$, 1, MPI_LOGICAL, 0, MPI_COMM_WORLD, ierr)
             #:endfor
 
-            #:for VAR in [ 'gamma_method', 'transport_model', 'reaction_substeps' ]
+            #:for VAR in [ 'gamma_method', 'transport_model', 'reaction_substeps', 'reaction_substeps_max' ]
                 call MPI_BCAST(chem_params%${VAR}$, 1, MPI_INTEGER, 0, MPI_COMM_WORLD, ierr)
             #:endfor
         end if

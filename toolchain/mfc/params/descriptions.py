@@ -513,6 +513,9 @@ PATTERNS = [
     (r"chem_params%reactions", "Enable chemical reactions"),
     (r"chem_params%gamma_method", "Gamma calculation method (1=formulation, 2=cp/cv ratio)"),
     (r"chem_params%transport_model", "Transport model selection for chemistry"),
+    (r"chem_params%reaction_substeps", "Base fixed AQSS reaction substep count"),
+    (r"chem_params%adap_substeps", "Enable adaptive AQSS reaction substep selection"),
+    (r"chem_params%reaction_substeps_max", "Maximum adaptive AQSS reaction substep count"),
     (r"chem_params%(\w+)", "Chemistry parameter: {0}"),
 
     # fluid_rho patterns

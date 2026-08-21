@@ -470,6 +470,8 @@ module m_derived_types
         integer :: gamma_method
         integer :: transport_model
         integer :: reaction_substeps
+        logical :: adap_substeps
+        integer :: reaction_substeps_max
     end type chemistry_parameters
 
     !> Lagrangian bubble parameters
