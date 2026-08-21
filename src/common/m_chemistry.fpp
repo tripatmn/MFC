@@ -48,6 +48,8 @@ module m_chemistry
     real(wp), parameter :: aqss_negative_roundoff_tol = 1.0e-14_wp
     real(wp), parameter :: aqss_pre_sumY_temp_norm_tol = 1.0e-3_wp
     real(wp), parameter :: aqss_pre_negative_abort_tol = 1.0e-3_wp
+    real(wp), parameter :: aqss_post_sumY_repair_tol = 1.0e-3_wp
+    real(wp), parameter :: aqss_post_negative_repair_tol = 1.0e-12_wp
 
 contains
 
@@ -1032,7 +1034,7 @@ contains
         integer, intent(in) :: t_step
 
         integer :: x, y, z, eqn, s, nsub
-        integer :: abort_flag, pre_norm_flag, gas_idx, fluid_id, count_g
+        integer :: abort_flag, pre_norm_flag, post_repair_flag, gas_idx, fluid_id, count_g
         integer :: local_abort_reason, local_abort_species, local_fluid_id
         integer :: diag_abort_reason, diag_abort_x, diag_abort_y, diag_abort_z
         integer :: diag_abort_species, diag_abort_fluid_id
@@ -1054,11 +1056,15 @@ contains
         real(wp) :: diag_abort_pressure, diag_abort_temperature
         real(wp) :: diag_pre_norm_score, diag_pre_norm_sumY, diag_pre_norm_minY
         real(wp) :: diag_pre_norm_repaired_sumY
+        real(wp) :: diag_post_repair_score, diag_post_repair_sumY_before, diag_post_repair_sumY_after
+        real(wp) :: diag_post_repair_minY_before, diag_post_repair_minY_after
+        real(wp) :: local_post_repair_score, local_post_repair_sumY_before, local_post_repair_minY_before
         real(wp) :: h_k, qdot_h_sub, mass_rate_k, heat_sub
         real(wp) :: heat_weight, heat_weight_denom
         integer :: diag_pre_norm_x, diag_pre_norm_y, diag_pre_norm_z, diag_pre_norm_species
+        integer :: diag_post_repair_x, diag_post_repair_y, diag_post_repair_z
         real(wp), parameter :: y_floor = 1.e-16_wp
-        logical :: model3_gas
+        logical :: model3_gas, local_species_finite
         character(len=32) :: diag_abort_reason_label
 
         #:if not MFC_CASE_OPTIMIZATION and USING_AMD
@@ -1110,12 +1116,21 @@ contains
         diag_pre_norm_y = -1
         diag_pre_norm_z = -1
         diag_pre_norm_species = -1
+        post_repair_flag = 0
+        diag_post_repair_score = -1._wp
+        diag_post_repair_sumY_before = 0._wp
+        diag_post_repair_sumY_after = 0._wp
+        diag_post_repair_minY_before = 0._wp
+        diag_post_repair_minY_after = 0._wp
+        diag_post_repair_x = -1
+        diag_post_repair_y = -1
+        diag_post_repair_z = -1
 
         $:GPU_PARALLEL_LOOP(collapse=3, &
-            private='[Ys, Ys_rate, Ys_cons, Ys_initial, cdot, ddot, y0, prod0, Lloss, alp, h_rt, eqn, s, gas_idx, fluid_id, count_g, local_abort_reason, local_abort_species, local_fluid_id, rho_g, alpha_g, rho_react, rho_species, rho, energy, T, T_new, Ysum, Ysum0, Yerr0, Ysum_raw, Ysum_repaired, Ysum_write, Ywrite, closure_delta, r, r2, wr, mw, loss_i, prod_p, loss_p, Lbar, pbar, source_vol_scale, minY, minY_after, local_abort_score, local_pre_sumY, local_post_sumY, local_pre_minY, local_post_minY, local_Y_before, local_Y_after, local_pressure, h_k, qdot_h_sub, mass_rate_k, heat_sub, heat_weight, heat_weight_denom]', &
-            reduction='[[diag_pre_sumY_err, diag_post_sumY_err], [diag_species_mass_before, diag_species_mass_after, diag_heat_pos_sum, diag_heat_neg_sum, diag_heat_abs_sum], [abort_flag, pre_norm_flag], [diag_minY]]', &
+            private='[Ys, Ys_rate, Ys_cons, Ys_initial, cdot, ddot, y0, prod0, Lloss, alp, h_rt, eqn, s, gas_idx, fluid_id, count_g, local_abort_reason, local_abort_species, local_fluid_id, rho_g, alpha_g, rho_react, rho_species, rho, energy, T, T_new, Ysum, Ysum0, Yerr0, Ysum_raw, Ysum_repaired, Ysum_write, Ywrite, closure_delta, r, r2, wr, mw, loss_i, prod_p, loss_p, Lbar, pbar, source_vol_scale, minY, minY_after, local_abort_score, local_pre_sumY, local_post_sumY, local_pre_minY, local_post_minY, local_Y_before, local_Y_after, local_pressure, local_species_finite, local_post_repair_score, local_post_repair_sumY_before, local_post_repair_minY_before, h_k, qdot_h_sub, mass_rate_k, heat_sub, heat_weight, heat_weight_denom]', &
+            reduction='[[diag_pre_sumY_err, diag_post_sumY_err], [diag_species_mass_before, diag_species_mass_after, diag_heat_pos_sum, diag_heat_neg_sum, diag_heat_abs_sum], [abort_flag, pre_norm_flag, post_repair_flag], [diag_minY]]', &
             reductionOp='[MAX, +, MAX, MIN]', &
-            copy='[diag_abort_score, diag_abort_reason, diag_abort_x, diag_abort_y, diag_abort_z, diag_abort_species, diag_abort_fluid_id, diag_abort_pre_sumY, diag_abort_post_sumY, diag_abort_pre_minY, diag_abort_post_minY, diag_abort_Y_before, diag_abort_Y_after, diag_abort_alpha_g, diag_abort_rho_stored, diag_abort_rho_intrinsic, diag_abort_pressure, diag_abort_temperature, diag_pre_norm_score, diag_pre_norm_sumY, diag_pre_norm_minY, diag_pre_norm_repaired_sumY, diag_pre_norm_x, diag_pre_norm_y, diag_pre_norm_z, diag_pre_norm_species]', &
+            copy='[diag_abort_score, diag_abort_reason, diag_abort_x, diag_abort_y, diag_abort_z, diag_abort_species, diag_abort_fluid_id, diag_abort_pre_sumY, diag_abort_post_sumY, diag_abort_pre_minY, diag_abort_post_minY, diag_abort_Y_before, diag_abort_Y_after, diag_abort_alpha_g, diag_abort_rho_stored, diag_abort_rho_intrinsic, diag_abort_pressure, diag_abort_temperature, diag_pre_norm_score, diag_pre_norm_sumY, diag_pre_norm_minY, diag_pre_norm_repaired_sumY, diag_pre_norm_x, diag_pre_norm_y, diag_pre_norm_z, diag_pre_norm_species, diag_post_repair_score, diag_post_repair_sumY_before, diag_post_repair_sumY_after, diag_post_repair_minY_before, diag_post_repair_minY_after, diag_post_repair_x, diag_post_repair_y, diag_post_repair_z]', &
             copyin='[bounds, dt_sub, nsub, model3_gas]')
         do z = bounds(3)%beg, bounds(3)%end
             do y = bounds(2)%beg, bounds(2)%end
@@ -1133,6 +1148,9 @@ contains
                     local_fluid_id = 1
                     T = 0._wp
                     T_new = 0._wp
+                    local_post_repair_score = -1._wp
+                    local_post_repair_sumY_before = 0._wp
+                    local_post_repair_minY_before = 0._wp
 
                     if (model3_gas) then
                         call s_compute_chemistry_gas_alpha_density(q_cons_vf, x, y, z, rho_g, alpha_g, rho_react)
@@ -1329,7 +1347,7 @@ contains
                             alp(eqn) = (180._wp + 60._wp*r + 11._wp*r2 + r2*r)/ &
                                        (360._wp + 60._wp*r + 12._wp*r2 + r2*r)
                             Ys(eqn) = y0(eqn) + dt_sub*(prod0(eqn) - loss_i)/(1._wp + alp(eqn)*dt_sub*Lloss(eqn))
-                            if (Ys(eqn) < -aqss_negative_roundoff_tol) then
+                            if (Ys(eqn) < -aqss_post_negative_repair_tol) then
                                 abort_flag = 1
                                 if (abs(Ys(eqn)) > local_abort_score) then
                                     local_abort_reason = 4
@@ -1382,7 +1400,7 @@ contains
                             Lbar = 0.5_wp*(Lloss(eqn) + loss_p/max(Ys_rate(eqn), y_floor))
                             pbar = alp(eqn)*prod_p + (1._wp - alp(eqn))*prod0(eqn)
                             Ys(eqn) = y0(eqn) + dt_sub*(pbar - Lbar*y0(eqn))/(1._wp + alp(eqn)*dt_sub*Lbar)
-                            if (Ys(eqn) < -aqss_negative_roundoff_tol) then
+                            if (Ys(eqn) < -aqss_post_negative_repair_tol) then
                                 abort_flag = 1
                                 if (abs(Ys(eqn)) > local_abort_score) then
                                     local_abort_reason = 5
@@ -1439,13 +1457,56 @@ contains
 
                         Ysum = 0._wp
                         minY_after = huge(1._wp)
+                        local_species_finite = .true.
                         $:GPU_LOOP(parallelism='[seq]')
                         do eqn = 1, num_species
                             Ysum = Ysum + Ys(eqn)
                             minY_after = min(minY_after, Ys(eqn))
+                            if (.not. s_is_finite_wp(Ys(eqn))) local_species_finite = .false.
                         end do
                         local_post_sumY = Ysum
                         local_post_minY = minY_after
+                        if (local_species_finite .and. s_is_finite_wp(Ysum) .and. &
+                            minY_after >= -aqss_post_negative_repair_tol .and. &
+                            abs(Ysum - 1._wp) <= aqss_post_sumY_repair_tol .and. &
+                            Ysum > y_floor .and. &
+                            (minY_after < 0._wp .or. abs(Ysum - 1._wp) > aqss_sumY_abort_tol)) then
+                            post_repair_flag = 1
+                            local_post_repair_score = abs(Ysum - 1._wp)
+                            local_post_repair_sumY_before = Ysum
+                            local_post_repair_minY_before = minY_after
+                            Ysum_repaired = 0._wp
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do eqn = 1, num_species
+                                Ys(eqn) = max(0._wp, Ys(eqn))
+                                Ysum_repaired = Ysum_repaired + Ys(eqn)
+                            end do
+                            if (Ysum_repaired > y_floor) then
+                                $:GPU_LOOP(parallelism='[seq]')
+                                do eqn = 1, num_species
+                                    Ys(eqn) = Ys(eqn)/Ysum_repaired
+                                end do
+                            end if
+                            Ysum = 0._wp
+                            minY_after = huge(1._wp)
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do eqn = 1, num_species
+                                Ysum = Ysum + Ys(eqn)
+                                minY_after = min(minY_after, Ys(eqn))
+                            end do
+                            local_post_sumY = Ysum
+                            local_post_minY = minY_after
+                            if (local_post_repair_score > diag_post_repair_score) then
+                                diag_post_repair_score = local_post_repair_score
+                                diag_post_repair_sumY_before = local_post_repair_sumY_before
+                                diag_post_repair_minY_before = local_post_repair_minY_before
+                                diag_post_repair_sumY_after = Ysum
+                                diag_post_repair_minY_after = minY_after
+                                diag_post_repair_x = x
+                                diag_post_repair_y = y
+                                diag_post_repair_z = z
+                            end if
+                        end if
                         if ((.not. s_is_finite_wp(Ysum)) .or. abs(Ysum - 1._wp) > aqss_sumY_abort_tol) then
                             abort_flag = 1
                             if (max(abs(Ysum - 1._wp), 0._wp) > local_abort_score) then
@@ -1570,6 +1631,17 @@ contains
                     &" repaired_sumY=", ES16.6)', &
                 proc_rank, t_step, diag_pre_norm_x, diag_pre_norm_y, diag_pre_norm_z, &
                 diag_pre_norm_species, diag_pre_norm_minY, diag_pre_norm_sumY, diag_pre_norm_repaired_sumY
+            call flush (output_unit)
+        end if
+
+        if (post_repair_flag > 0) then
+            print '(" AQSS_POST_REPAIR rank=", I6, " t_step=", I8, " i=", I8, &
+                    &" j=", I8, " k=", I8, " sumY_before_repair=", ES16.6, &
+                    &" sumY_after_repair=", ES16.6, " minY_before_repair=", ES16.6, &
+                    &" minY_after_repair=", ES16.6)', &
+                proc_rank, t_step, diag_post_repair_x, diag_post_repair_y, diag_post_repair_z, &
+                diag_post_repair_sumY_before, diag_post_repair_sumY_after, &
+                diag_post_repair_minY_before, diag_post_repair_minY_after
             call flush (output_unit)
         end if
 
