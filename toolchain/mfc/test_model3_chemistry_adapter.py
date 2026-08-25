@@ -59,6 +59,19 @@ def _conversion_source() -> str:
     return re.sub(r"[\s&]+", "", match.group("body"))
 
 
+def _primitive_to_conservative_source() -> str:
+    text = VARIABLES_CONVERSION_SRC.read_text()
+    match = re.search(
+        r"subroutine s_convert_primitive_to_conservative_variables\b(?P<body>.*?)"
+        r"end subroutine s_convert_primitive_to_conservative_variables",
+        text,
+        flags=re.S,
+    )
+    if match is None:
+        raise AssertionError("s_convert_primitive_to_conservative_variables not found")
+    return re.sub(r"[\s&]+", "", match.group("body"))
+
+
 def _temperature_init_source() -> str:
     text = CHEMISTRY_SRC.read_text()
     match = re.search(
@@ -121,6 +134,10 @@ def _model3_hllc_species_flux_reference(cont2_flux, cont3_flux, y_left, y_right,
     if sum_y_face <= 0.0:
         return [0.0 for _ in y_face], gas_flux
     return [gas_flux * y / sum_y_face for y in y_face], gas_flux
+
+
+def _model3_total_energy_from_pressure_form(dyn_pres, int_ens):
+    return dyn_pres + sum(int_ens)
 
 
 class TestModel3ChemistryGasStateAdapter(unittest.TestCase):
@@ -446,6 +463,67 @@ class TestModel3ConservativeToPrimitiveReconstruction(unittest.TestCase):
         self.assertEqual(src.count("pres=gas_pressure"), 3)
         self.assertEqual(src.count("T=gas_temperature"), 3)
         self.assertEqual(src.count("calls_get_model3_phase_pressure"), 3)
+
+
+class TestModel3PrimitiveToConservativeInitialization(unittest.TestCase):
+    def test_coupled_species_initialization_uses_stored_gas_mass_not_total_density(self):
+        src = _primitive_to_conservative_source()
+        self.assertIn(
+            "rho_g_stored=q_cons_vf(eqn_idx%cont%beg+1)%sf(j,k,l)+q_cons_vf(eqn_idx%cont%beg+2)%sf(j,k,l)",
+            src,
+        )
+        self.assertIn("q_cons_vf(i)%sf(j,k,l)=rho_g_stored*q_prim_vf(i)%sf(j,k,l)", src)
+
+        coupled_block = src.split("if(model3_chemistry_coupling)then", 1)[1].split("else", 1)[0]
+        self.assertNotIn("q_cons_vf(i)%sf(j,k,l)=rho*q_prim_vf(i)%sf(j,k,l)", coupled_block)
+
+    def test_reference_species_initialization_closes_on_stored_gas_mass(self):
+        alpha_rho = [0.02, 0.28, 0.70]
+        y = [0.05, 0.20, 0.75]
+        rho_total = sum(alpha_rho)
+        rho_g_stored = alpha_rho[1] + alpha_rho[2]
+
+        coupled_rho_y = [rho_g_stored * value for value in y]
+        old_generic_rho_y = [rho_total * value for value in y]
+
+        self.assertAlmostEqual(sum(coupled_rho_y), rho_g_stored)
+        self.assertNotAlmostEqual(sum(old_generic_rho_y), rho_g_stored)
+
+    def test_coupled_energy_initialization_sums_model3_phasic_internal_energies(self):
+        src = _primitive_to_conservative_source()
+        self.assertIn("int_en_sum=0._wp", src)
+        self.assertIn("doi=eqn_idx%int_en%beg,eqn_idx%int_en%end", src)
+        self.assertIn("int_en_sum=int_en_sum+q_cons_vf(i)%sf(j,k,l)", src)
+        self.assertIn("q_cons_vf(eqn_idx%E)%sf(j,k,l)=dyn_pres+int_en_sum", src)
+
+        int_energy_loop = src.index("q_cons_vf(i+eqn_idx%int_en%beg-1)%sf(j,k,l)=")
+        energy_sum = src.index("q_cons_vf(eqn_idx%E)%sf(j,k,l)=dyn_pres+int_en_sum")
+        self.assertLess(int_energy_loop, energy_sum)
+
+    def test_reference_energy_initialization_round_trip_recovers_phase_pressures(self):
+        pressure = 1.5705375e6
+        dyn_pres = 0.0
+        fluid1 = _model3_int_en_from_pressure(1.0e-10, 7.4e-8, 0.7407407407407407, 835555555.5555555, -758060.0, pressure)
+        fluid2 = _model3_int_en_from_pressure(0.004281387655773769, 0.022627218570339464, 40.00000000000014, 0.0, -234490.0, pressure)
+        fluid3 = _model3_int_en_from_pressure(0.9957186122442262, 5.2623925898000286, 2.5000000000000004, 0.0, 0.0, pressure)
+
+        total_energy = _model3_total_energy_from_pressure_form(dyn_pres, [fluid1, fluid2, fluid3])
+
+        self.assertAlmostEqual(total_energy - dyn_pres, fluid1 + fluid2 + fluid3)
+        self.assertAlmostEqual(
+            _model3_pressure_from_int_en(0.004281387655773769, 0.022627218570339464, 40.00000000000014, 0.0, -234490.0, fluid2),
+            pressure,
+        )
+        self.assertAlmostEqual(
+            _model3_pressure_from_int_en(0.9957186122442262, 5.2623925898000286, 2.5000000000000004, 0.0, 0.0, fluid3),
+            pressure,
+        )
+
+    def test_normal_gas_only_chemistry_initialization_path_is_still_present(self):
+        src = _primitive_to_conservative_source()
+        self.assertIn("q_cons_vf(i)%sf(j,k,l)=rho*q_prim_vf(i)%sf(j,k,l)", src)
+        self.assertIn("callget_mixture_energy_mass(T,Ys,e_mix)", src)
+        self.assertIn("q_cons_vf(eqn_idx%E)%sf(j,k,l)=dyn_pres+rho*e_mix", src)
 
 
 class TestModel3HllcSpeciesFlux(unittest.TestCase):

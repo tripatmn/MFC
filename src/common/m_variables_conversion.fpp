@@ -865,6 +865,7 @@ contains
         integer                          :: i, j, k, l  !< Generic loop iterators
         real(wp), dimension(num_species) :: Ys
         real(wp)                         :: e_mix, mix_mol_weight, T
+        real(wp)                         :: rho_g_stored, int_en_sum
         real(wp)                         :: pres_mag
         real(wp)                         :: Ga          !< Lorentz factor (gamma in relativity)
         real(wp)                         :: h           !< relativistic enthalpy
@@ -962,16 +963,31 @@ contains
 
                     if (chemistry) then
                         ! Reacting mixture: compute conserved energy from species mass fractions and temperature
+                        if (model3_chemistry_coupling) then
+                            rho_g_stored = q_cons_vf(eqn_idx%cont%beg + 1)%sf(j, k, l) + &
+                                         & q_cons_vf(eqn_idx%cont%beg + 2)%sf(j, k, l)
+                        end if
+
                         do i = eqn_idx%species%beg, eqn_idx%species%end
                             Ys(i - eqn_idx%species%beg + 1) = q_prim_vf(i)%sf(j, k, l)
-                            q_cons_vf(i)%sf(j, k, l) = rho*q_prim_vf(i)%sf(j, k, l)
+                            if (model3_chemistry_coupling) then
+                                q_cons_vf(i)%sf(j, k, l) = rho_g_stored*q_prim_vf(i)%sf(j, k, l)
+                            else
+                                q_cons_vf(i)%sf(j, k, l) = rho*q_prim_vf(i)%sf(j, k, l)
+                            end if
                         end do
 
-                        call get_mixture_molecular_weight(Ys, mix_mol_weight)
-                        T = q_prim_vf(eqn_idx%E)%sf(j, k, l)*mix_mol_weight/(gas_constant*rho)
-                        call get_mixture_energy_mass(T, Ys, e_mix)
+                        if (model3_chemistry_coupling) then
+                            ! Coupled Model-3 stores total E in the pressure-form six-equation representation.
+                            ! The thermochemical energy is only the AQSS reactor invariant, not the conserved E.
+                            q_cons_vf(eqn_idx%E)%sf(j, k, l) = dyn_pres
+                        else
+                            call get_mixture_molecular_weight(Ys, mix_mol_weight)
+                            T = q_prim_vf(eqn_idx%E)%sf(j, k, l)*mix_mol_weight/(gas_constant*rho)
+                            call get_mixture_energy_mass(T, Ys, e_mix)
 
-                        q_cons_vf(eqn_idx%E)%sf(j, k, l) = dyn_pres + rho*e_mix
+                            q_cons_vf(eqn_idx%E)%sf(j, k, l) = dyn_pres + rho*e_mix
+                        end if
                     else
                         ! Computing the energy from the pressure
                         if (mhd) then
@@ -1002,6 +1018,14 @@ contains
                                       & l)*(gammas(i)*q_prim_vf(eqn_idx%E)%sf(j, k, &
                                       & l) + pi_infs(i)) + q_cons_vf(i + eqn_idx%cont%beg - 1)%sf(j, k, l)*qvs(i)
                         end do
+
+                        if (chemistry .and. model3_chemistry_coupling) then
+                            int_en_sum = 0._wp
+                            do i = eqn_idx%int_en%beg, eqn_idx%int_en%end
+                                int_en_sum = int_en_sum + q_cons_vf(i)%sf(j, k, l)
+                            end do
+                            q_cons_vf(eqn_idx%E)%sf(j, k, l) = dyn_pres + int_en_sum
+                        end if
                     end if
 
                     if (bubbles_euler) then
