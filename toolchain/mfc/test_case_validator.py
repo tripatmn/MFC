@@ -235,11 +235,14 @@ class TestModel3ChemistryCoupling(ConstraintTestCase):
     def test_rejects_too_few_fluids(self):
         self.assertRejects({**MODEL3_CHEM_COUPLING, "num_fluids": 2}, "requires num_fluids >= 3")
 
-    def test_rejects_reactions_off(self):
-        self.assertRejects({**MODEL3_CHEM_COUPLING, "chem_params%reactions": "F"}, "requires chem_params%reactions = T")
+    def test_accepts_reactions_off_for_phase_change_and_transport_diagnostics(self):
+        self.assertAccepts({**MODEL3_CHEM_COUPLING, "chem_params%reactions": "F", "chem_params%reaction_substeps": 0})
 
     def test_rejects_explicit_chemistry(self):
         self.assertRejects({**MODEL3_CHEM_COUPLING, "chem_params%reaction_substeps": 0}, "coupled explicit chemistry is not implemented")
+
+    def test_accepts_reacting_aqss_with_valid_substeps(self):
+        self.assertAccepts({**MODEL3_CHEM_COUPLING, "chem_params%reactions": "T", "chem_params%reaction_substeps": 2})
 
     def test_rejects_stage1_diffusion(self):
         self.assertRejects({**MODEL3_CHEM_COUPLING, "chem_params%diffusion": "T"}, "Model-3 reacting diffusion is planned")

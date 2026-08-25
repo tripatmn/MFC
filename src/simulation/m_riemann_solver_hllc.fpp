@@ -74,7 +74,7 @@ contains
         real(wp)               :: Cp_L, Cp_R
         real(wp)               :: Cv_L, Cv_R
         real(wp)               :: Gamm_L, Gamm_R
-        real(wp)               :: Y_L, Y_R
+        real(wp)               :: Y_L, Y_R, Y_face, sumY_face, gas_mass_flux
         real(wp)               :: gamma_L, gamma_R
         real(wp)               :: pi_inf_L, pi_inf_R
         real(wp)               :: qv_L, qv_R
@@ -181,8 +181,9 @@ contains
                     $:GPU_PARALLEL_LOOP(collapse=3, private='[i, j, k, l, vel_L, vel_R, Re_L, Re_R, alpha_L, alpha_R, &
                                         & alpha_rho_L, alpha_rho_R, Ys_L, Ys_R, Xs_L, Xs_R, Gamma_iL, Gamma_iR, Cp_iL, Cp_iR, &
                                         & Yi_avg, Phi_avg, h_iL, h_iR, h_avg_2, pcorr, zcoef, rho_L, rho_R, pres_L, pres_R, E_L, &
-                                        & E_R, H_L, H_R, Cp_avg, Cv_avg, T_avg, eps, c_sum_Yi_Phi, T_L, T_R, Y_L, Y_R, MW_L, &
-                                        & MW_R, R_gas_L, R_gas_R, Cp_L, Cp_R, Cv_L, Cv_R, Gamm_L, Gamm_R, gamma_L, gamma_R, &
+                                        & E_R, H_L, H_R, Cp_avg, Cv_avg, T_avg, eps, c_sum_Yi_Phi, T_L, T_R, Y_L, Y_R, &
+                                        & Y_face, sumY_face, gas_mass_flux, MW_L, MW_R, R_gas_L, R_gas_R, Cp_L, Cp_R, Cv_L, &
+                                        & Cv_R, Gamm_L, Gamm_R, gamma_L, gamma_R, &
                                         & pi_inf_L, pi_inf_R, qv_L, qv_R, qv_avg, c_L, c_R, rho_avg, H_avg, c_avg, gamma_avg, &
                                         & ptilde_L, ptilde_R, vel_L_rms, vel_R_rms, vel_avg_rms, vel_L_tmp, vel_R_tmp, Ms_L, &
                                         & Ms_R, pres_SL, pres_SR, alpha_L_sum, alpha_R_sum, rho_Star, E_Star, p_Star, p_K_Star, &
@@ -365,6 +366,31 @@ contains
                                                 & i)*(vel_L(dir_idx(1)) + s_M*xi_L_m1) + xi_P*qR_prim_rsx_vf(${SF(' + 1')}$, &
                                                 & i)*(vel_R(dir_idx(1)) + s_P*xi_R_m1)
                                 end do
+
+                                if (chemistry .and. model3_chemistry_coupling) then
+                                    gas_mass_flux = flux_rsx_vf(${SF('')}$, eqn_idx%cont%beg + 1) &
+                                                    & + flux_rsx_vf(${SF('')}$, eqn_idx%cont%beg + 2)
+                                    sumY_face = 0._wp
+
+                                    $:GPU_LOOP(parallelism='[seq]')
+                                    do i = eqn_idx%species%beg, eqn_idx%species%end
+                                        Y_face = max(0._wp, xi_M*qL_prim_rsx_vf(${SF('')}$, i) &
+                                                     & + xi_P*qR_prim_rsx_vf(${SF(' + 1')}$, i))
+                                        Yi_avg(i - eqn_idx%species%beg + 1) = Y_face
+                                        sumY_face = sumY_face + Y_face
+                                    end do
+
+                                    $:GPU_LOOP(parallelism='[seq]')
+                                    do i = eqn_idx%species%beg, eqn_idx%species%end
+                                        if (sumY_face > sgm_eps) then
+                                            Y_face = Yi_avg(i - eqn_idx%species%beg + 1)/sumY_face
+                                            flux_rsx_vf(${SF('')}$, i) = Y_face*gas_mass_flux
+                                        else
+                                            flux_rsx_vf(${SF('')}$, i) = 0._wp
+                                        end if
+                                        flux_src_rsx_vf(${SF('')}$, i) = 0._wp
+                                    end do
+                                end if
 
                                 ! MOMENTUM FLUX. f = \rho u u - \sigma, q = \rho u, q_star = \xi * \rho*(s_star, v, w)
                                 $:GPU_LOOP(parallelism='[seq]')

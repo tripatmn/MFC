@@ -17,6 +17,7 @@ PHASE_CHANGE_SRC = REPO_ROOT / "src" / "common" / "m_phase_change.fpp"
 SIM_START_UP_SRC = REPO_ROOT / "src" / "simulation" / "m_start_up.fpp"
 TIME_STEPPERS_SRC = REPO_ROOT / "src" / "simulation" / "m_time_steppers.fpp"
 DATA_OUTPUT_SRC = REPO_ROOT / "src" / "simulation" / "m_data_output.fpp"
+HLLC_SRC = REPO_ROOT / "src" / "simulation" / "m_riemann_solver_hllc.fpp"
 
 
 def _adapter_source() -> str:
@@ -88,6 +89,10 @@ def _compact_fortran(path: Path) -> str:
     return re.sub(r"[\s&]+", "", path.read_text())
 
 
+def _hllc_source() -> str:
+    return _compact_fortran(HLLC_SRC)
+
+
 def _apply_evaporation_only_reference(liquid_before, vapor_before, liquid_candidate, vapor_candidate):
     if vapor_candidate < vapor_before:
         return liquid_before, vapor_before, 0.0
@@ -107,6 +112,15 @@ def _model3_int_en_from_pressure(alpha, alpha_rho, gamma, pi_inf, qv, pressure):
 
 def _model3_pressure_from_int_en(alpha, alpha_rho, gamma, pi_inf, qv, int_en):
     return ((int_en - alpha_rho * qv) / alpha - pi_inf) / gamma
+
+
+def _model3_hllc_species_flux_reference(cont2_flux, cont3_flux, y_left, y_right, xi_m, xi_p):
+    gas_flux = cont2_flux + cont3_flux
+    y_face = [max(0.0, xi_m * yl + xi_p * yr) for yl, yr in zip(y_left, y_right)]
+    sum_y_face = sum(y_face)
+    if sum_y_face <= 0.0:
+        return [0.0 for _ in y_face], gas_flux
+    return [gas_flux * y / sum_y_face for y in y_face], gas_flux
 
 
 class TestModel3ChemistryGasStateAdapter(unittest.TestCase):
@@ -432,6 +446,78 @@ class TestModel3ConservativeToPrimitiveReconstruction(unittest.TestCase):
         self.assertEqual(src.count("pres=gas_pressure"), 3)
         self.assertEqual(src.count("T=gas_temperature"), 3)
         self.assertEqual(src.count("calls_get_model3_phase_pressure"), 3)
+
+
+class TestModel3HllcSpeciesFlux(unittest.TestCase):
+    def test_coupled_hllc_species_flux_uses_final_fluid2_and_fluid3_fluxes(self):
+        src = _hllc_source()
+        self.assertIn("if(chemistry.and.model3_chemistry_coupling)then", src)
+        self.assertIn(
+            "gas_mass_flux=flux_rsx_vf(${SF('')}$,eqn_idx%cont%beg+1)+flux_rsx_vf(${SF('')}$,eqn_idx%cont%beg+2)",
+            src,
+        )
+        self.assertNotIn(
+            "gas_mass_flux=flux_rsx_vf(${SF('')}$,eqn_idx%cont%beg)+flux_rsx_vf(${SF('')}$,eqn_idx%cont%beg+1)",
+            src,
+        )
+
+    def test_coupled_hllc_species_flux_uses_contact_selected_normalized_face_y(self):
+        src = _hllc_source()
+        coupled_block = src.split("if(chemistry.and.model3_chemistry_coupling)then", 1)[1].split(
+            "!MOMENTUMFLUX", 1
+        )[0]
+        self.assertIn(
+            "Y_face=max(0._wp,xi_M*qL_prim_rsx_vf(${SF('')}$,i)+xi_P*qR_prim_rsx_vf(${SF('+1')}$,i))",
+            coupled_block,
+        )
+        self.assertIn("sumY_face=sumY_face+Y_face", coupled_block)
+        self.assertIn("Y_face=Yi_avg(i-eqn_idx%species%beg+1)/sumY_face", coupled_block)
+        self.assertIn("flux_rsx_vf(${SF('')}$,i)=Y_face*gas_mass_flux", coupled_block)
+        self.assertIn("flux_src_rsx_vf(${SF('')}$,i)=0._wp", coupled_block)
+
+    def test_existing_non_coupled_hllc_species_flux_formula_is_still_present(self):
+        src = _hllc_source()
+        self.assertIn(
+            "flux_rsx_vf(${SF('')}$,i)=xi_M*rho_L*Y_L*(vel_L(dir_idx(1))+s_M*xi_L_m1)+xi_P*rho_R*Y_R*(vel_R(dir_idx(1))+s_P*xi_R_m1)",
+            src,
+        )
+
+    def test_reference_species_flux_excludes_liquid_mass_flux(self):
+        fluxes, gas_flux = _model3_hllc_species_flux_reference(
+            cont2_flux=0.3,
+            cont3_flux=0.7,
+            y_left=[0.2, 0.3, 0.5],
+            y_right=[0.1, 0.1, 0.8],
+            xi_m=1.0,
+            xi_p=0.0,
+        )
+        self.assertAlmostEqual(gas_flux, 1.0)
+        self.assertAlmostEqual(sum(fluxes), gas_flux)
+
+        fluxes_with_large_liquid, gas_flux_with_large_liquid = _model3_hllc_species_flux_reference(
+            cont2_flux=0.3,
+            cont3_flux=0.7,
+            y_left=[0.2, 0.3, 0.5],
+            y_right=[0.1, 0.1, 0.8],
+            xi_m=1.0,
+            xi_p=0.0,
+        )
+        self.assertEqual(fluxes_with_large_liquid, fluxes)
+        self.assertAlmostEqual(gas_flux_with_large_liquid, gas_flux)
+
+    def test_reference_uniform_y_advection_preserves_species_closure(self):
+        y = [0.05, 0.20, 0.75]
+        fluxes, gas_flux = _model3_hllc_species_flux_reference(
+            cont2_flux=-0.4,
+            cont3_flux=0.9,
+            y_left=y,
+            y_right=y,
+            xi_m=0.0,
+            xi_p=1.0,
+        )
+        for actual, expected in zip(fluxes, [gas_flux * value for value in y]):
+            self.assertAlmostEqual(actual, expected)
+        self.assertAlmostEqual(sum(fluxes), gas_flux)
 
 
 if __name__ == "__main__":

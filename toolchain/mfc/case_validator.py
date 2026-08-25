@@ -1823,11 +1823,7 @@ class CaseValidator:
             "model3_chemistry_coupling requires num_fluids >= 3: fluid 1 liquid fuel, fluid 2 fuel vapor, fluid 3 oxidizer/ambient gas",
         )
         self.prohibit(
-            model3_chemistry_coupling and not reactions,
-            "model3_chemistry_coupling requires chem_params%reactions = T",
-        )
-        self.prohibit(
-            model3_chemistry_coupling and reaction_substeps <= 0,
+            model3_chemistry_coupling and reactions and reaction_substeps <= 0,
             "model3_chemistry_coupling requires chem_params%reaction_substeps > 0; coupled explicit chemistry is not implemented",
         )
         self.prohibit(
