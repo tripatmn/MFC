@@ -12,6 +12,8 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CHEMISTRY_SRC = REPO_ROOT / "src" / "common" / "m_chemistry.fpp"
+PHASE_CHANGE_SRC = REPO_ROOT / "src" / "common" / "m_phase_change.fpp"
+SIM_START_UP_SRC = REPO_ROOT / "src" / "simulation" / "m_start_up.fpp"
 
 
 def _adapter_source() -> str:
@@ -25,6 +27,19 @@ def _adapter_source() -> str:
     if match is None:
         raise AssertionError("s_get_model3_chemistry_gas_state not found")
     return re.sub(r"\s+", "", match.group("body"))
+
+
+def _apply_evaporation_only_reference(liquid_before, vapor_before, liquid_candidate, vapor_candidate):
+    if vapor_candidate < vapor_before:
+        return liquid_before, vapor_before, 0.0
+    return liquid_candidate, vapor_candidate, vapor_candidate - vapor_before
+
+
+def _apply_vapor_delta_to_fuel_species_reference(species_rho_y, fuel_index, delta):
+    updated = list(species_rho_y)
+    updated[fuel_index] += delta
+    delta = 0.0
+    return updated, delta
 
 
 class TestModel3ChemistryGasStateAdapter(unittest.TestCase):
@@ -94,6 +109,74 @@ class TestModel3ChemistryGasStateAdapter(unittest.TestCase):
         self.assertAlmostEqual(sum_y, 1.0)
         self.assertAlmostEqual(closure_error, 0.0)
         self.assertGreater(temperature, 0.0)
+
+
+class TestModel3PhaseChangeVaporDelta(unittest.TestCase):
+    def test_delta_field_is_public_and_coupled_mode_allocated(self):
+        text = re.sub(r"\s+", "", PHASE_CHANGE_SRC.read_text())
+        self.assertIn("s_apply_model3_vapor_delta_to_fuel_species", text)
+        self.assertIn("s_finalize_relaxation_solver_module,delta_m_vapor", text)
+        self.assertIn("type(scalar_field)::delta_m_vapor", text)
+        self.assertIn("if(model3_chemistry_coupling)then@:ALLOCATE(delta_m_vapor%sf(0:m,0:n,0:p))", text)
+        self.assertIn("@:ACC_SETUP_SFs(delta_m_vapor)", text)
+        self.assertIn("if(associated(delta_m_vapor%sf))then@:DEALLOCATE(delta_m_vapor%sf)", text)
+
+    def test_delta_is_reset_and_accepts_evaporation_only_around_ptg_relaxation(self):
+        text = re.sub(r"\s+", "", PHASE_CHANGE_SRC.read_text())
+        self.assertIn("if(model3_chemistry_coupling)delta_m_vapor%sf(j,k,l)=0._wp", text)
+        self.assertIn("vapor_mass_before=m2", text)
+        self.assertIn("no_transfer_pS=pS", text)
+        self.assertIn("no_transfer_TS=TS", text)
+        self.assertIn("call s_infinite_ptg_relaxation_k".replace(" ", ""), text)
+        self.assertIn("vapor_mass_after=q_cons_vf(vp+eqn_idx%cont%beg-1)%sf(j,k,l)", text)
+        self.assertIn("if(vapor_mass_after<vapor_mass_before)then", text)
+        self.assertIn("q_cons_vf(lp+eqn_idx%cont%beg-1)%sf(j,k,l)=m1", text)
+        self.assertIn("q_cons_vf(vp+eqn_idx%cont%beg-1)%sf(j,k,l)=m2", text)
+        self.assertIn("pS=no_transfer_pS", text)
+        self.assertIn("TS=no_transfer_TS", text)
+        self.assertIn("delta_m_vapor%sf(j,k,l)=0._wp", text)
+        self.assertIn("delta_m_vapor%sf(j,k,l)=vapor_mass_after-vapor_mass_before", text)
+
+    def test_accepted_evaporation_reference_has_positive_delta(self):
+        liquid, vapor, delta = _apply_evaporation_only_reference(0.7, 0.3, 0.65, 0.35)
+        self.assertAlmostEqual(liquid, 0.65)
+        self.assertAlmostEqual(vapor, 0.35)
+        self.assertAlmostEqual(delta, 0.05)
+        self.assertGreater(delta, 0.0)
+
+    def test_condensation_reference_rolls_back_and_zeroes_delta(self):
+        liquid, vapor, delta = _apply_evaporation_only_reference(0.7, 0.3, 0.75, 0.25)
+        self.assertAlmostEqual(liquid, 0.7)
+        self.assertAlmostEqual(vapor, 0.3)
+        self.assertAlmostEqual(delta, 0.0)
+
+    def test_vapor_delta_species_insertion_is_fuel_only_and_one_shot(self):
+        initial_species = [0.05, 0.15, 0.20]
+        delta = 0.04
+        updated_species, delta = _apply_vapor_delta_to_fuel_species_reference(initial_species, 1, delta)
+
+        self.assertAlmostEqual(updated_species[1] - initial_species[1], 0.04)
+        self.assertAlmostEqual(updated_species[0], initial_species[0])
+        self.assertAlmostEqual(updated_species[2], initial_species[2])
+        self.assertAlmostEqual(sum(updated_species) - sum(initial_species), 0.04)
+        self.assertAlmostEqual(delta, 0.0)
+
+        reapplied_species, delta = _apply_vapor_delta_to_fuel_species_reference(updated_species, 1, delta)
+        self.assertEqual(reapplied_species, updated_species)
+        self.assertAlmostEqual(delta, 0.0)
+
+    def test_fortran_species_insertion_consumes_delta_after_relaxation(self):
+        phase_text = re.sub(r"\s+", "", PHASE_CHANGE_SRC.read_text())
+        startup_text = re.sub(r"\s+", "", SIM_START_UP_SRC.read_text())
+
+        self.assertIn("fuel_eqn=eqn_idx%species%beg+fuel_species_id-1", phase_text)
+        self.assertIn("q_cons_vf(fuel_eqn)%sf(j,k,l)=q_cons_vf(fuel_eqn)%sf(j,k,l)+delta_m_vapor%sf(j,k,l)", phase_text)
+        self.assertIn("delta_m_vapor%sf(j,k,l)=0._wp", phase_text)
+        self.assertIn("calls_infinite_relaxation_k(q_cons_ts(1)%vf)", startup_text)
+        self.assertIn(
+            "if(model3_chemistry_coupling)calls_apply_model3_vapor_delta_to_fuel_species(q_cons_ts(1)%vf)",
+            startup_text,
+        )
 
 
 if __name__ == "__main__":

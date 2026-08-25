@@ -634,7 +634,10 @@ contains
         ! Advance time after RK so source terms see current-step time
         mytime = mytime + dt
 
-        if (relax) call s_infinite_relaxation_k(q_cons_ts(1)%vf)
+        if (relax) then
+            call s_infinite_relaxation_k(q_cons_ts(1)%vf)
+            if (model3_chemistry_coupling) call s_apply_model3_vapor_delta_to_fuel_species(q_cons_ts(1)%vf)
+        end if
 
         ! Time-stepping loop controls
         t_step = t_step + 1

@@ -954,7 +954,7 @@ contains
 
         $:GPU_UPDATE(device='[Bx0]')
 
-        $:GPU_UPDATE(device='[chem_params]')
+        $:GPU_UPDATE(device='[chem_params, model3_chemistry_coupling]')
 
         $:GPU_UPDATE(device='[rburn]')
 

@@ -75,6 +75,7 @@ SIM_GPU_DECL_VARS = {
     "m",
     "mapped_weno",
     "mixture_err",
+    "model3_chemistry_coupling",
     "model_eqns",
     "mp_weno",
     "mhd",

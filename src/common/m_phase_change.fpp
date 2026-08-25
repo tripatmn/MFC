@@ -19,7 +19,8 @@ module m_phase_change
     implicit none
 
     private
-    public :: s_initialize_phasechange_module, s_relaxation_solver, s_infinite_relaxation_k, s_finalize_relaxation_solver_module
+    public :: s_initialize_phasechange_module, s_relaxation_solver, s_infinite_relaxation_k, &
+        & s_apply_model3_vapor_delta_to_fuel_species, s_finalize_relaxation_solver_module, delta_m_vapor
 
     !> @name Parameters for the first order transition phase change
     !> @{
@@ -31,6 +32,9 @@ module m_phase_change
     integer, parameter  :: lp = 1                       !< liquid dodecane fluid id
     integer, parameter  :: vp = 2                       !< dodecane vapor fluid id
     !> @}
+
+    type(scalar_field) :: delta_m_vapor  !< Cell-local change in vapor-fluid partial density from phase change
+    $:GPU_DECLARE(create='[delta_m_vapor]')
 
 contains
 
@@ -44,8 +48,14 @@ contains
 
     end subroutine s_relaxation_solver
 
-    !> Initialize the phase change module (no module-level state to set up; the pT/pTg relaxation solvers are self-contained)
+    !> Initialize the phase change module.
     impure subroutine s_initialize_phasechange_module
+
+        if (model3_chemistry_coupling) then
+            @:ALLOCATE(delta_m_vapor%sf(0:m, 0:n, 0:p))
+            delta_m_vapor%sf = 0._wp
+            @:ACC_SETUP_SFs(delta_m_vapor)
+        end if
 
     end subroutine s_initialize_phasechange_module
 
@@ -58,6 +68,10 @@ contains
         real(wp) :: rhoe, dynE, rhos      !< total internal energy, kinetic energy, and total entropy
         real(wp) :: rho, rM, m1, m2, MCT  !< total density, total reacting mass, individual reacting masses
         real(wp) :: TvF                   !< total volume fraction
+        real(wp) :: vapor_mass_before     !< vapor partial density before pTg mass transfer
+        real(wp) :: vapor_mass_after      !< vapor partial density after candidate pTg mass transfer
+        real(wp) :: no_transfer_pS        !< pT-equilibrium pressure before pTg mass transfer
+        real(wp) :: no_transfer_TS        !< pT-equilibrium temperature before pTg mass transfer
         ! $:GPU_DECLARE(create='[pS,TS,rhoe,dynE,rhos,rho,rM,m1,m2,MCT,TvF]')
 
         #:if not MFC_CASE_OPTIMIZATION and USING_AMD
@@ -80,10 +94,12 @@ contains
         ! starting equilibrium solver
 
         $:GPU_PARALLEL_LOOP(collapse=3, private='[i, j, k, l, p_infpT, sk, hk, gk, ek, rhok, pS, TS, rhoe, dynE, rhos, rho, rM, &
-                            & m1, m2, MCT, TvF]')
+                            & m1, m2, MCT, TvF, vapor_mass_before, vapor_mass_after, no_transfer_pS, no_transfer_TS]')
         do j = 0, m
             do k = 0, n
                 do l = 0, p
+                    if (model3_chemistry_coupling) delta_m_vapor%sf(j, k, l) = 0._wp
+
                     rho = 0.0_wp; TvF = 0.0_wp
                     $:GPU_LOOP(parallelism='[seq]')
                     do i = 1, num_fluids
@@ -106,6 +122,7 @@ contains
                     m1 = q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, l)
 
                     m2 = q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l)
+                    vapor_mass_before = m2
 
                     ! kinetic energy as an auxiliary variable to the calculation of the total internal energy
                     dynE = 0.0_wp
@@ -122,6 +139,8 @@ contains
                     ! Calling pT-equilibrium for either finishing phase-change module, or as an IC for the pTg-equilibrium for this
                     ! case, MFL cannot be either 0 or 1, so I chose it to be 2
                     call s_infinite_pt_relaxation_k(j, k, l, 2, pS, p_infpT, q_cons_vf, rhoe, TS)
+                    no_transfer_pS = pS
+                    no_transfer_TS = TS
 
                     ! Check if pTg-equilibrium needed; only partial densities require updating
                     if ((relax_model == 6) .and. ((q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, &
@@ -135,8 +154,22 @@ contains
                         ! boundary and destroyed cross-backend reproducibility.
                         q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, l) = m1
                         q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l) = m2
+                        if (model3_chemistry_coupling) vapor_mass_before = q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l)
 
                         call s_infinite_ptg_relaxation_k(j, k, l, pS, rhoe, q_cons_vf, TS)
+
+                        if (model3_chemistry_coupling) then
+                            vapor_mass_after = q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l)
+                            if (vapor_mass_after < vapor_mass_before) then
+                                q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, l) = m1
+                                q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l) = m2
+                                pS = no_transfer_pS
+                                TS = no_transfer_TS
+                                delta_m_vapor%sf(j, k, l) = 0._wp
+                            else
+                                delta_m_vapor%sf(j, k, l) = vapor_mass_after - vapor_mass_before
+                            end if
+                        end if
                     end if
 
                     ! Calculations AFTER equilibrium
@@ -181,6 +214,34 @@ contains
         $:END_GPU_PARALLEL_LOOP()
 
     end subroutine s_infinite_relaxation_k
+
+    !> Add accepted vaporized fuel mass to the coupled gas species state exactly once.
+    subroutine s_apply_model3_vapor_delta_to_fuel_species(q_cons_vf)
+
+        type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
+        integer :: fuel_eqn
+        integer :: j, k, l
+
+        if (.not. model3_chemistry_coupling) return
+        if (.not. associated(delta_m_vapor%sf)) return
+
+        fuel_eqn = eqn_idx%species%beg + fuel_species_id - 1
+        if ((fuel_eqn < eqn_idx%species%beg) .or. (fuel_eqn > eqn_idx%species%end)) then
+            call s_mpi_abort("model3_chemistry_coupling fuel_species_id is outside the chemistry species range")
+        end if
+
+        $:GPU_PARALLEL_LOOP(collapse=3, private='[j, k, l]', copyin='[fuel_eqn]')
+        do j = 0, m
+            do k = 0, n
+                do l = 0, p
+                    q_cons_vf(fuel_eqn)%sf(j, k, l) = q_cons_vf(fuel_eqn)%sf(j, k, l) + delta_m_vapor%sf(j, k, l)
+                    delta_m_vapor%sf(j, k, l) = 0._wp
+                end do
+            end do
+        end do
+        $:END_GPU_PARALLEL_LOOP()
+
+    end subroutine s_apply_model3_vapor_delta_to_fuel_species
 
     !> Apply pT-equilibrium relaxation for N fluids
     !! @param MFL flag: 0=gas, 1=liquid, 2=mixture
@@ -467,6 +528,10 @@ contains
 
     !> Finalize the phase change module
     impure subroutine s_finalize_relaxation_solver_module
+
+        if (associated(delta_m_vapor%sf)) then
+            @:DEALLOCATE(delta_m_vapor%sf)
+        end if
 
     end subroutine s_finalize_relaxation_solver_module
 
