@@ -308,6 +308,21 @@ class TestModel3AqssOrdering(unittest.TestCase):
         self.assertLess(chemistry_gate, chemistry_call)
         self.assertEqual(text.count("calls_chemistry_reaction_substep(q_cons_ts(1)%vf,q_T_sf,dt,idwint)"), 1)
 
+    def test_coupled_runtime_phase_change_insertion_and_aqss_use_same_state_without_intervening_reconstruction(self):
+        text = _compact_fortran(SIM_START_UP_SRC)
+        sequence = [
+            "calls_infinite_relaxation_k(q_cons_ts(1)%vf)",
+            "if(model3_chemistry_coupling)calls_apply_model3_vapor_delta_to_fuel_species(q_cons_ts(1)%vf)",
+            "calls_chemistry_reaction_substep(q_cons_ts(1)%vf,q_T_sf,dt,idwint)",
+        ]
+        positions = [text.index(item) for item in sequence]
+
+        self.assertEqual(positions, sorted(positions))
+        between_insertion_and_aqss = text[positions[1]:positions[2]]
+        self.assertNotIn("s_convert_conservative_to_primitive_variables", between_insertion_and_aqss)
+        self.assertNotIn("q_cons_ts(2)%vf", between_insertion_and_aqss)
+        self.assertNotIn("q_cons_ts(stor)%vf", between_insertion_and_aqss)
+
     def test_coupled_restart_preserves_model3_internal_energies(self):
         text = _compact_fortran(SIM_START_UP_SRC)
         self.assertIn(
