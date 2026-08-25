@@ -24,12 +24,12 @@ module m_phase_change
     !> @name Parameters for the first order transition phase change
     !> @{
     integer, parameter  :: max_iter = 100000            !< max Newton iterations before accepting the last iterate
-    real(wp), parameter :: pCr = 4.94e7_wp              !< Critical pressure of water [Pa]
-    real(wp), parameter :: TCr = 385.05_wp + 273.15_wp  !< Critical temperature of water [K]
+    real(wp), parameter :: pCr = 1.817e6_wp             !< Critical pressure of n-dodecane [Pa]
+    real(wp), parameter :: TCr = 658.2_wp               !< Critical temperature of n-dodecane [K]
     integer, parameter  :: ptg_ls_max = 30              !< max backtracking-line-search halvings in the pTg solver
     real(wp), parameter :: mixM = 1.0e-8_wp             !< Mixture mass fraction threshold for triggering phase change
-    integer, parameter  :: lp = 1                       !< index for the liquid phase of the reacting fluid
-    integer, parameter  :: vp = 2                       !< index for the vapor phase of the reacting fluid
+    integer, parameter  :: lp = 1                       !< liquid dodecane fluid id
+    integer, parameter  :: vp = 2                       !< dodecane vapor fluid id
     !> @}
 
 contains

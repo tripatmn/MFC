@@ -379,6 +379,7 @@ CONSTRAINTS = {
     "ib_neighborhood_radius": {"min": 0},
     "num_source": {"min": 1},
     "num_probes": {"min": 1},
+    "fuel_species_id": {"min": 1},
     "nb": {"min": 1},
     "m": {"min": 0},
     "n": {"min": 0},
@@ -416,6 +417,14 @@ DEPENDENCIES = {
     "chemistry": {
         "when_true": {
             "requires": ["cantera_file"],
+        }
+    },
+    "model3_chemistry_coupling": {
+        "when_true": {
+            "requires": ["chemistry", "fuel_species_id"],
+            "requires_value": {
+                "model_eqns": [3],
+            },
         }
     },
     "qbmm": {
@@ -647,6 +656,8 @@ def _load():
     # Chemistry
     _r("cantera_file", STR, {"chemistry"})
     _r("chemistry", LOG, {"chemistry"})
+    _r("model3_chemistry_coupling", LOG, {"chemistry"})
+    _r("fuel_species_id", INT, {"chemistry"})
 
     # Condensed-phase reactive burn (programmed pressure burn on the multi-fluid model)
     _r("reactive_burn", LOG, {"reactive_burn"})
@@ -1317,6 +1328,7 @@ _nv(
     "patch_ib",
     "pi_fac",
 )
+_nv(_PRE_SIM, "model3_chemistry_coupling", "fuel_species_id")
 _nv(_PRE_POST, "num_fluids", "weno_order", "recon_type", "muscl_order", "mhd", "nb", "igr", "igr_order", "sigR")
 _nv(_ALL, "reactive_burn", "rburn")
 _nv(_PRE_SIM, "ib_airfoil")

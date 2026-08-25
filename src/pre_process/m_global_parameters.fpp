@@ -383,6 +383,8 @@ contains
         chem_params%reaction_substeps = 0
         chem_params%adap_substeps = .false.
         chem_params%reaction_substeps_max = 0
+        model3_chemistry_coupling = .false.
+        fuel_species_id = 1
 
         ! Fluids physical parameters
         do i = 1, num_fluids_max

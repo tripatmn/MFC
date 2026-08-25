@@ -75,6 +75,26 @@ REACTIVE_BURN = {
 
 CHEMISTRY = {**BASE, "chemistry": "T", "cantera_file": "h2o2.yaml"}
 
+MODEL3_CHEM_COUPLING = {
+    **BASE,
+    "model_eqns": 3,
+    "num_fluids": 3,
+    "chemistry": "T",
+    "cantera_file": "h2o2.yaml",
+    "chem_params%reactions": "T",
+    "chem_params%reaction_substeps": 2,
+    "model3_chemistry_coupling": "T",
+    "fuel_species_id": 1,
+    "fluid_pp(2)%gamma": 0.4,
+    "fluid_pp(2)%pi_inf": 0.0,
+    "fluid_pp(3)%gamma": 0.4,
+    "fluid_pp(3)%pi_inf": 0.0,
+    "patch_icpp(1)%alpha_rho(2)": 0.0,
+    "patch_icpp(1)%alpha(2)": 0.0,
+    "patch_icpp(1)%alpha_rho(3)": 0.0,
+    "patch_icpp(1)%alpha(3)": 0.0,
+}
+
 # Two-fluid variants, which alt_soundspeed requires (the Kapila K coefficient is a
 # two-fluid closure).
 TWO_FLUID = {
@@ -199,6 +219,33 @@ class TestChemistrySubstepping(ConstraintTestCase):
 
     def test_accepts_igr_without_substepping(self):
         self.assertAccepts({**CHEMISTRY, "igr": "T", "chem_params%reaction_substeps": 0})
+
+
+class TestModel3ChemistryCoupling(ConstraintTestCase):
+    def test_accepts_fixed_thesis_layout(self):
+        self.assertAccepts(MODEL3_CHEM_COUPLING)
+
+    def test_normal_multifluid_chemistry_still_rejected_without_coupling(self):
+        params = {k: v for k, v in MODEL3_CHEM_COUPLING.items() if k != "model3_chemistry_coupling"}
+        self.assertRejects(params, "unless model3_chemistry_coupling = T")
+
+    def test_rejects_non_model3(self):
+        self.assertRejects({**MODEL3_CHEM_COUPLING, "model_eqns": 2}, "requires Model 3")
+
+    def test_rejects_too_few_fluids(self):
+        self.assertRejects({**MODEL3_CHEM_COUPLING, "num_fluids": 2}, "requires num_fluids >= 3")
+
+    def test_rejects_reactions_off(self):
+        self.assertRejects({**MODEL3_CHEM_COUPLING, "chem_params%reactions": "F"}, "requires chem_params%reactions = T")
+
+    def test_rejects_explicit_chemistry(self):
+        self.assertRejects({**MODEL3_CHEM_COUPLING, "chem_params%reaction_substeps": 0}, "coupled explicit chemistry is not implemented")
+
+    def test_rejects_stage1_diffusion(self):
+        self.assertRejects({**MODEL3_CHEM_COUPLING, "chem_params%diffusion": "T"}, "Model-3 reacting diffusion is planned")
+
+    def test_rejects_invalid_fuel_species_id(self):
+        self.assertRejects({**MODEL3_CHEM_COUPLING, "fuel_species_id": 0}, "fuel_species_id >= 1")
 
 
 class TestReactiveBurnFluidPairing(ConstraintTestCase):

@@ -16,6 +16,7 @@ module m_chemistry
         & get_mixture_specific_heat_cp_mass, get_mixture_enthalpy_mass
 
     use m_global_parameters
+    use m_constants, only: sgm_eps
 
     implicit none
 
@@ -25,6 +26,86 @@ module m_chemistry
     $:GPU_DECLARE(create='[offsets]')
 
 contains
+
+    !> Recover one six-equation Model-3 phase pressure from its pressure-form internal-energy equation.
+    subroutine s_get_model3_phase_pressure(q_cons_vf, fluid_id, x, y, z, phase_pressure, active_phase)
+
+        $:GPU_ROUTINE(function_name='s_get_model3_phase_pressure',parallelism='[seq]', cray_inline=True)
+
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
+        integer, intent(in)                                 :: fluid_id, x, y, z
+        real(wp), intent(out)                                :: phase_pressure
+        logical, intent(out)                                 :: active_phase
+        real(wp)                                             :: alpha_k, alpha_rho_k, int_en_k
+
+        alpha_k = q_cons_vf(eqn_idx%adv%beg + fluid_id - 1)%sf(x, y, z)
+        alpha_rho_k = q_cons_vf(eqn_idx%cont%beg + fluid_id - 1)%sf(x, y, z)
+        int_en_k = q_cons_vf(eqn_idx%int_en%beg + fluid_id - 1)%sf(x, y, z)
+
+        active_phase = alpha_k > sgm_eps
+        if (active_phase) then
+            phase_pressure = ((int_en_k - alpha_rho_k*qvs(fluid_id))/alpha_k - pi_infs(fluid_id))/gammas(fluid_id)
+        else
+            phase_pressure = 0._wp
+        end if
+
+    end subroutine s_get_model3_phase_pressure
+
+    !> Extract the fixed thesis-layout Model-3 gas chemistry state without repairing conserved species.
+    !! Fluid 2 is fuel vapor, fluid 3 is oxidizer/ambient gas, and species rhoY is stored against their combined gas mass.
+    subroutine s_get_model3_chemistry_gas_state(q_cons_vf, x, y, z, rho_g_stored, alpha_g, rho_g_intrinsic, Ys, rhoY_sum, sumY, &
+                                                & species_closure_error, species_closure_relerr, gas_pressure, gas_temperature, &
+                                                & active_gas)
+
+        $:GPU_ROUTINE(function_name='s_get_model3_chemistry_gas_state',parallelism='[seq]', cray_inline=True)
+
+        type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
+        integer, intent(in)                                 :: x, y, z
+        real(wp), intent(out)                                :: rho_g_stored, alpha_g, rho_g_intrinsic
+        real(wp), dimension(num_species), intent(out)        :: Ys
+        real(wp), intent(out)                                :: rhoY_sum, sumY
+        real(wp), intent(out)                                :: species_closure_error, species_closure_relerr
+        real(wp), intent(out)                                :: gas_pressure, gas_temperature
+        logical, intent(out)                                 :: active_gas
+        integer                                              :: eqn
+        real(wp)                                             :: p2, p3, mix_mol_weight
+        logical                                              :: active_phase_2, active_phase_3
+
+        rho_g_stored = q_cons_vf(eqn_idx%cont%beg + 1)%sf(x, y, z) + q_cons_vf(eqn_idx%cont%beg + 2)%sf(x, y, z)
+        alpha_g = q_cons_vf(eqn_idx%adv%beg + 1)%sf(x, y, z) + q_cons_vf(eqn_idx%adv%beg + 2)%sf(x, y, z)
+
+        rho_g_intrinsic = 0._wp
+        rhoY_sum = 0._wp
+        sumY = 0._wp
+        species_closure_error = 0._wp
+        species_closure_relerr = 0._wp
+        gas_pressure = 0._wp
+        gas_temperature = 0._wp
+        Ys(:) = 0._wp
+
+        active_gas = (alpha_g > sgm_eps) .and. (rho_g_stored > sgm_eps)
+        if (.not. active_gas) return
+
+        rho_g_intrinsic = rho_g_stored/alpha_g
+
+        $:GPU_LOOP(parallelism='[seq]')
+        do eqn = 1, num_species
+            rhoY_sum = rhoY_sum + q_cons_vf(eqn_idx%species%beg + eqn - 1)%sf(x, y, z)
+            Ys(eqn) = q_cons_vf(eqn_idx%species%beg + eqn - 1)%sf(x, y, z)/rho_g_stored
+            sumY = sumY + Ys(eqn)
+        end do
+
+        species_closure_error = rhoY_sum - rho_g_stored
+        species_closure_relerr = species_closure_error/max(rho_g_stored, sgm_eps)
+
+        call s_get_model3_phase_pressure(q_cons_vf, 2, x, y, z, p2, active_phase_2)
+        call s_get_model3_phase_pressure(q_cons_vf, 3, x, y, z, p3, active_phase_3)
+        gas_pressure = (q_cons_vf(eqn_idx%adv%beg + 1)%sf(x, y, z)*p2 + q_cons_vf(eqn_idx%adv%beg + 2)%sf(x, y, z)*p3)/alpha_g
+
+        call get_mixture_molecular_weight(Ys, mix_mol_weight)
+        gas_temperature = gas_pressure*mix_mol_weight/(gas_constant*rho_g_intrinsic)
+
+    end subroutine s_get_model3_chemistry_gas_state
 
     !> Compute mixture viscosities for left and right states and invert them for use as reciprocal Reynolds numbers.
     subroutine compute_viscosity_and_inversion(T_L, Ys_L, T_R, Ys_R, Re_L, Re_R)

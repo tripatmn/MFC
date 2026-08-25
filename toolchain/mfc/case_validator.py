@@ -1762,6 +1762,8 @@ class CaseValidator:
         chemistry = self.get("chemistry", "F") == "T"
         diffusion = self.get("chem_params%diffusion", "F") == "T"
         num_fluids = self.get("num_fluids")
+        model_eqns = self.get("model_eqns")
+        model3_chemistry_coupling = self.get("model3_chemistry_coupling", "F") == "T"
 
         # Chemistry assumes a single reacting gas phase: the temperature/pressure
         # inversion recovers T from the total internal energy via Cantera's ideal-gas
@@ -1769,7 +1771,10 @@ class CaseValidator:
         # densities onto the species-summed total density. Both are only correct for
         # num_fluids = 1; with a second (e.g. stiffened-gas) fluid the state is
         # inconsistent and the simulation NaNs. See MFlowCode/MFC#1470.
-        self.prohibit(chemistry and num_fluids is not None and num_fluids != 1, "chemistry is only supported for single-component flows (num_fluids = 1)")
+        self.prohibit(
+            chemistry and num_fluids is not None and num_fluids != 1 and not model3_chemistry_coupling,
+            "chemistry is only supported for single-component flows (num_fluids = 1) unless model3_chemistry_coupling = T",
+        )
 
         # Chemistry with Euler bubbles is not currently supported: the IBM image-point
         # interpolation branch selects the bubbles/QBMM path before the chemistry path, so
@@ -1784,8 +1789,10 @@ class CaseValidator:
         # unset value is treated as 0 here to match.
         igr = self.get("igr", "F") == "T"
         adap_substeps = self.get("chem_params%adap_substeps", "F") == "T"
+        reactions = self.get("chem_params%reactions", "F") == "T"
         reaction_substeps = self.get("chem_params%reaction_substeps", 0) or 0
         reaction_substeps_max = self.get("chem_params%reaction_substeps_max", 0) or 0
+        fuel_species_id = self.get("fuel_species_id")
 
         self.prohibit(
             chemistry and reaction_substeps < 0,
@@ -1802,6 +1809,34 @@ class CaseValidator:
         self.prohibit(
             chemistry and adap_substeps and reaction_substeps_max < reaction_substeps,
             "chem_params%reaction_substeps_max must be >= reaction_substeps when adap_substeps = T",
+        )
+        self.prohibit(
+            model3_chemistry_coupling and not chemistry,
+            "model3_chemistry_coupling requires chemistry = T",
+        )
+        self.prohibit(
+            model3_chemistry_coupling and model_eqns != 3,
+            "model3_chemistry_coupling requires Model 3 / six-equation formulation (model_eqns = 3)",
+        )
+        self.prohibit(
+            model3_chemistry_coupling and (num_fluids is None or num_fluids < 3),
+            "model3_chemistry_coupling requires num_fluids >= 3: fluid 1 liquid fuel, fluid 2 fuel vapor, fluid 3 oxidizer/ambient gas",
+        )
+        self.prohibit(
+            model3_chemistry_coupling and not reactions,
+            "model3_chemistry_coupling requires chem_params%reactions = T",
+        )
+        self.prohibit(
+            model3_chemistry_coupling and reaction_substeps <= 0,
+            "model3_chemistry_coupling requires chem_params%reaction_substeps > 0; coupled explicit chemistry is not implemented",
+        )
+        self.prohibit(
+            model3_chemistry_coupling and diffusion,
+            "model3_chemistry_coupling does not support chem_params%diffusion = T in Stage 1; Model-3 reacting diffusion is planned but not yet implemented",
+        )
+        self.prohibit(
+            model3_chemistry_coupling and (fuel_species_id is None or fuel_species_id < 1),
+            "model3_chemistry_coupling requires fuel_species_id >= 1",
         )
 
         # Define what constitutes a wall (-15 for slip, -16 for no-slip)

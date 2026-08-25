@@ -107,6 +107,8 @@ DESCRIPTIONS = {
     "hll_u_interface": "HLL Method 2 (u-interface) selector",
     "surface_tension": "Enable surface tension effects",
     "chemistry": "Enable chemical reactions",
+    "model3_chemistry_coupling": "Enable fixed-layout Model-3 vaporizing-fuel chemistry coupling",
+    "fuel_species_id": "Fuel species index for Model-3 vaporized fuel coupling",
     "reactive_burn": "Enable condensed-phase reactive burn (programmed pressure burn on the multi-fluid model)",
     "mhd": "Enable magnetohydrodynamics",
     "hyper_cleaning": "Enable hyperbolic divergence cleaning for MHD",
