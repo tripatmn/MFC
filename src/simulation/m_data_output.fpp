@@ -1154,6 +1154,11 @@ contains
         real(wp)                        :: nondim_time       !< Non-dimensional time
         real(wp)                        :: tmp               !< Temporary variable to store quantity for mpi_allreduce
         real(wp)                        :: rhoYks(1:num_species)
+        real(wp)                        :: Ys(1:num_species)
+        real(wp)                        :: rho_g_stored, alpha_g, rho_g_intrinsic, rhoY_sum, sumY
+        real(wp)                        :: species_closure_error, species_closure_relerr, gas_pressure, gas_temperature
+        real(wp)                        :: liquid_pressure
+        logical                         :: active_gas, active_liquid
 
         T = dflt_T_guess
 
@@ -1226,7 +1231,18 @@ contains
 
                     dyn_p = 0.5_wp*rho*dot_product(vel, vel)
 
-                    if (hypoelasticity) then
+                    if (chemistry .and. model3_chemistry_coupling) then
+                        call s_get_model3_chemistry_gas_state(q_cons_vf, j - 2, k, l, rho_g_stored, alpha_g, rho_g_intrinsic, &
+                                                              & Ys, rhoY_sum, sumY, species_closure_error, species_closure_relerr, &
+                                                              & gas_pressure, gas_temperature, active_gas)
+                        if (active_gas) then
+                            pres = gas_pressure
+                            T = gas_temperature
+                        else
+                            call s_get_model3_phase_pressure(q_cons_vf, 1, j - 2, k, l, liquid_pressure, active_liquid)
+                            pres = liquid_pressure
+                        end if
+                    else if (hypoelasticity) then
                         if (cont_damage) then
                             damage_state = q_cons_vf(eqn_idx%damage)%sf(j - 2, k, l)
                             G_local = G_local*max((1._wp - damage_state), 0._wp)
@@ -1332,7 +1348,18 @@ contains
 
                         dyn_p = 0.5_wp*rho*dot_product(vel, vel)
 
-                        if (hypoelasticity) then
+                        if (chemistry .and. model3_chemistry_coupling) then
+                            call s_get_model3_chemistry_gas_state(q_cons_vf, j - 2, k - 2, l, rho_g_stored, alpha_g, &
+                                                                  & rho_g_intrinsic, Ys, rhoY_sum, sumY, species_closure_error, &
+                                                                  & species_closure_relerr, gas_pressure, gas_temperature, active_gas)
+                            if (active_gas) then
+                                pres = gas_pressure
+                                T = gas_temperature
+                            else
+                                call s_get_model3_phase_pressure(q_cons_vf, 1, j - 2, k - 2, l, liquid_pressure, active_liquid)
+                                pres = liquid_pressure
+                            end if
+                        else if (hypoelasticity) then
                             if (cont_damage) then
                                 damage_state = q_cons_vf(eqn_idx%damage)%sf(j - 2, k - 2, l)
                                 G_local = G_local*max((1._wp - damage_state), 0._wp)
@@ -1421,7 +1448,20 @@ contains
                                 end do
                             end if
 
-                            if (hypoelasticity) then
+                            if (chemistry .and. model3_chemistry_coupling) then
+                                call s_get_model3_chemistry_gas_state(q_cons_vf, j - 2, k - 2, l - 2, rho_g_stored, alpha_g, &
+                                                                      & rho_g_intrinsic, Ys, rhoY_sum, sumY, species_closure_error, &
+                                                                      & species_closure_relerr, gas_pressure, gas_temperature, &
+                                                                      & active_gas)
+                                if (active_gas) then
+                                    pres = gas_pressure
+                                    T = gas_temperature
+                                else
+                                    call s_get_model3_phase_pressure(q_cons_vf, 1, j - 2, k - 2, l - 2, liquid_pressure, &
+                                                                     & active_liquid)
+                                    pres = liquid_pressure
+                                end if
+                            else if (hypoelasticity) then
                                 if (cont_damage) then
                                     damage_state = q_cons_vf(eqn_idx%damage)%sf(j - 2, k - 2, l - 2)
                                     G_local = G_local*max((1._wp - damage_state), 0._wp)

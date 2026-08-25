@@ -579,7 +579,8 @@ contains
 
         ! Operator-split reaction: integrate the stiff chemistry ODE per cell after the flow update,
         ! with sub-stepping, instead of adding the reaction source to the flow RHS (chem_params%reaction_substeps > 0).
-        if (chemistry .and. chem_params%reactions .and. chem_params%reaction_substeps > 0) then
+        if (chemistry .and. chem_params%reactions .and. chem_params%reaction_substeps > 0 .and. &
+            & (.not. model3_chemistry_coupling)) then
             call nvtxStartRange("CHEM-REACTION-SUBSTEP")
             call s_chemistry_reaction_substep(q_cons_ts(1)%vf, q_T_sf, dt, idwint)
             call nvtxEndRange

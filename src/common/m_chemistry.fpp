@@ -17,6 +17,7 @@ module m_chemistry
 
     use m_global_parameters
     use m_constants, only: sgm_eps
+    use m_variables_conversion, only: s_get_model3_chemistry_gas_state
 
     implicit none
 
@@ -26,86 +27,6 @@ module m_chemistry
     $:GPU_DECLARE(create='[offsets]')
 
 contains
-
-    !> Recover one six-equation Model-3 phase pressure from its pressure-form internal-energy equation.
-    subroutine s_get_model3_phase_pressure(q_cons_vf, fluid_id, x, y, z, phase_pressure, active_phase)
-
-        $:GPU_ROUTINE(function_name='s_get_model3_phase_pressure',parallelism='[seq]', cray_inline=True)
-
-        type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
-        integer, intent(in)                                 :: fluid_id, x, y, z
-        real(wp), intent(out)                                :: phase_pressure
-        logical, intent(out)                                 :: active_phase
-        real(wp)                                             :: alpha_k, alpha_rho_k, int_en_k
-
-        alpha_k = q_cons_vf(eqn_idx%adv%beg + fluid_id - 1)%sf(x, y, z)
-        alpha_rho_k = q_cons_vf(eqn_idx%cont%beg + fluid_id - 1)%sf(x, y, z)
-        int_en_k = q_cons_vf(eqn_idx%int_en%beg + fluid_id - 1)%sf(x, y, z)
-
-        active_phase = alpha_k > sgm_eps
-        if (active_phase) then
-            phase_pressure = ((int_en_k - alpha_rho_k*qvs(fluid_id))/alpha_k - pi_infs(fluid_id))/gammas(fluid_id)
-        else
-            phase_pressure = 0._wp
-        end if
-
-    end subroutine s_get_model3_phase_pressure
-
-    !> Extract the fixed thesis-layout Model-3 gas chemistry state without repairing conserved species.
-    !! Fluid 2 is fuel vapor, fluid 3 is oxidizer/ambient gas, and species rhoY is stored against their combined gas mass.
-    subroutine s_get_model3_chemistry_gas_state(q_cons_vf, x, y, z, rho_g_stored, alpha_g, rho_g_intrinsic, Ys, rhoY_sum, sumY, &
-                                                & species_closure_error, species_closure_relerr, gas_pressure, gas_temperature, &
-                                                & active_gas)
-
-        $:GPU_ROUTINE(function_name='s_get_model3_chemistry_gas_state',parallelism='[seq]', cray_inline=True)
-
-        type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
-        integer, intent(in)                                 :: x, y, z
-        real(wp), intent(out)                                :: rho_g_stored, alpha_g, rho_g_intrinsic
-        real(wp), dimension(num_species), intent(out)        :: Ys
-        real(wp), intent(out)                                :: rhoY_sum, sumY
-        real(wp), intent(out)                                :: species_closure_error, species_closure_relerr
-        real(wp), intent(out)                                :: gas_pressure, gas_temperature
-        logical, intent(out)                                 :: active_gas
-        integer                                              :: eqn
-        real(wp)                                             :: p2, p3, mix_mol_weight
-        logical                                              :: active_phase_2, active_phase_3
-
-        rho_g_stored = q_cons_vf(eqn_idx%cont%beg + 1)%sf(x, y, z) + q_cons_vf(eqn_idx%cont%beg + 2)%sf(x, y, z)
-        alpha_g = q_cons_vf(eqn_idx%adv%beg + 1)%sf(x, y, z) + q_cons_vf(eqn_idx%adv%beg + 2)%sf(x, y, z)
-
-        rho_g_intrinsic = 0._wp
-        rhoY_sum = 0._wp
-        sumY = 0._wp
-        species_closure_error = 0._wp
-        species_closure_relerr = 0._wp
-        gas_pressure = 0._wp
-        gas_temperature = 0._wp
-        Ys(:) = 0._wp
-
-        active_gas = (alpha_g > sgm_eps) .and. (rho_g_stored > sgm_eps)
-        if (.not. active_gas) return
-
-        rho_g_intrinsic = rho_g_stored/alpha_g
-
-        $:GPU_LOOP(parallelism='[seq]')
-        do eqn = 1, num_species
-            rhoY_sum = rhoY_sum + q_cons_vf(eqn_idx%species%beg + eqn - 1)%sf(x, y, z)
-            Ys(eqn) = q_cons_vf(eqn_idx%species%beg + eqn - 1)%sf(x, y, z)/rho_g_stored
-            sumY = sumY + Ys(eqn)
-        end do
-
-        species_closure_error = rhoY_sum - rho_g_stored
-        species_closure_relerr = species_closure_error/max(rho_g_stored, sgm_eps)
-
-        call s_get_model3_phase_pressure(q_cons_vf, 2, x, y, z, p2, active_phase_2)
-        call s_get_model3_phase_pressure(q_cons_vf, 3, x, y, z, p3, active_phase_3)
-        gas_pressure = (q_cons_vf(eqn_idx%adv%beg + 1)%sf(x, y, z)*p2 + q_cons_vf(eqn_idx%adv%beg + 2)%sf(x, y, z)*p3)/alpha_g
-
-        call get_mixture_molecular_weight(Ys, mix_mol_weight)
-        gas_temperature = gas_pressure*mix_mol_weight/(gas_constant*rho_g_intrinsic)
-
-    end subroutine s_get_model3_chemistry_gas_state
 
     !> Compute mixture viscosities for left and right states and invert them for use as reciprocal Reynolds numbers.
     subroutine compute_viscosity_and_inversion(T_L, Ys_L, T_R, Ys_R, Re_L, Re_R)
@@ -134,11 +55,22 @@ contains
         type(int_bounds_info), dimension(1:3), intent(in)   :: bounds
         integer                                             :: x, y, z, eqn
         real(wp)                                            :: energy, T_in
+        real(wp)                                            :: rho_g_stored, alpha_g, rho_g_intrinsic, rhoY_sum, sumY
+        real(wp)                                            :: species_closure_error, species_closure_relerr, gas_pressure, gas_temperature
         real(wp), dimension(num_species)                    :: Ys
+        logical                                             :: active_gas
 
         do z = bounds(3)%beg, bounds(3)%end
             do y = bounds(2)%beg, bounds(2)%end
                 do x = bounds(1)%beg, bounds(1)%end
+                    if (model3_chemistry_coupling) then
+                        call s_get_model3_chemistry_gas_state(q_cons_vf, x, y, z, rho_g_stored, alpha_g, rho_g_intrinsic, Ys, &
+                                                              & rhoY_sum, sumY, species_closure_error, species_closure_relerr, &
+                                                              & gas_pressure, gas_temperature, active_gas)
+                        if (active_gas) q_T_sf%sf(x, y, z) = gas_temperature
+                        cycle
+                    end if
+
                     do eqn = eqn_idx%species%beg, eqn_idx%species%end
                         Ys(eqn - eqn_idx%species%beg + 1) = q_cons_vf(eqn)%sf(x, y, z)/q_cons_vf(eqn_idx%cont%beg)%sf(x, y, z)
                     end do
@@ -168,6 +100,8 @@ contains
         integer                                             :: x, y, z, i
         real(wp), dimension(num_species)                    :: Ys
         real(wp)                                            :: mix_mol_weight
+        real(wp)                                            :: rho_g_stored, alpha_g, rho_g_intrinsic
+        logical                                             :: active_gas
 
         do z = bounds(3)%beg, bounds(3)%end
             do y = bounds(2)%beg, bounds(2)%end
@@ -177,7 +111,18 @@ contains
                     end do
 
                     call get_mixture_molecular_weight(Ys, mix_mol_weight)
-                    q_T_sf%sf(x, y, z) = q_prim_vf(eqn_idx%E)%sf(x, y, z)*mix_mol_weight/(gas_constant*q_prim_vf(1)%sf(x, y, z))
+                    if (model3_chemistry_coupling) then
+                        rho_g_stored = q_prim_vf(eqn_idx%cont%beg + 1)%sf(x, y, z) + &
+                                     & q_prim_vf(eqn_idx%cont%beg + 2)%sf(x, y, z)
+                        alpha_g = q_prim_vf(eqn_idx%adv%beg + 1)%sf(x, y, z) + q_prim_vf(eqn_idx%adv%beg + 2)%sf(x, y, z)
+                        active_gas = (alpha_g > sgm_eps) .and. (rho_g_stored > sgm_eps)
+                        if (active_gas) then
+                            rho_g_intrinsic = rho_g_stored/alpha_g
+                            q_T_sf%sf(x, y, z) = q_prim_vf(eqn_idx%E)%sf(x, y, z)*mix_mol_weight/(gas_constant*rho_g_intrinsic)
+                        end if
+                    else
+                        q_T_sf%sf(x, y, z) = q_prim_vf(eqn_idx%E)%sf(x, y, z)*mix_mol_weight/(gas_constant*q_prim_vf(1)%sf(x, y, z))
+                    end if
                 end do
             end do
         end do
@@ -247,9 +192,14 @@ contains
         type(int_bounds_info), dimension(1:3), intent(in)      :: bounds
         integer                                                :: x, y, z, eqn, s, nsub
         real(wp)                                               :: rho, energy, T, T_new, dt_sub, Ysum
+        real(wp)                                               :: rho_g_stored, alpha_g, rho_g_intrinsic, rhoY_sum, sumY
+        real(wp)                                               :: species_closure_error, species_closure_relerr, gas_pressure
+        real(wp)                                               :: mix_mol_weight, p_new, alpha_2, alpha_3, alpha_rho_2, alpha_rho_3
+        real(wp)                                               :: int_en_2_new, int_en_3_new, int_g_old, int_g_new
         real(wp)                                               :: r, r2, wr, loss_i, prod_p, loss_p, Lbar, pbar
         real(wp)                                               :: stiff_max, cell_stiff
         real(wp), parameter                                    :: y_floor = 1.e-16_wp
+        logical                                                :: active_gas
         ! stiff_target: fractional net composition change per sub-step targeted when sizing the adaptive
         ! nsub. An uncalibrated engineering default -- alpha-QSS is unconditionally stable, so it trades
         ! accuracy for cost (never stability), and the cost is bounded by reaction_substeps_max.
@@ -265,28 +215,38 @@ contains
             ! Pass 1: per-rank local stiffness probe -> adapt nsub for this step, no MPI. Each rank
             ! sizes its own work from the largest fractional net species change any of its cells sees.
             stiff_max = 0._wp
-            $:GPU_PARALLEL_LOOP(collapse=3, private='[Ys, cdot, eqn, rho, T, T_new, energy, wr, cell_stiff]', &
+            $:GPU_PARALLEL_LOOP(collapse=3, private='[Ys, cdot, eqn, rho, T, T_new, energy, wr, cell_stiff, rho_g_stored, &
+                                & alpha_g, rho_g_intrinsic, rhoY_sum, sumY, species_closure_error, species_closure_relerr, &
+                                & gas_pressure, active_gas]', &
                                 & reduction='[[stiff_max]]', reductionOp='[MAX]', copyin='[bounds, dtime]')
             do z = bounds(3)%beg, bounds(3)%end
                 do y = bounds(2)%beg, bounds(2)%end
                     do x = bounds(1)%beg, bounds(1)%end
-                        rho = q_cons_vf(eqn_idx%cont%beg)%sf(x, y, z)
-                        $:GPU_LOOP(parallelism='[seq]')
-                        do eqn = eqn_idx%species%beg, eqn_idx%species%end
-                            Ys(eqn - eqn_idx%species%beg + 1) = q_cons_vf(eqn)%sf(x, y, z)/rho
-                        end do
-                        ! q_T_sf still holds the pre-update RK-stage temperature; re-solve T from the fresh
-                        ! post-advection internal energy so a just-shock-heated cell is probed at its true
-                        ! (hot) temperature. Otherwise the stiffness is under-read and nsub under-sizes
-                        ! exactly at an ignition front.
-                        energy = q_cons_vf(eqn_idx%E)%sf(x, y, z)/rho
-                        $:GPU_LOOP(parallelism='[seq]')
-                        do eqn = eqn_idx%mom%beg, eqn_idx%mom%end
-                            energy = energy - 0.5_wp*(q_cons_vf(eqn)%sf(x, y, z)/rho)**2
-                        end do
-                        T = q_T_sf%sf(x, y, z)
-                        call get_temperature(energy, T, Ys, .true., T_new)
-                        T = T_new
+                        if (model3_chemistry_coupling) then
+                            call s_get_model3_chemistry_gas_state(q_cons_vf, x, y, z, rho_g_stored, alpha_g, rho_g_intrinsic, &
+                                                                  & Ys, rhoY_sum, sumY, species_closure_error, &
+                                                                  & species_closure_relerr, gas_pressure, T, active_gas)
+                            if (.not. active_gas) cycle
+                            rho = rho_g_intrinsic
+                        else
+                            rho = q_cons_vf(eqn_idx%cont%beg)%sf(x, y, z)
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do eqn = eqn_idx%species%beg, eqn_idx%species%end
+                                Ys(eqn - eqn_idx%species%beg + 1) = q_cons_vf(eqn)%sf(x, y, z)/rho
+                            end do
+                            ! q_T_sf still holds the pre-update RK-stage temperature; re-solve T from the fresh
+                            ! post-advection internal energy so a just-shock-heated cell is probed at its true
+                            ! (hot) temperature. Otherwise the stiffness is under-read and nsub under-sizes
+                            ! exactly at an ignition front.
+                            energy = q_cons_vf(eqn_idx%E)%sf(x, y, z)/rho
+                            $:GPU_LOOP(parallelism='[seq]')
+                            do eqn = eqn_idx%mom%beg, eqn_idx%mom%end
+                                energy = energy - 0.5_wp*(q_cons_vf(eqn)%sf(x, y, z)/rho)**2
+                            end do
+                            T = q_T_sf%sf(x, y, z)
+                            call get_temperature(energy, T, Ys, .true., T_new)
+                            T = T_new
+                        end if
                         ! Net rate (creation - destruction) on purpose: nsub sizes the accuracy of the
                         ! composition trajectory, which is set by how fast Ys actually moves, not by the
                         ! raw forward/reverse magnitudes. In fast partial equilibrium the net is ~0 and the
@@ -312,29 +272,41 @@ contains
         dt_sub = dtime/real(nsub, wp)
 
         $:GPU_PARALLEL_LOOP(collapse=3, private='[Ys, cdot, ddot, y0, prod0, Lloss, alp, eqn, s, rho, energy, T, T_new, Ysum, r, &
-                            & r2, wr, loss_i, prod_p, loss_p, Lbar, pbar]', copyin='[bounds, dt_sub, nsub]')
+                            & r2, wr, loss_i, prod_p, loss_p, Lbar, pbar, rho_g_stored, alpha_g, rho_g_intrinsic, rhoY_sum, &
+                            & sumY, species_closure_error, species_closure_relerr, gas_pressure, mix_mol_weight, p_new, alpha_2, &
+                            & alpha_3, alpha_rho_2, alpha_rho_3, int_en_2_new, int_en_3_new, int_g_old, int_g_new, active_gas]', &
+                            & copyin='[bounds, dt_sub, nsub]')
         do z = bounds(3)%beg, bounds(3)%end
             do y = bounds(2)%beg, bounds(2)%end
                 do x = bounds(1)%beg, bounds(1)%end
-                    rho = q_cons_vf(eqn_idx%cont%beg)%sf(x, y, z)
+                    if (model3_chemistry_coupling) then
+                        call s_get_model3_chemistry_gas_state(q_cons_vf, x, y, z, rho_g_stored, alpha_g, rho_g_intrinsic, Ys, &
+                                                              & rhoY_sum, sumY, species_closure_error, species_closure_relerr, &
+                                                              & gas_pressure, T, active_gas)
+                        if (.not. active_gas) cycle
+                        rho = rho_g_intrinsic
+                        call get_mixture_energy_mass(T, Ys, energy)
+                    else
+                        rho = q_cons_vf(eqn_idx%cont%beg)%sf(x, y, z)
 
-                    $:GPU_LOOP(parallelism='[seq]')
-                    do eqn = eqn_idx%species%beg, eqn_idx%species%end
-                        Ys(eqn - eqn_idx%species%beg + 1) = q_cons_vf(eqn)%sf(x, y, z)/rho
-                    end do
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = eqn_idx%species%beg, eqn_idx%species%end
+                            Ys(eqn - eqn_idx%species%beg + 1) = q_cons_vf(eqn)%sf(x, y, z)/rho
+                        end do
 
-                    ! internal energy per mass, held fixed through the reactor sub-steps
-                    energy = q_cons_vf(eqn_idx%E)%sf(x, y, z)/rho
-                    $:GPU_LOOP(parallelism='[seq]')
-                    do eqn = eqn_idx%mom%beg, eqn_idx%mom%end
-                        energy = energy - 0.5_wp*(q_cons_vf(eqn)%sf(x, y, z)/rho)**2
-                    end do
+                        ! internal energy per mass, held fixed through the reactor sub-steps
+                        energy = q_cons_vf(eqn_idx%E)%sf(x, y, z)/rho
+                        $:GPU_LOOP(parallelism='[seq]')
+                        do eqn = eqn_idx%mom%beg, eqn_idx%mom%end
+                            energy = energy - 0.5_wp*(q_cons_vf(eqn)%sf(x, y, z)/rho)**2
+                        end do
 
-                    ! re-solve T from the fresh internal energy so the first predictor sub-step starts
-                    ! from the post-advection state (q_T_sf holds the pre-update RK-stage temperature).
-                    T = q_T_sf%sf(x, y, z)
-                    call get_temperature(energy, T, Ys, .true., T_new)
-                    T = T_new
+                        ! re-solve T from the fresh internal energy so the first predictor sub-step starts
+                        ! from the post-advection state (q_T_sf holds the pre-update RK-stage temperature).
+                        T = q_T_sf%sf(x, y, z)
+                        call get_temperature(energy, T, Ys, .true., T_new)
+                        T = T_new
+                    end if
 
                     do s = 1, nsub
                         ! predictor: rates at the start of the sub-step (one fused pass fills both)
@@ -386,9 +358,33 @@ contains
                         T = T_new
                     end do
 
+                    if (model3_chemistry_coupling) then
+                        call get_mixture_molecular_weight(Ys, mix_mol_weight)
+                        p_new = rho_g_intrinsic*gas_constant*T/mix_mol_weight
+
+                        alpha_2 = q_cons_vf(eqn_idx%adv%beg + 1)%sf(x, y, z)
+                        alpha_3 = q_cons_vf(eqn_idx%adv%beg + 2)%sf(x, y, z)
+                        alpha_rho_2 = q_cons_vf(eqn_idx%cont%beg + 1)%sf(x, y, z)
+                        alpha_rho_3 = q_cons_vf(eqn_idx%cont%beg + 2)%sf(x, y, z)
+
+                        int_g_old = q_cons_vf(eqn_idx%int_en%beg + 1)%sf(x, y, z) + &
+                                  & q_cons_vf(eqn_idx%int_en%beg + 2)%sf(x, y, z)
+                        int_en_2_new = alpha_2*(gammas(2)*p_new + pi_infs(2)) + alpha_rho_2*qvs(2)
+                        int_en_3_new = alpha_3*(gammas(3)*p_new + pi_infs(3)) + alpha_rho_3*qvs(3)
+                        int_g_new = int_en_2_new + int_en_3_new
+
+                        q_cons_vf(eqn_idx%int_en%beg + 1)%sf(x, y, z) = int_en_2_new
+                        q_cons_vf(eqn_idx%int_en%beg + 2)%sf(x, y, z) = int_en_3_new
+                        q_cons_vf(eqn_idx%E)%sf(x, y, z) = q_cons_vf(eqn_idx%E)%sf(x, y, z) + int_g_new - int_g_old
+                    end if
+
                     $:GPU_LOOP(parallelism='[seq]')
                     do eqn = eqn_idx%species%beg, eqn_idx%species%end
-                        q_cons_vf(eqn)%sf(x, y, z) = rho*Ys(eqn - eqn_idx%species%beg + 1)
+                        if (model3_chemistry_coupling) then
+                            q_cons_vf(eqn)%sf(x, y, z) = rho_g_stored*Ys(eqn - eqn_idx%species%beg + 1)
+                        else
+                            q_cons_vf(eqn)%sf(x, y, z) = rho*Ys(eqn - eqn_idx%species%beg + 1)
+                        end if
                     end do
                     q_T_sf%sf(x, y, z) = T
                 end do

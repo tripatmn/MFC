@@ -639,6 +639,13 @@ contains
             if (model3_chemistry_coupling) call s_apply_model3_vapor_delta_to_fuel_species(q_cons_ts(1)%vf)
         end if
 
+        if (model3_chemistry_coupling .and. chemistry .and. chem_params%reactions .and. &
+            & chem_params%reaction_substeps > 0) then
+            call nvtxStartRange("CHEM-REACTION-SUBSTEP")
+            call s_chemistry_reaction_substep(q_cons_ts(1)%vf, q_T_sf, dt, idwint)
+            call nvtxEndRange
+        end if
+
         ! Time-stepping loop controls
         t_step = t_step + 1
 
@@ -898,7 +905,9 @@ contains
         if (n > 0) dy_min = minval(dy)
         if (p > 0) dz_min = minval(dz)
 
-        if (model_eqns == model_eqns_6eq) call s_initialize_internal_energy_equations(q_cons_ts(1)%vf)
+        if (model_eqns == model_eqns_6eq .and. (.not. model3_chemistry_coupling)) then
+            call s_initialize_internal_energy_equations(q_cons_ts(1)%vf)
+        end if
         if (ib) then
             block
                 type(ib_patch_parameters), allocatable :: particle_cloud_ibs(:)
