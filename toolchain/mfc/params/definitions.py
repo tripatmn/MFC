@@ -1328,7 +1328,7 @@ _nv(
     "patch_ib",
     "pi_fac",
 )
-_nv(_PRE_SIM, "model3_chemistry_coupling", "fuel_species_id")
+_nv(_ALL, "model3_chemistry_coupling", "fuel_species_id")
 _nv(_PRE_POST, "num_fluids", "weno_order", "recon_type", "muscl_order", "mhd", "nb", "igr", "igr_order", "sigR")
 _nv(_ALL, "reactive_burn", "rburn")
 _nv(_PRE_SIM, "ib_airfoil")
