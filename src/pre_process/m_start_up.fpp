@@ -557,6 +557,7 @@ contains
             end if
 
             call s_infinite_relaxation_k(ic%q_cons_vf)
+            if (model3_chemistry_coupling) call s_apply_model3_vapor_delta_to_fuel_species(ic%q_cons_vf)
         end if
 
         if (chemistry) then

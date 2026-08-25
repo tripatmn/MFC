@@ -15,6 +15,7 @@ CHEMISTRY_SRC = REPO_ROOT / "src" / "common" / "m_chemistry.fpp"
 VARIABLES_CONVERSION_SRC = REPO_ROOT / "src" / "common" / "m_variables_conversion.fpp"
 PHASE_CHANGE_SRC = REPO_ROOT / "src" / "common" / "m_phase_change.fpp"
 SIM_START_UP_SRC = REPO_ROOT / "src" / "simulation" / "m_start_up.fpp"
+PRE_START_UP_SRC = REPO_ROOT / "src" / "pre_process" / "m_start_up.fpp"
 TIME_STEPPERS_SRC = REPO_ROOT / "src" / "simulation" / "m_time_steppers.fpp"
 DATA_OUTPUT_SRC = REPO_ROOT / "src" / "simulation" / "m_data_output.fpp"
 HLLC_SRC = REPO_ROOT / "src" / "simulation" / "m_riemann_solver_hllc.fpp"
@@ -275,6 +276,13 @@ class TestModel3PhaseChangeVaporDelta(unittest.TestCase):
             "if(model3_chemistry_coupling)calls_apply_model3_vapor_delta_to_fuel_species(q_cons_ts(1)%vf)",
             startup_text,
         )
+
+    def test_preprocess_applies_vapor_delta_after_initial_relaxation(self):
+        text = _compact_fortran(PRE_START_UP_SRC)
+        relaxation = text.index("calls_infinite_relaxation_k(ic%q_cons_vf)")
+        insertion = text.index("if(model3_chemistry_coupling)calls_apply_model3_vapor_delta_to_fuel_species(ic%q_cons_vf)")
+
+        self.assertLess(relaxation, insertion)
 
 
 class TestModel3AqssOrdering(unittest.TestCase):
