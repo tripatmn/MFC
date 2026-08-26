@@ -40,7 +40,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--p2-p3-abs-tol", type=float, default=1.0e-1)
     parser.add_argument("--evolution-tol", type=float, default=1.0e-8)
     parser.add_argument("--chem-activity-tol", type=float, default=1.0e-12)
-    parser.add_argument("--temperature-rise-tol", type=float, default=1.0e-6)
     return parser.parse_args()
 
 
@@ -130,7 +129,7 @@ def main() -> int:
     mv0 = v7.fsum(first["arho"][1]) * first["measure"]
     mf0 = species_integral(first, species_by_var, fuel_name)
     mo20 = species_integral(first, species_by_var, "O2")
-    initial_temperature_min = min_finite(first["temperature"])
+    initial_global_tmax = max_finite(first["temperature"])
 
     rows: List[Dict[str, object]] = []
     max_abs_closure = 0.0
@@ -198,7 +197,7 @@ def main() -> int:
             "delta_M_liquid": f"{ml - ml0:.17e}",
             "delta_M_vapor_fluid": f"{mv - mv0:.17e}",
             f"delta_M_{fuel_name}": f"{mf - mf0:.17e}",
-            "delta_M_O2": f"{mo2 - mo20:.17e}",
+            "global_delta_M_O2": f"{mo2 - mo20:.17e}",
             "fuel_consumption_vs_nonreacting_delta": f"{(mv - mv0) - (mf - mf0):.17e}",
             "max_abs_closure_error": f"{max_abs:.17e}",
             "max_rel_closure_error": f"{max_rel:.17e}",
@@ -238,11 +237,10 @@ def main() -> int:
         product_increases[name] = final_value - initial if math.isfinite(initial) and math.isfinite(final_value) else math.nan
 
     fuel_consumption_indicator = dmv - dmf
-    chemistry_activity_sources = [fuel_consumption_indicator, -dmo2, *product_increases.values()]
+    chemistry_activity_sources = [fuel_consumption_indicator, *product_increases.values()]
     chemistry_active = any(math.isfinite(value) and value > args.chem_activity_tol for value in chemistry_activity_sources)
     phase_change_active = dmv > args.chem_activity_tol and -dml > args.chem_activity_tol
-    temperature_rise = max_t - initial_temperature_min
-    temperature_signal = math.isfinite(temperature_rise) and temperature_rise > args.temperature_rise_tol
+    delta_global_tmax = max_t - initial_global_tmax
 
     profile_changes = {
         "liquid_arho": v7.max_abs_delta(final["arho"][0], first["arho"][0]),
@@ -270,8 +268,7 @@ def main() -> int:
         ),
         ("shock_droplet_evolution", shock_drop_evolved, f"{max(profile_changes.values()):.6e}", f"> {args.evolution_tol:.1e}"),
         ("phase_change_active", phase_change_active, f"dMv={dmv:.6e}, -dMl={-dml:.6e}", f"> {args.chem_activity_tol:.1e}"),
-        ("chemistry_active", chemistry_active, f"fuel_deficit={fuel_consumption_indicator:.6e}, -dO2={-dmo2:.6e}", f"> {args.chem_activity_tol:.1e}"),
-        ("temperature_signal", temperature_signal, f"{temperature_rise:.6e} K", f"> {args.temperature_rise_tol:.1e} K"),
+        ("chemistry_active", chemistry_active, f"fuel_deficit={fuel_consumption_indicator:.6e}", f"> {args.chem_activity_tol:.1e} or product growth"),
     ]
     overall = all(item[1] for item in checks)
 
@@ -284,13 +281,18 @@ def main() -> int:
             "delta_M_liquid": dml,
             "delta_M_vapor_fluid": dmv,
             f"delta_M_{fuel_name}": dmf,
-            "delta_M_O2": dmo2,
+            "global_delta_M_O2": dmo2,
             "fuel_consumption_vs_nonreacting_delta": fuel_consumption_indicator,
             "product_increases": product_increases,
         },
         "max_species_values": {name: {"rhoY": key_max_values[name], "where": max_product_locations.get(name)} for name in KEY_SPECIES},
         "profile_changes": profile_changes,
-        "temperature": {"min_K": min_t, "max_K": max_t, "rise_K": temperature_rise},
+        "temperature": {
+            "initial_global_Tmax_K": initial_global_tmax,
+            "maximum_T_over_run_K": max_t,
+            "delta_global_Tmax_K": delta_global_tmax,
+            "minimum_T_over_run_K": min_t,
+        },
         "p2_p3": {"max_rel": max_p2p3_rel, "max_abs_Pa": max_p2p3_abs, "where": max_p2p3_where},
         "checks": {name: status(ok) for name, ok, _, _ in checks},
         "overall": status(overall),
@@ -302,6 +304,8 @@ def main() -> int:
         "",
         f"Run directory: `{run_dir}`",
         f"Complete saved steps analyzed: {steps}",
+        "",
+        "V8 validates active reacting coupling in the shock/droplet calculation. It does not by itself classify sustained ignition.",
         "",
         "| Component | Value | Criterion | Result |",
         "| --- | ---: | ---: | --- |",
@@ -315,10 +319,11 @@ def main() -> int:
             f"- Delta liquid mass: `{dml:.12e}`",
             f"- Delta vapor-fluid mass: `{dmv:.12e}`",
             f"- Delta {fuel_name} mass: `{dmf:.12e}`",
-            f"- Delta O2 mass: `{dmo2:.12e}`",
+            f"- Global domain delta O2 mass: `{dmo2:.12e}` (non-periodic boundary contaminated; informational only)",
             f"- Fuel consumption indicator `(Delta vapor - Delta fuel)`: `{fuel_consumption_indicator:.12e}`",
-            f"- Max temperature: `{max_t:.12e} K`",
-            f"- Temperature rise from saved step 0 min T: `{temperature_rise:.12e} K`",
+            f"- Initial global Tmax: `{initial_global_tmax:.12e} K`",
+            f"- Maximum T over run: `{max_t:.12e} K`",
+            f"- Delta global Tmax: `{delta_global_tmax:.12e} K` (descriptive; not used alone as chemistry evidence)",
             "",
             "## Product/Radical Growth",
             "",

@@ -286,6 +286,8 @@ class TestModel3PhaseChangeVaporDelta(unittest.TestCase):
 
 
 class TestModel3AqssOrdering(unittest.TestCase):
+    COUPLED_AQSS_CALL = "calls_chemistry_reaction_substep(q_cons_ts(1)%vf,q_T_sf,dt,idwint,aqss_nsub,aqss_stiff_local)"
+
     def test_upstream_aqss_call_is_gated_off_for_coupled_mode(self):
         text = _compact_fortran(TIME_STEPPERS_SRC)
         self.assertIn(
@@ -301,19 +303,19 @@ class TestModel3AqssOrdering(unittest.TestCase):
         chemistry_gate = text.index(
             "if(model3_chemistry_coupling.and.chemistry.and.chem_params%reactions.and.chem_params%reaction_substeps>0)then"
         )
-        chemistry_call = text.index("calls_chemistry_reaction_substep(q_cons_ts(1)%vf,q_T_sf,dt,idwint)")
+        chemistry_call = text.index(self.COUPLED_AQSS_CALL)
 
         self.assertLess(relaxation, insertion)
         self.assertLess(insertion, chemistry_gate)
         self.assertLess(chemistry_gate, chemistry_call)
-        self.assertEqual(text.count("calls_chemistry_reaction_substep(q_cons_ts(1)%vf,q_T_sf,dt,idwint)"), 1)
+        self.assertEqual(text.count(self.COUPLED_AQSS_CALL), 1)
 
     def test_coupled_runtime_phase_change_insertion_and_aqss_use_same_state_without_intervening_reconstruction(self):
         text = _compact_fortran(SIM_START_UP_SRC)
         sequence = [
             "calls_infinite_relaxation_k(q_cons_ts(1)%vf)",
             "if(model3_chemistry_coupling)calls_apply_model3_vapor_delta_to_fuel_species(q_cons_ts(1)%vf)",
-            "calls_chemistry_reaction_substep(q_cons_ts(1)%vf,q_T_sf,dt,idwint)",
+            self.COUPLED_AQSS_CALL,
         ]
         positions = [text.index(item) for item in sequence]
 
