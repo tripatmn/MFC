@@ -118,7 +118,7 @@ contains
                             & m1, m2, MCT, TvF, vapor_mass_before, vapor_mass_after, no_transfer_pS, no_transfer_TS, &
                             & pt_iter, pt_cap_hit, ptg_iter, ptg_cap_hit, ptg_ls_iter, ptg_resnorm_final]', &
                             & reduction='[[pt_iter_max_loc, ptg_iter_max_loc, ptg_ls_max_loc, ptg_cap_res_max_loc], &
-                            & [pt_cap_hits_loc, ptg_cells_loc, ptg_cap_hits_loc]]', reductionOp='[MAX, SUM]')
+                            & [pt_cap_hits_loc, ptg_cells_loc, ptg_cap_hits_loc]]', reductionOp='[MAX, +]')
         do j = 0, m
             do k = 0, n
                 do l = 0, p
