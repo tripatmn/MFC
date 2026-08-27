@@ -76,8 +76,10 @@ contains
         real(wp) :: no_transfer_TS        !< pT-equilibrium temperature before pTg mass transfer
         real(wp) :: pt_iter_max_loc, pt_cap_hits_loc
         real(wp) :: ptg_cells_loc, ptg_iter_max_loc, ptg_cap_hits_loc, ptg_ls_max_loc, ptg_cap_res_max_loc
+        real(wp) :: ptg_conv_iter_max_loc, ptg_conv_gt100_loc, ptg_conv_gt500_loc, ptg_conv_gt1000_loc
         real(wp) :: pt_iter_max_glb, pt_cap_hits_glb
         real(wp) :: ptg_cells_glb, ptg_iter_max_glb, ptg_cap_hits_glb, ptg_ls_max_glb, ptg_cap_res_max_glb
+        real(wp) :: ptg_conv_iter_max_glb, ptg_conv_gt100_glb, ptg_conv_gt500_glb, ptg_conv_gt1000_glb
         ! $:GPU_DECLARE(create='[pS,TS,rhoe,dynE,rhos,rho,rM,m1,m2,MCT,TvF]')
 
         #:if not MFC_CASE_OPTIMIZATION and USING_AMD
@@ -113,12 +115,14 @@ contains
         pt_iter_max_loc = 0._wp; pt_cap_hits_loc = 0._wp
         ptg_cells_loc = 0._wp; ptg_iter_max_loc = 0._wp; ptg_cap_hits_loc = 0._wp
         ptg_ls_max_loc = 0._wp; ptg_cap_res_max_loc = 0._wp
+        ptg_conv_iter_max_loc = 0._wp; ptg_conv_gt100_loc = 0._wp; ptg_conv_gt500_loc = 0._wp; ptg_conv_gt1000_loc = 0._wp
 
         $:GPU_PARALLEL_LOOP(collapse=3, private='[i, j, k, l, p_infpT, sk, hk, gk, ek, rhok, pS, TS, rhoe, dynE, rhos, rho, rM, &
                             & m1, m2, MCT, TvF, vapor_mass_before, vapor_mass_after, no_transfer_pS, no_transfer_TS, &
                             & pt_iter, pt_cap_hit, ptg_iter, ptg_cap_hit, ptg_ls_iter, ptg_resnorm_final]', &
-                            & reduction='[[pt_iter_max_loc, ptg_iter_max_loc, ptg_ls_max_loc, ptg_cap_res_max_loc], &
-                            & [pt_cap_hits_loc, ptg_cells_loc, ptg_cap_hits_loc]]', reductionOp='[MAX, +]')
+                            & reduction='[[pt_iter_max_loc, ptg_iter_max_loc, ptg_ls_max_loc, ptg_cap_res_max_loc, &
+                            & ptg_conv_iter_max_loc], [pt_cap_hits_loc, ptg_cells_loc, ptg_cap_hits_loc, ptg_conv_gt100_loc, &
+                            & ptg_conv_gt500_loc, ptg_conv_gt1000_loc]]', reductionOp='[MAX, +]')
         do j = 0, m
             do k = 0, n
                 do l = 0, p
@@ -193,6 +197,11 @@ contains
                             if (ptg_cap_hit /= 0) then
                                 ptg_cap_hits_loc = ptg_cap_hits_loc + 1._wp
                                 ptg_cap_res_max_loc = max(ptg_cap_res_max_loc, ptg_resnorm_final)
+                            else
+                                ptg_conv_iter_max_loc = max(ptg_conv_iter_max_loc, real(ptg_iter, wp))
+                                if (ptg_iter > 100) ptg_conv_gt100_loc = ptg_conv_gt100_loc + 1._wp
+                                if (ptg_iter > 500) ptg_conv_gt500_loc = ptg_conv_gt500_loc + 1._wp
+                                if (ptg_iter > 1000) ptg_conv_gt1000_loc = ptg_conv_gt1000_loc + 1._wp
                             end if
                         end if
 
@@ -262,6 +271,10 @@ contains
                 call s_mpi_allreduce_sum(ptg_cap_hits_loc, ptg_cap_hits_glb)
                 call s_mpi_allreduce_max(ptg_ls_max_loc, ptg_ls_max_glb)
                 call s_mpi_allreduce_max(ptg_cap_res_max_loc, ptg_cap_res_max_glb)
+                call s_mpi_allreduce_max(ptg_conv_iter_max_loc, ptg_conv_iter_max_glb)
+                call s_mpi_allreduce_sum(ptg_conv_gt100_loc, ptg_conv_gt100_glb)
+                call s_mpi_allreduce_sum(ptg_conv_gt500_loc, ptg_conv_gt500_glb)
+                call s_mpi_allreduce_sum(ptg_conv_gt1000_loc, ptg_conv_gt1000_glb)
             else
                 pt_iter_max_glb = pt_iter_max_loc
                 pt_cap_hits_glb = pt_cap_hits_loc
@@ -270,14 +283,21 @@ contains
                 ptg_cap_hits_glb = ptg_cap_hits_loc
                 ptg_ls_max_glb = ptg_ls_max_loc
                 ptg_cap_res_max_glb = ptg_cap_res_max_loc
+                ptg_conv_iter_max_glb = ptg_conv_iter_max_loc
+                ptg_conv_gt100_glb = ptg_conv_gt100_loc
+                ptg_conv_gt500_glb = ptg_conv_gt500_loc
+                ptg_conv_gt1000_glb = ptg_conv_gt1000_loc
             end if
 
             if (proc_rank == 0) then
                 print '(" PHASE PERF step=", I0, " pt_iter_max=", I0, " pt_cap_hits=", I0, &
                     & " ptg_cells=", I0, " ptg_iter_max=", I0, " ptg_cap_hits=", I0, &
-                    & " ptg_ls_max=", I0, " ptg_cap_res_max=", ES12.5)', &
+                    & " ptg_ls_max=", I0, " ptg_cap_res_max=", ES12.5, " ptg_conv_iter_max=", I0, &
+                    & " ptg_conv_gt100=", I0, " ptg_conv_gt500=", I0, " ptg_conv_gt1000=", I0)', &
                     & phase_perf_step, nint(pt_iter_max_glb), nint(pt_cap_hits_glb), nint(ptg_cells_glb), &
-                    & nint(ptg_iter_max_glb), nint(ptg_cap_hits_glb), nint(ptg_ls_max_glb), ptg_cap_res_max_glb
+                    & nint(ptg_iter_max_glb), nint(ptg_cap_hits_glb), nint(ptg_ls_max_glb), ptg_cap_res_max_glb, &
+                    & nint(ptg_conv_iter_max_glb), nint(ptg_conv_gt100_glb), nint(ptg_conv_gt500_glb), &
+                    & nint(ptg_conv_gt1000_glb)
             end if
         end if
 
