@@ -25,7 +25,7 @@ module m_phase_change
     !> @name Parameters for the first order transition phase change
     !> @{
     integer, parameter  :: max_iter = 100000            !< max Newton iterations before accepting the last iterate
-    integer, parameter  :: ptg_max_iter = 100           !< max pTg Newton iterations before falling back to pT equilibrium
+    integer, parameter  :: ptg_max_iter = 500           !< max pTg Newton iterations before falling back to pT equilibrium
     real(wp), parameter :: pCr = 1.817e6_wp             !< Critical pressure of n-dodecane [Pa]
     real(wp), parameter :: TCr = 658.2_wp               !< Critical temperature of n-dodecane [K]
     integer, parameter  :: ptg_ls_max = 30              !< max backtracking-line-search halvings in the pTg solver
