@@ -574,10 +574,14 @@ contains
         real(wp)                :: aqss_stiff_local, aqss_stiff_global
         real(wp)                :: aqss_nsub_local, aqss_nsub_min, aqss_nsub_max
         real(wp)                :: chem_wall_local, chem_wall_max, full_step_wall_local, full_step_wall_max
-        logical                 :: aqss_perf_sample
+        logical                 :: aqss_perf_sample, phase_perf_sample
 
+        phase_perf_sample = .false.
         aqss_perf_sample = .false.
-        if (t_step_print > 0) aqss_perf_sample = mod(t_step - t_step_start, t_step_print) == 0
+        if (t_step_print > 0) then
+            phase_perf_sample = mod(t_step - t_step_start, t_step_print) == 0
+        end if
+        aqss_perf_sample = phase_perf_sample
         aqss_nsub = 0
         aqss_stiff_local = 0._wp
         chem_wall_local = 0._wp
@@ -653,7 +657,7 @@ contains
         mytime = mytime + dt
 
         if (relax) then
-            call s_infinite_relaxation_k(q_cons_ts(1)%vf, t_step)
+            call s_infinite_relaxation_k(q_cons_ts(1)%vf, t_step, phase_perf_sample)
             if (model3_chemistry_coupling) call s_apply_model3_vapor_delta_to_fuel_species(q_cons_ts(1)%vf)
         end if
 

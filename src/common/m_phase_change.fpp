@@ -60,10 +60,11 @@ contains
     end subroutine s_initialize_phasechange_module
 
     !> Apply pT- or pTg-equilibrium relaxation with mass depletion based on the incoming state conditions.
-    subroutine s_infinite_relaxation_k(q_cons_vf, phase_t_step)
+    subroutine s_infinite_relaxation_k(q_cons_vf, phase_t_step, phase_perf_sample_in)
 
         type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
         integer, optional, intent(in) :: phase_t_step
+        logical, optional, intent(in) :: phase_perf_sample_in
         real(wp) :: pS                    !< equilibrium pressure
         real(wp) :: TS                    !< equilibrium temperature
         real(wp) :: rhoe, dynE, rhos      !< total internal energy, kinetic energy, and total entropy
@@ -106,8 +107,8 @@ contains
         phase_perf_sample = .false.
         if (present(phase_t_step)) then
             phase_perf_step = phase_t_step
-            if (t_step_print > 0) phase_perf_sample = mod(phase_t_step - t_step_start, t_step_print) == 0
         end if
+        if (present(phase_perf_sample_in)) phase_perf_sample = phase_perf_sample_in
 
         pt_iter_max_loc = 0._wp; pt_cap_hits_loc = 0._wp
         ptg_cells_loc = 0._wp; ptg_iter_max_loc = 0._wp; ptg_cap_hits_loc = 0._wp
