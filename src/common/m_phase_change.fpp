@@ -25,6 +25,7 @@ module m_phase_change
     !> @name Parameters for the first order transition phase change
     !> @{
     integer, parameter  :: max_iter = 100000            !< max Newton iterations before accepting the last iterate
+    integer, parameter  :: ptg_max_iter = 100           !< max pTg Newton iterations before falling back to pT equilibrium
     real(wp), parameter :: pCr = 1.817e6_wp             !< Critical pressure of n-dodecane [Pa]
     real(wp), parameter :: TCr = 658.2_wp               !< Critical temperature of n-dodecane [K]
     integer, parameter  :: ptg_ls_max = 30              !< max backtracking-line-search halvings in the pTg solver
@@ -75,10 +76,10 @@ contains
         real(wp) :: no_transfer_pS        !< pT-equilibrium pressure before pTg mass transfer
         real(wp) :: no_transfer_TS        !< pT-equilibrium temperature before pTg mass transfer
         real(wp) :: pt_iter_max_loc, pt_cap_hits_loc
-        real(wp) :: ptg_cells_loc, ptg_iter_max_loc, ptg_cap_hits_loc, ptg_ls_max_loc, ptg_cap_res_max_loc
+        real(wp) :: ptg_cells_loc, ptg_iter_max_loc, ptg_cap_hits_loc, ptg_failures_loc, ptg_ls_max_loc, ptg_cap_res_max_loc
         real(wp) :: ptg_conv_iter_max_loc, ptg_conv_gt100_loc, ptg_conv_gt500_loc, ptg_conv_gt1000_loc
         real(wp) :: pt_iter_max_glb, pt_cap_hits_glb
-        real(wp) :: ptg_cells_glb, ptg_iter_max_glb, ptg_cap_hits_glb, ptg_ls_max_glb, ptg_cap_res_max_glb
+        real(wp) :: ptg_cells_glb, ptg_iter_max_glb, ptg_cap_hits_glb, ptg_failures_glb, ptg_ls_max_glb, ptg_cap_res_max_glb
         real(wp) :: ptg_conv_iter_max_glb, ptg_conv_gt100_glb, ptg_conv_gt500_glb, ptg_conv_gt1000_glb
         ! $:GPU_DECLARE(create='[pS,TS,rhoe,dynE,rhos,rho,rM,m1,m2,MCT,TvF]')
 
@@ -91,7 +92,7 @@ contains
 
         !> Generic loop iterators
         integer :: i, j, k, l
-        integer :: pt_iter, pt_cap_hit, ptg_iter, ptg_cap_hit, ptg_ls_iter
+        integer :: pt_iter, pt_cap_hit, ptg_iter, ptg_cap_hit, ptg_failed, ptg_ls_iter
         integer :: phase_perf_step
         real(wp) :: ptg_resnorm_final
         logical :: phase_perf_sample
@@ -113,16 +114,16 @@ contains
         if (present(phase_perf_sample_in)) phase_perf_sample = phase_perf_sample_in
 
         pt_iter_max_loc = 0._wp; pt_cap_hits_loc = 0._wp
-        ptg_cells_loc = 0._wp; ptg_iter_max_loc = 0._wp; ptg_cap_hits_loc = 0._wp
+        ptg_cells_loc = 0._wp; ptg_iter_max_loc = 0._wp; ptg_cap_hits_loc = 0._wp; ptg_failures_loc = 0._wp
         ptg_ls_max_loc = 0._wp; ptg_cap_res_max_loc = 0._wp
         ptg_conv_iter_max_loc = 0._wp; ptg_conv_gt100_loc = 0._wp; ptg_conv_gt500_loc = 0._wp; ptg_conv_gt1000_loc = 0._wp
 
         $:GPU_PARALLEL_LOOP(collapse=3, private='[i, j, k, l, p_infpT, sk, hk, gk, ek, rhok, pS, TS, rhoe, dynE, rhos, rho, rM, &
                             & m1, m2, MCT, TvF, vapor_mass_before, vapor_mass_after, no_transfer_pS, no_transfer_TS, &
-                            & pt_iter, pt_cap_hit, ptg_iter, ptg_cap_hit, ptg_ls_iter, ptg_resnorm_final]', &
+                            & pt_iter, pt_cap_hit, ptg_iter, ptg_cap_hit, ptg_failed, ptg_ls_iter, ptg_resnorm_final]', &
                             & reduction='[[pt_iter_max_loc, ptg_iter_max_loc, ptg_ls_max_loc, ptg_cap_res_max_loc, &
-                            & ptg_conv_iter_max_loc], [pt_cap_hits_loc, ptg_cells_loc, ptg_cap_hits_loc, ptg_conv_gt100_loc, &
-                            & ptg_conv_gt500_loc, ptg_conv_gt1000_loc]]', reductionOp='[MAX, +]')
+                            & ptg_conv_iter_max_loc], [pt_cap_hits_loc, ptg_cells_loc, ptg_cap_hits_loc, ptg_failures_loc, &
+                            & ptg_conv_gt100_loc, ptg_conv_gt500_loc, ptg_conv_gt1000_loc]]', reductionOp='[MAX, +]')
         do j = 0, m
             do k = 0, n
                 do l = 0, p
@@ -189,15 +190,23 @@ contains
                         if (model3_chemistry_coupling) vapor_mass_before = q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l)
 
                         call s_infinite_ptg_relaxation_k(j, k, l, pS, rhoe, q_cons_vf, TS, ptg_iter, ptg_cap_hit, &
-                                                         & ptg_ls_iter, ptg_resnorm_final)
+                                                         & ptg_failed, ptg_ls_iter, ptg_resnorm_final)
+                        if (ptg_failed /= 0) then
+                            q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, l) = m1
+                            q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l) = m2
+                            pS = no_transfer_pS
+                            TS = no_transfer_TS
+                            if (model3_chemistry_coupling) delta_m_vapor%sf(j, k, l) = 0._wp
+                        end if
                         if (phase_perf_sample) then
                             ptg_cells_loc = ptg_cells_loc + 1._wp
                             ptg_iter_max_loc = max(ptg_iter_max_loc, real(ptg_iter, wp))
                             ptg_ls_max_loc = max(ptg_ls_max_loc, real(ptg_ls_iter, wp))
+                            if (ptg_failed /= 0) ptg_failures_loc = ptg_failures_loc + 1._wp
                             if (ptg_cap_hit /= 0) then
                                 ptg_cap_hits_loc = ptg_cap_hits_loc + 1._wp
                                 ptg_cap_res_max_loc = max(ptg_cap_res_max_loc, ptg_resnorm_final)
-                            else
+                            else if (ptg_failed == 0) then
                                 ptg_conv_iter_max_loc = max(ptg_conv_iter_max_loc, real(ptg_iter, wp))
                                 if (ptg_iter > 100) ptg_conv_gt100_loc = ptg_conv_gt100_loc + 1._wp
                                 if (ptg_iter > 500) ptg_conv_gt500_loc = ptg_conv_gt500_loc + 1._wp
@@ -207,7 +216,7 @@ contains
 
                         if (model3_chemistry_coupling) then
                             vapor_mass_after = q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l)
-                            if (vapor_mass_after < vapor_mass_before) then
+                            if ((ptg_failed /= 0) .or. (vapor_mass_after < vapor_mass_before)) then
                                 q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, l) = m1
                                 q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l) = m2
                                 pS = no_transfer_pS
@@ -269,6 +278,7 @@ contains
                 call s_mpi_allreduce_sum(ptg_cells_loc, ptg_cells_glb)
                 call s_mpi_allreduce_max(ptg_iter_max_loc, ptg_iter_max_glb)
                 call s_mpi_allreduce_sum(ptg_cap_hits_loc, ptg_cap_hits_glb)
+                call s_mpi_allreduce_sum(ptg_failures_loc, ptg_failures_glb)
                 call s_mpi_allreduce_max(ptg_ls_max_loc, ptg_ls_max_glb)
                 call s_mpi_allreduce_max(ptg_cap_res_max_loc, ptg_cap_res_max_glb)
                 call s_mpi_allreduce_max(ptg_conv_iter_max_loc, ptg_conv_iter_max_glb)
@@ -281,6 +291,7 @@ contains
                 ptg_cells_glb = ptg_cells_loc
                 ptg_iter_max_glb = ptg_iter_max_loc
                 ptg_cap_hits_glb = ptg_cap_hits_loc
+                ptg_failures_glb = ptg_failures_loc
                 ptg_ls_max_glb = ptg_ls_max_loc
                 ptg_cap_res_max_glb = ptg_cap_res_max_loc
                 ptg_conv_iter_max_glb = ptg_conv_iter_max_loc
@@ -292,11 +303,11 @@ contains
             if (proc_rank == 0) then
                 print '(" PHASE PERF step=", I0, " pt_iter_max=", I0, " pt_cap_hits=", I0, &
                     & " ptg_cells=", I0, " ptg_iter_max=", I0, " ptg_cap_hits=", I0, &
-                    & " ptg_ls_max=", I0, " ptg_cap_res_max=", ES12.5, " ptg_conv_iter_max=", I0, &
+                    & " ptg_failures=", I0, " ptg_ls_max=", I0, " ptg_cap_res_max=", ES12.5, " ptg_conv_iter_max=", I0, &
                     & " ptg_conv_gt100=", I0, " ptg_conv_gt500=", I0, " ptg_conv_gt1000=", I0)', &
                     & phase_perf_step, nint(pt_iter_max_glb), nint(pt_cap_hits_glb), nint(ptg_cells_glb), &
-                    & nint(ptg_iter_max_glb), nint(ptg_cap_hits_glb), nint(ptg_ls_max_glb), ptg_cap_res_max_glb, &
-                    & nint(ptg_conv_iter_max_glb), nint(ptg_conv_gt100_glb), nint(ptg_conv_gt500_glb), &
+                    & nint(ptg_iter_max_glb), nint(ptg_cap_hits_glb), nint(ptg_failures_glb), nint(ptg_ls_max_glb), &
+                    & ptg_cap_res_max_glb, nint(ptg_conv_iter_max_glb), nint(ptg_conv_gt100_glb), nint(ptg_conv_gt500_glb), &
                     & nint(ptg_conv_gt1000_glb)
             end if
         end if
@@ -487,8 +498,8 @@ contains
     !! rhoe-relative branch). Every step is projected onto the physical bounds 0 <= ml <= mT, pS > pmin. This converges in a handful
     !! of iterations with a bounded, uniform count (no GPU warp divergence), unlike the former fixed 1e-3 underrelaxation that
     !! stalled far from the root.
-    subroutine s_infinite_ptg_relaxation_k(j, k, l, pS, rhoe, q_cons_vf, TS, ptg_iter, ptg_cap_hit, ptg_ls_iter, &
-                                           & ptg_resnorm_final)
+    subroutine s_infinite_ptg_relaxation_k(j, k, l, pS, rhoe, q_cons_vf, TS, ptg_iter, ptg_cap_hit, ptg_failed, &
+                                           & ptg_ls_iter, ptg_resnorm_final)
 
         $:GPU_ROUTINE(function_name='s_infinite_ptg_relaxation_k', parallelism='[seq]', cray_noinline=True)
 
@@ -497,7 +508,7 @@ contains
         real(wp), intent(in)                                   :: rhoe
         type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
         real(wp), intent(inout)                                :: TS
-        integer, intent(out)                                   :: ptg_iter, ptg_cap_hit, ptg_ls_iter
+        integer, intent(out)                                   :: ptg_iter, ptg_cap_hit, ptg_failed, ptg_ls_iter
         real(wp), intent(out)                                  :: ptg_resnorm_final
         real(wp), dimension(2, 2)                              :: Jac, InvJac
         real(wp), dimension(2)                                 :: R2D, R2D_try, DeltamP
@@ -508,6 +519,7 @@ contains
 
         ptg_iter = 0
         ptg_cap_hit = 0
+        ptg_failed = 0
         ptg_ls_iter = 0
         ptg_resnorm_final = 0._wp
 
@@ -528,7 +540,7 @@ contains
         call s_compute_ptg_residual(ml, mT, pS, j, k, l, q_cons_vf, rhoe, R2D, TS, mCP, mQ, mCVGP, mCVGP2, mCPD)
         resnorm = sqrt(R2D(1)**2 + R2D(2)**2)
 
-        do ns = 1, max_iter
+        do ns = 1, ptg_max_iter
             ! converged on the absolute residual, or on the rhoe-relative residual (multiply form, rhoe > 0)
             if ((resnorm <= ptgalpha_eps) .or. (resnorm <= (ptgalpha_eps/1.e6_wp)*rhoe)) exit
             ptg_iter = ns
@@ -557,7 +569,10 @@ contains
 
             detJ = Jac(1, 1)*Jac(2, 2) - Jac(1, 2)*Jac(2, 1)
             ! singular Jacobian: no usable Newton direction, accept the current (best) state
-            if (detJ == 0.0_wp) exit
+            if (detJ == 0.0_wp) then
+                ptg_failed = 1
+                exit
+            end if
 
             InvJac(1, 1) = Jac(2, 2)/detJ
             InvJac(1, 2) = -Jac(1, 2)/detJ
@@ -582,8 +597,11 @@ contains
 
             ! accept the trial state (TS, mCP, mQ, mCVGP, mCVGP2, mCPD already set to it by the last call)
             ml = ml_try; pS = pS_try; R2D = R2D_try; resnorm = resnorm_try
-            if (ns == max_iter) then
-                if (.not. ((resnorm <= ptgalpha_eps) .or. (resnorm <= (ptgalpha_eps/1.e6_wp)*rhoe))) ptg_cap_hit = 1
+            if (ns == ptg_max_iter) then
+                if (.not. ((resnorm <= ptgalpha_eps) .or. (resnorm <= (ptgalpha_eps/1.e6_wp)*rhoe))) then
+                    ptg_cap_hit = 1
+                    ptg_failed = 1
+                end if
             end if
         end do
         ptg_resnorm_final = resnorm
