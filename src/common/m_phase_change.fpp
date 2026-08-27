@@ -60,9 +60,10 @@ contains
     end subroutine s_initialize_phasechange_module
 
     !> Apply pT- or pTg-equilibrium relaxation with mass depletion based on the incoming state conditions.
-    subroutine s_infinite_relaxation_k(q_cons_vf)
+    subroutine s_infinite_relaxation_k(q_cons_vf, phase_t_step)
 
         type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
+        integer, optional, intent(in) :: phase_t_step
         real(wp) :: pS                    !< equilibrium pressure
         real(wp) :: TS                    !< equilibrium temperature
         real(wp) :: rhoe, dynE, rhos      !< total internal energy, kinetic energy, and total entropy
@@ -72,6 +73,10 @@ contains
         real(wp) :: vapor_mass_after      !< vapor partial density after candidate pTg mass transfer
         real(wp) :: no_transfer_pS        !< pT-equilibrium pressure before pTg mass transfer
         real(wp) :: no_transfer_TS        !< pT-equilibrium temperature before pTg mass transfer
+        real(wp) :: pt_iter_max_loc, pt_cap_hits_loc
+        real(wp) :: ptg_cells_loc, ptg_iter_max_loc, ptg_cap_hits_loc, ptg_ls_max_loc, ptg_cap_res_max_loc
+        real(wp) :: pt_iter_max_glb, pt_cap_hits_glb
+        real(wp) :: ptg_cells_glb, ptg_iter_max_glb, ptg_cap_hits_glb, ptg_ls_max_glb, ptg_cap_res_max_glb
         ! $:GPU_DECLARE(create='[pS,TS,rhoe,dynE,rhos,rho,rM,m1,m2,MCT,TvF]')
 
         #:if not MFC_CASE_OPTIMIZATION and USING_AMD
@@ -83,6 +88,10 @@ contains
 
         !> Generic loop iterators
         integer :: i, j, k, l
+        integer :: pt_iter, pt_cap_hit, ptg_iter, ptg_cap_hit, ptg_ls_iter
+        integer :: phase_perf_step
+        real(wp) :: ptg_resnorm_final
+        logical :: phase_perf_sample
 
 #ifdef _CRAYFTN
 #ifdef MFC_OpenACC
@@ -93,8 +102,22 @@ contains
 
         ! starting equilibrium solver
 
+        phase_perf_step = -1
+        phase_perf_sample = .false.
+        if (present(phase_t_step)) then
+            phase_perf_step = phase_t_step
+            if (t_step_print > 0) phase_perf_sample = mod(phase_t_step - t_step_start, t_step_print) == 0
+        end if
+
+        pt_iter_max_loc = 0._wp; pt_cap_hits_loc = 0._wp
+        ptg_cells_loc = 0._wp; ptg_iter_max_loc = 0._wp; ptg_cap_hits_loc = 0._wp
+        ptg_ls_max_loc = 0._wp; ptg_cap_res_max_loc = 0._wp
+
         $:GPU_PARALLEL_LOOP(collapse=3, private='[i, j, k, l, p_infpT, sk, hk, gk, ek, rhok, pS, TS, rhoe, dynE, rhos, rho, rM, &
-                            & m1, m2, MCT, TvF, vapor_mass_before, vapor_mass_after, no_transfer_pS, no_transfer_TS]')
+                            & m1, m2, MCT, TvF, vapor_mass_before, vapor_mass_after, no_transfer_pS, no_transfer_TS, &
+                            & pt_iter, pt_cap_hit, ptg_iter, ptg_cap_hit, ptg_ls_iter, ptg_resnorm_final]', &
+                            & reduction='[[pt_iter_max_loc, ptg_iter_max_loc, ptg_ls_max_loc, ptg_cap_res_max_loc], &
+                            & [pt_cap_hits_loc, ptg_cells_loc, ptg_cap_hits_loc]]', reductionOp='[MAX, SUM]')
         do j = 0, m
             do k = 0, n
                 do l = 0, p
@@ -138,7 +161,11 @@ contains
 
                     ! Calling pT-equilibrium for either finishing phase-change module, or as an IC for the pTg-equilibrium for this
                     ! case, MFL cannot be either 0 or 1, so I chose it to be 2
-                    call s_infinite_pt_relaxation_k(j, k, l, 2, pS, p_infpT, q_cons_vf, rhoe, TS)
+                    call s_infinite_pt_relaxation_k(j, k, l, 2, pS, p_infpT, q_cons_vf, rhoe, TS, pt_iter, pt_cap_hit)
+                    if (phase_perf_sample) then
+                        pt_iter_max_loc = max(pt_iter_max_loc, real(pt_iter, wp))
+                        if (pt_cap_hit /= 0) pt_cap_hits_loc = pt_cap_hits_loc + 1._wp
+                    end if
                     no_transfer_pS = pS
                     no_transfer_TS = TS
 
@@ -156,7 +183,17 @@ contains
                         q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l) = m2
                         if (model3_chemistry_coupling) vapor_mass_before = q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l)
 
-                        call s_infinite_ptg_relaxation_k(j, k, l, pS, rhoe, q_cons_vf, TS)
+                        call s_infinite_ptg_relaxation_k(j, k, l, pS, rhoe, q_cons_vf, TS, ptg_iter, ptg_cap_hit, &
+                                                         & ptg_ls_iter, ptg_resnorm_final)
+                        if (phase_perf_sample) then
+                            ptg_cells_loc = ptg_cells_loc + 1._wp
+                            ptg_iter_max_loc = max(ptg_iter_max_loc, real(ptg_iter, wp))
+                            ptg_ls_max_loc = max(ptg_ls_max_loc, real(ptg_ls_iter, wp))
+                            if (ptg_cap_hit /= 0) then
+                                ptg_cap_hits_loc = ptg_cap_hits_loc + 1._wp
+                                ptg_cap_res_max_loc = max(ptg_cap_res_max_loc, ptg_resnorm_final)
+                            end if
+                        end if
 
                         if (model3_chemistry_coupling) then
                             vapor_mass_after = q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l)
@@ -213,6 +250,36 @@ contains
         end do
         $:END_GPU_PARALLEL_LOOP()
 
+        if (phase_perf_sample) then
+            $:GPU_WAIT()
+
+            if (num_procs > 1) then
+                call s_mpi_allreduce_max(pt_iter_max_loc, pt_iter_max_glb)
+                call s_mpi_allreduce_sum(pt_cap_hits_loc, pt_cap_hits_glb)
+                call s_mpi_allreduce_sum(ptg_cells_loc, ptg_cells_glb)
+                call s_mpi_allreduce_max(ptg_iter_max_loc, ptg_iter_max_glb)
+                call s_mpi_allreduce_sum(ptg_cap_hits_loc, ptg_cap_hits_glb)
+                call s_mpi_allreduce_max(ptg_ls_max_loc, ptg_ls_max_glb)
+                call s_mpi_allreduce_max(ptg_cap_res_max_loc, ptg_cap_res_max_glb)
+            else
+                pt_iter_max_glb = pt_iter_max_loc
+                pt_cap_hits_glb = pt_cap_hits_loc
+                ptg_cells_glb = ptg_cells_loc
+                ptg_iter_max_glb = ptg_iter_max_loc
+                ptg_cap_hits_glb = ptg_cap_hits_loc
+                ptg_ls_max_glb = ptg_ls_max_loc
+                ptg_cap_res_max_glb = ptg_cap_res_max_loc
+            end if
+
+            if (proc_rank == 0) then
+                print '(" PHASE PERF step=", I0, " pt_iter_max=", I0, " pt_cap_hits=", I0, &
+                    & " ptg_cells=", I0, " ptg_iter_max=", I0, " ptg_cap_hits=", I0, &
+                    & " ptg_ls_max=", I0, " ptg_cap_res_max=", ES12.5)', &
+                    & phase_perf_step, nint(pt_iter_max_glb), nint(pt_cap_hits_glb), nint(ptg_cells_glb), &
+                    & nint(ptg_iter_max_glb), nint(ptg_cap_hits_glb), nint(ptg_ls_max_glb), ptg_cap_res_max_glb
+            end if
+        end if
+
     end subroutine s_infinite_relaxation_k
 
     !> Add accepted vaporized fuel mass to the coupled gas species state exactly once.
@@ -245,7 +312,7 @@ contains
 
     !> Apply pT-equilibrium relaxation for N fluids
     !! @param MFL flag: 0=gas, 1=liquid, 2=mixture
-    subroutine s_infinite_pt_relaxation_k(j, k, l, MFL, pS, p_infpT, q_cons_vf, rhoe, TS)
+    subroutine s_infinite_pt_relaxation_k(j, k, l, MFL, pS, p_infpT, q_cons_vf, rhoe, TS, pt_iter, pt_cap_hit)
 
         $:GPU_ROUTINE(function_name='s_infinite_pt_relaxation_k', parallelism='[seq]', cray_noinline=True)
 
@@ -256,10 +323,14 @@ contains
         type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
         real(wp), intent(in)                                :: rhoe
         real(wp), intent(out)                               :: TS
+        integer, intent(out)                                :: pt_iter
+        integer, intent(out)                                :: pt_cap_hit
         real(wp)                                            :: gp, gpp, hp, pO, mCP, mQ  !< variables for the Newton Solver
         real(wp)                                            :: p_infpT_sum
         integer                                             :: i, ns                     !< generic loop iterators
         ! auxiliary variables for the pT-equilibrium solver
+        pt_iter = 0
+        pt_cap_hit = 0
         mCP = 0.0_wp; mQ = 0.0_wp; p_infpT_sum = 0._wp
         $:GPU_LOOP(parallelism='[seq]')
         do i = 1, num_fluids
@@ -313,8 +384,12 @@ contains
         do while ((abs(pS - pO) > palpha_eps) .and. (abs(pS - pO) > (palpha_eps/1.e4_wp)*abs(pO)) .or. (ns == 0))
             ! increasing counter
             ns = ns + 1
+            pt_iter = ns
             ! guard against non-convergence: accept the last iterate rather than looping forever
-            if (ns >= max_iter) exit
+            if (ns >= max_iter) then
+                pt_cap_hit = 1
+                exit
+            end if
 
             ! updating old pressure
             pO = pS
@@ -391,7 +466,8 @@ contains
     !! rhoe-relative branch). Every step is projected onto the physical bounds 0 <= ml <= mT, pS > pmin. This converges in a handful
     !! of iterations with a bounded, uniform count (no GPU warp divergence), unlike the former fixed 1e-3 underrelaxation that
     !! stalled far from the root.
-    subroutine s_infinite_ptg_relaxation_k(j, k, l, pS, rhoe, q_cons_vf, TS)
+    subroutine s_infinite_ptg_relaxation_k(j, k, l, pS, rhoe, q_cons_vf, TS, ptg_iter, ptg_cap_hit, ptg_ls_iter, &
+                                           & ptg_resnorm_final)
 
         $:GPU_ROUTINE(function_name='s_infinite_ptg_relaxation_k', parallelism='[seq]', cray_noinline=True)
 
@@ -400,12 +476,19 @@ contains
         real(wp), intent(in)                                   :: rhoe
         type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
         real(wp), intent(inout)                                :: TS
+        integer, intent(out)                                   :: ptg_iter, ptg_cap_hit, ptg_ls_iter
+        real(wp), intent(out)                                  :: ptg_resnorm_final
         real(wp), dimension(2, 2)                              :: Jac, InvJac
         real(wp), dimension(2)                                 :: R2D, R2D_try, DeltamP
         real(wp)                                               :: mCP, mCPD, mCVGP, mCVGP2, mQ
         real(wp)                                               :: ml, ml_try, mT, pS_try, pmin, lambda, resnorm, resnorm_try
         real(wp)                                               :: dFdT, dTdm, dTdp, detJ
         integer                                                :: ns, ls
+
+        ptg_iter = 0
+        ptg_cap_hit = 0
+        ptg_ls_iter = 0
+        ptg_resnorm_final = 0._wp
 
         ! total reacting mass is conserved; the liquid mass ml is the primary unknown, vapor mass = mT - ml
         mT = q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, l) + q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l)
@@ -427,6 +510,7 @@ contains
         do ns = 1, max_iter
             ! converged on the absolute residual, or on the rhoe-relative residual (multiply form, rhoe > 0)
             if ((resnorm <= ptgalpha_eps) .or. (resnorm <= (ptgalpha_eps/1.e6_wp)*rhoe)) exit
+            ptg_iter = ns
 
             ! 2x2 Jacobian of (Gibbs equality, energy) with respect to (ml, pS) at the current state
             dFdT = -(cvs(lp)*gs_min(lp) - cvs(vp)*gs_min(vp))*log(TS) - (qvps(lp) - qvps(vp)) + cvs(lp)*(gs_min(lp) - 1)*log(pS &
@@ -473,10 +557,15 @@ contains
                 if ((resnorm_try < resnorm) .or. (ls == ptg_ls_max)) exit
                 lambda = 0.5_wp*lambda
             end do
+            ptg_ls_iter = max(ptg_ls_iter, ls)
 
             ! accept the trial state (TS, mCP, mQ, mCVGP, mCVGP2, mCPD already set to it by the last call)
             ml = ml_try; pS = pS_try; R2D = R2D_try; resnorm = resnorm_try
+            if (ns == max_iter) then
+                if (.not. ((resnorm <= ptgalpha_eps) .or. (resnorm <= (ptgalpha_eps/1.e6_wp)*rhoe))) ptg_cap_hit = 1
+            end if
         end do
+        ptg_resnorm_final = resnorm
 
         ! commit the reacting masses (mT conserved) and set the common temperature
         q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, l) = ml

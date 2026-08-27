@@ -653,7 +653,7 @@ contains
         mytime = mytime + dt
 
         if (relax) then
-            call s_infinite_relaxation_k(q_cons_ts(1)%vf)
+            call s_infinite_relaxation_k(q_cons_ts(1)%vf, t_step)
             if (model3_chemistry_coupling) call s_apply_model3_vapor_delta_to_fuel_species(q_cons_ts(1)%vf)
         end if
 
