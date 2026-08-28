@@ -568,29 +568,7 @@ contains
         integer, intent(inout)  :: t_step
         real(wp), intent(inout) :: time_avg
         integer                 :: i, eta_hh, eta_mm, eta_ss
-        integer                 :: aqss_nsub
-        integer(kind=8)         :: full_step_t0, full_step_t1, chem_t0, chem_t1, perf_clock_rate, perf_clock_max
         real(wp)                :: eta_sec
-        real(wp)                :: aqss_stiff_local, aqss_stiff_global
-        real(wp)                :: aqss_nsub_local, aqss_nsub_min, aqss_nsub_max
-        real(wp)                :: chem_wall_local, chem_wall_max, full_step_wall_local, full_step_wall_max
-        logical                 :: aqss_perf_sample, phase_perf_sample
-
-        phase_perf_sample = .false.
-        aqss_perf_sample = .false.
-        if (t_step_print > 0) then
-            phase_perf_sample = mod(t_step - t_step_start, t_step_print) == 0
-        end if
-        aqss_perf_sample = phase_perf_sample
-        aqss_nsub = 0
-        aqss_stiff_local = 0._wp
-        chem_wall_local = 0._wp
-        full_step_wall_local = 0._wp
-
-        if (aqss_perf_sample) then
-            $:GPU_WAIT()
-            call system_clock(full_step_t0, perf_clock_rate, perf_clock_max)
-        end if
 
         if (cfl_dt) then
             if (cfl_const_dt .and. t_step == 0) call s_compute_dt()
@@ -657,62 +635,15 @@ contains
         mytime = mytime + dt
 
         if (relax) then
-            call s_infinite_relaxation_k(q_cons_ts(1)%vf, t_step, phase_perf_sample)
+            call s_infinite_relaxation_k(q_cons_ts(1)%vf)
             if (model3_chemistry_coupling) call s_apply_model3_vapor_delta_to_fuel_species(q_cons_ts(1)%vf)
         end if
 
         if (model3_chemistry_coupling .and. chemistry .and. chem_params%reactions .and. &
             & chem_params%reaction_substeps > 0) then
             call nvtxStartRange("CHEM-REACTION-SUBSTEP")
-            if (aqss_perf_sample) then
-                $:GPU_WAIT()
-                call system_clock(chem_t0, perf_clock_rate, perf_clock_max)
-            end if
-            call s_chemistry_reaction_substep(q_cons_ts(1)%vf, q_T_sf, dt, idwint, aqss_nsub, aqss_stiff_local)
-            if (aqss_perf_sample) then
-                $:GPU_WAIT()
-                call system_clock(chem_t1, perf_clock_rate, perf_clock_max)
-                if (chem_t1 >= chem_t0) then
-                    chem_wall_local = real(chem_t1 - chem_t0, wp)/real(perf_clock_rate, wp)
-                else
-                    chem_wall_local = real(chem_t1 - chem_t0 + perf_clock_max + 1_8, wp)/real(perf_clock_rate, wp)
-                end if
-            end if
+            call s_chemistry_reaction_substep(q_cons_ts(1)%vf, q_T_sf, dt, idwint)
             call nvtxEndRange
-        end if
-
-        if (aqss_perf_sample) then
-            $:GPU_WAIT()
-            call system_clock(full_step_t1, perf_clock_rate, perf_clock_max)
-            if (full_step_t1 >= full_step_t0) then
-                full_step_wall_local = real(full_step_t1 - full_step_t0, wp)/real(perf_clock_rate, wp)
-            else
-                full_step_wall_local = real(full_step_t1 - full_step_t0 + perf_clock_max + 1_8, wp)/real(perf_clock_rate, wp)
-            end if
-
-            if (model3_chemistry_coupling .and. chemistry .and. chem_params%reactions .and. &
-                & chem_params%reaction_substeps > 0) then
-                aqss_nsub_local = real(aqss_nsub, wp)
-                if (num_procs > 1) then
-                    call s_mpi_allreduce_min(aqss_nsub_local, aqss_nsub_min)
-                    call s_mpi_allreduce_max(aqss_nsub_local, aqss_nsub_max)
-                    call s_mpi_allreduce_max(aqss_stiff_local, aqss_stiff_global)
-                    call s_mpi_allreduce_max(chem_wall_local, chem_wall_max)
-                    call s_mpi_allreduce_max(full_step_wall_local, full_step_wall_max)
-                else
-                    aqss_nsub_min = aqss_nsub_local
-                    aqss_nsub_max = aqss_nsub_local
-                    aqss_stiff_global = aqss_stiff_local
-                    chem_wall_max = chem_wall_local
-                    full_step_wall_max = full_step_wall_local
-                end if
-
-                if (proc_rank == 0) then
-                    print '(" AQSS PERF step=", I0, " nsub[min,max]=", I0, ",", I0, " stiff_max=", ES12.5, &
-                        & " chem_wall_max=", ES12.5, " full_step_wall_max=", ES12.5)', &
-                        & t_step, nint(aqss_nsub_min), nint(aqss_nsub_max), aqss_stiff_global, chem_wall_max, full_step_wall_max
-                end if
-            end if
         end if
 
         ! Time-stepping loop controls

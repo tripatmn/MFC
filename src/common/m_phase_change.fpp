@@ -61,11 +61,9 @@ contains
     end subroutine s_initialize_phasechange_module
 
     !> Apply pT- or pTg-equilibrium relaxation with mass depletion based on the incoming state conditions.
-    subroutine s_infinite_relaxation_k(q_cons_vf, phase_t_step, phase_perf_sample_in)
+    subroutine s_infinite_relaxation_k(q_cons_vf)
 
         type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
-        integer, optional, intent(in) :: phase_t_step
-        logical, optional, intent(in) :: phase_perf_sample_in
         real(wp) :: pS, pSOV, pSSL        !< equilibrium pressure
         real(wp) :: TS, TSOV, TSSL        !< equilibrium temperature
         real(wp) :: TSatOV, TSatSL        !< saturation temperatures for boundary candidates
@@ -77,18 +75,6 @@ contains
         real(wp) :: vapor_mass_after      !< vapor partial density after candidate pTg mass transfer
         real(wp) :: no_transfer_pS        !< pT-equilibrium pressure before pTg mass transfer
         real(wp) :: no_transfer_TS        !< pT-equilibrium temperature before pTg mass transfer
-        real(wp) :: pt_iter_max_loc, pt_cap_hits_loc
-        real(wp) :: ptg_cells_loc, ptg_iter_max_loc, ptg_cap_hits_loc, ptg_failures_loc, ptg_ls_max_loc, ptg_cap_res_max_loc
-        real(wp) :: ptg_conv_iter_max_loc, ptg_conv_gt100_loc, ptg_conv_gt500_loc, ptg_conv_gt1000_loc
-        real(wp) :: ptg_class_all_vapor_loc, ptg_class_all_liquid_loc, ptg_class_ambiguous_loc
-        real(wp) :: ptg_fail_ls_nondescent_loc, ptg_fail_ml_lo_bound_loc, ptg_fail_ml_hi_bound_loc
-        real(wp) :: ptg_fail_p_bound_loc, ptg_fail_res_ratio_max_loc
-        real(wp) :: pt_iter_max_glb, pt_cap_hits_glb
-        real(wp) :: ptg_cells_glb, ptg_iter_max_glb, ptg_cap_hits_glb, ptg_failures_glb, ptg_ls_max_glb, ptg_cap_res_max_glb
-        real(wp) :: ptg_conv_iter_max_glb, ptg_conv_gt100_glb, ptg_conv_gt500_glb, ptg_conv_gt1000_glb
-        real(wp) :: ptg_class_all_vapor_glb, ptg_class_all_liquid_glb, ptg_class_ambiguous_glb
-        real(wp) :: ptg_fail_ls_nondescent_glb, ptg_fail_ml_lo_bound_glb, ptg_fail_ml_hi_bound_glb
-        real(wp) :: ptg_fail_p_bound_glb, ptg_fail_res_ratio_max_glb
         ! $:GPU_DECLARE(create='[pS,TS,rhoe,dynE,rhos,rho,rM,m1,m2,MCT,TvF]')
 
         #:if not MFC_CASE_OPTIMIZATION and USING_AMD
@@ -100,12 +86,8 @@ contains
 
         !> Generic loop iterators
         integer :: i, j, k, l
-        integer :: pt_iter, pt_cap_hit, ptg_iter, ptg_cap_hit, ptg_failed, ptg_ls_iter
-        integer :: pt_iter_vap, pt_cap_hit_vap, pt_iter_liq, pt_cap_hit_liq
-        integer :: ptg_ls_nondescent, ptg_ml_lo_bound, ptg_ml_hi_bound, ptg_p_bound
-        integer :: phase_perf_step
-        real(wp) :: ptg_resnorm_final, ptg_fail_res_ratio
-        logical :: phase_perf_sample, vapor_candidate_clear, liquid_candidate_clear
+        integer :: ptg_failed
+        logical :: vapor_candidate_clear, liquid_candidate_clear
         logical :: vapor_candidate_physical, liquid_candidate_physical
 
 #ifdef _CRAYFTN
@@ -117,35 +99,10 @@ contains
 
         ! starting equilibrium solver
 
-        phase_perf_step = -1
-        phase_perf_sample = .false.
-        if (present(phase_t_step)) then
-            phase_perf_step = phase_t_step
-        end if
-        if (present(phase_perf_sample_in)) phase_perf_sample = phase_perf_sample_in
-
-        pt_iter_max_loc = 0._wp; pt_cap_hits_loc = 0._wp
-        ptg_cells_loc = 0._wp; ptg_iter_max_loc = 0._wp; ptg_cap_hits_loc = 0._wp; ptg_failures_loc = 0._wp
-        ptg_ls_max_loc = 0._wp; ptg_cap_res_max_loc = 0._wp
-        ptg_conv_iter_max_loc = 0._wp; ptg_conv_gt100_loc = 0._wp; ptg_conv_gt500_loc = 0._wp; ptg_conv_gt1000_loc = 0._wp
-        ptg_class_all_vapor_loc = 0._wp; ptg_class_all_liquid_loc = 0._wp; ptg_class_ambiguous_loc = 0._wp
-        ptg_fail_ls_nondescent_loc = 0._wp; ptg_fail_ml_lo_bound_loc = 0._wp; ptg_fail_ml_hi_bound_loc = 0._wp
-        ptg_fail_p_bound_loc = 0._wp
-        ptg_fail_res_ratio_max_loc = 0._wp
-
         $:GPU_PARALLEL_LOOP(collapse=3, private='[i, j, k, l, p_infpT, sk, hk, gk, ek, rhok, pS, pSOV, pSSL, TS, TSOV, TSSL, &
                             & TSatOV, TSatSL, G_vap, G_liq, rhoe, dynE, rhos, rho, rM, m1, m2, MCT, TvF, vapor_mass_before, &
-                            & vapor_mass_after, no_transfer_pS, no_transfer_TS, pt_iter, pt_cap_hit, pt_iter_vap, &
-                            & pt_cap_hit_vap, pt_iter_liq, pt_cap_hit_liq, ptg_iter, ptg_cap_hit, ptg_failed, ptg_ls_iter, &
-                            & ptg_ls_nondescent, ptg_ml_lo_bound, ptg_ml_hi_bound, ptg_p_bound, ptg_resnorm_final, &
-                            & ptg_fail_res_ratio, vapor_candidate_clear, liquid_candidate_clear, vapor_candidate_physical, &
-                            & liquid_candidate_physical]', &
-                            & reduction='[[pt_iter_max_loc, ptg_iter_max_loc, ptg_ls_max_loc, ptg_cap_res_max_loc, &
-                            & ptg_conv_iter_max_loc, ptg_fail_res_ratio_max_loc], [pt_cap_hits_loc, ptg_cells_loc, &
-                            & ptg_cap_hits_loc, ptg_failures_loc, ptg_conv_gt100_loc, ptg_conv_gt500_loc, ptg_conv_gt1000_loc, &
-                            & ptg_class_all_vapor_loc, ptg_class_all_liquid_loc, ptg_class_ambiguous_loc, &
-                            & ptg_fail_ls_nondescent_loc, ptg_fail_ml_lo_bound_loc, ptg_fail_ml_hi_bound_loc, &
-                            & ptg_fail_p_bound_loc]]', reductionOp='[MAX, +]')
+                            & vapor_mass_after, no_transfer_pS, no_transfer_TS, ptg_failed, vapor_candidate_clear, &
+                            & liquid_candidate_clear, vapor_candidate_physical, liquid_candidate_physical]')
         do j = 0, m
             do k = 0, n
                 do l = 0, p
@@ -189,11 +146,7 @@ contains
 
                     ! Calling pT-equilibrium for either finishing phase-change module, or as an IC for the pTg-equilibrium for this
                     ! case, MFL cannot be either 0 or 1, so I chose it to be 2
-                    call s_infinite_pt_relaxation_k(j, k, l, 2, pS, p_infpT, q_cons_vf, rhoe, TS, pt_iter, pt_cap_hit)
-                    if (phase_perf_sample) then
-                        pt_iter_max_loc = max(pt_iter_max_loc, real(pt_iter, wp))
-                        if (pt_cap_hit /= 0) pt_cap_hits_loc = pt_cap_hits_loc + 1._wp
-                    end if
+                    call s_infinite_pt_relaxation_k(j, k, l, 2, pS, p_infpT, q_cons_vf, rhoe, TS)
                     no_transfer_pS = pS
                     no_transfer_TS = TS
 
@@ -210,8 +163,7 @@ contains
 
                         q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, l) = mixM*rM
                         q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l) = (1.0_wp - mixM)*rM
-                        call s_infinite_pt_relaxation_k(j, k, l, 0, pSOV, p_infpT, q_cons_vf, rhoe, TSOV, pt_iter_vap, &
-                                                       & pt_cap_hit_vap)
+                        call s_infinite_pt_relaxation_k(j, k, l, 0, pSOV, p_infpT, q_cons_vf, rhoe, TSOV)
                         call s_TSat(pSOV, TSatOV, TSOV)
                         G_vap = f_phase_gibbs_residual(TSOV, pSOV)
                         vapor_candidate_physical = f_phase_positive_finite(pSOV) .and. f_phase_positive_finite(TSOV) .and. &
@@ -219,8 +171,7 @@ contains
 
                         q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, l) = (1.0_wp - mixM)*rM
                         q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l) = mixM*rM
-                        call s_infinite_pt_relaxation_k(j, k, l, 1, pSSL, p_infpT, q_cons_vf, rhoe, TSSL, pt_iter_liq, &
-                                                       & pt_cap_hit_liq)
+                        call s_infinite_pt_relaxation_k(j, k, l, 1, pSSL, p_infpT, q_cons_vf, rhoe, TSSL)
                         call s_TSat(pSSL, TSatSL, TSSL)
                         G_liq = f_phase_gibbs_residual(TSSL, pSSL)
                         liquid_candidate_physical = f_phase_positive_finite(pSSL) .and. f_phase_positive_finite(TSSL) .and. &
@@ -230,16 +181,6 @@ contains
                                                 & (.not. f_approx_equal(TSOV, TSatOV))
                         liquid_candidate_clear = liquid_candidate_physical .and. TSSL < TSatSL .and. abs(G_liq) > ptgalpha_eps .and. &
                                                  & (.not. f_approx_equal(TSSL, TSatSL))
-                        if (phase_perf_sample) then
-                            if (vapor_candidate_clear .and. (.not. liquid_candidate_clear)) then
-                                ptg_class_all_vapor_loc = ptg_class_all_vapor_loc + 1._wp
-                            else if (liquid_candidate_clear .and. (.not. vapor_candidate_clear)) then
-                                ptg_class_all_liquid_loc = ptg_class_all_liquid_loc + 1._wp
-                            else
-                                ptg_class_ambiguous_loc = ptg_class_ambiguous_loc + 1._wp
-                            end if
-                        end if
-
                         if (vapor_candidate_clear .and. (.not. liquid_candidate_clear)) then
                             q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, l) = mixM*rM
                             q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l) = (1.0_wp - mixM)*rM
@@ -254,37 +195,13 @@ contains
                             q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, l) = m1
                             q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l) = m2
 
-                            call s_infinite_ptg_relaxation_k(j, k, l, pS, rhoe, q_cons_vf, TS, ptg_iter, ptg_cap_hit, &
-                                                             & ptg_failed, ptg_ls_iter, ptg_resnorm_final, ptg_ls_nondescent, &
-                                                             & ptg_ml_lo_bound, ptg_ml_hi_bound, ptg_p_bound, ptg_fail_res_ratio)
+                            call s_infinite_ptg_relaxation_k(j, k, l, pS, rhoe, q_cons_vf, TS, ptg_failed)
                             if (ptg_failed /= 0) then
                                 q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, l) = m1
                                 q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l) = m2
                                 pS = no_transfer_pS
                                 TS = no_transfer_TS
                                 if (model3_chemistry_coupling) delta_m_vapor%sf(j, k, l) = 0._wp
-                            end if
-                            if (phase_perf_sample) then
-                                ptg_cells_loc = ptg_cells_loc + 1._wp
-                                ptg_iter_max_loc = max(ptg_iter_max_loc, real(ptg_iter, wp))
-                                ptg_ls_max_loc = max(ptg_ls_max_loc, real(ptg_ls_iter, wp))
-                                if (ptg_failed /= 0) then
-                                    ptg_failures_loc = ptg_failures_loc + 1._wp
-                                    ptg_fail_res_ratio_max_loc = max(ptg_fail_res_ratio_max_loc, ptg_fail_res_ratio)
-                                    if (ptg_ls_nondescent /= 0) ptg_fail_ls_nondescent_loc = ptg_fail_ls_nondescent_loc + 1._wp
-                                    if (ptg_ml_lo_bound /= 0) ptg_fail_ml_lo_bound_loc = ptg_fail_ml_lo_bound_loc + 1._wp
-                                    if (ptg_ml_hi_bound /= 0) ptg_fail_ml_hi_bound_loc = ptg_fail_ml_hi_bound_loc + 1._wp
-                                    if (ptg_p_bound /= 0) ptg_fail_p_bound_loc = ptg_fail_p_bound_loc + 1._wp
-                                end if
-                                if (ptg_cap_hit /= 0) then
-                                    ptg_cap_hits_loc = ptg_cap_hits_loc + 1._wp
-                                    ptg_cap_res_max_loc = max(ptg_cap_res_max_loc, ptg_resnorm_final)
-                                else if (ptg_failed == 0) then
-                                    ptg_conv_iter_max_loc = max(ptg_conv_iter_max_loc, real(ptg_iter, wp))
-                                    if (ptg_iter > 100) ptg_conv_gt100_loc = ptg_conv_gt100_loc + 1._wp
-                                    if (ptg_iter > 500) ptg_conv_gt500_loc = ptg_conv_gt500_loc + 1._wp
-                                    if (ptg_iter > 1000) ptg_conv_gt1000_loc = ptg_conv_gt1000_loc + 1._wp
-                                end if
                             end if
                         end if
 
@@ -343,70 +260,6 @@ contains
         end do
         $:END_GPU_PARALLEL_LOOP()
 
-        if (phase_perf_sample) then
-            $:GPU_WAIT()
-
-            if (num_procs > 1) then
-                call s_mpi_allreduce_max(pt_iter_max_loc, pt_iter_max_glb)
-                call s_mpi_allreduce_sum(pt_cap_hits_loc, pt_cap_hits_glb)
-                call s_mpi_allreduce_sum(ptg_cells_loc, ptg_cells_glb)
-                call s_mpi_allreduce_max(ptg_iter_max_loc, ptg_iter_max_glb)
-                call s_mpi_allreduce_sum(ptg_cap_hits_loc, ptg_cap_hits_glb)
-                call s_mpi_allreduce_sum(ptg_failures_loc, ptg_failures_glb)
-                call s_mpi_allreduce_max(ptg_ls_max_loc, ptg_ls_max_glb)
-                call s_mpi_allreduce_max(ptg_cap_res_max_loc, ptg_cap_res_max_glb)
-                call s_mpi_allreduce_max(ptg_conv_iter_max_loc, ptg_conv_iter_max_glb)
-                call s_mpi_allreduce_sum(ptg_conv_gt100_loc, ptg_conv_gt100_glb)
-                call s_mpi_allreduce_sum(ptg_conv_gt500_loc, ptg_conv_gt500_glb)
-                call s_mpi_allreduce_sum(ptg_conv_gt1000_loc, ptg_conv_gt1000_glb)
-                call s_mpi_allreduce_sum(ptg_class_all_vapor_loc, ptg_class_all_vapor_glb)
-                call s_mpi_allreduce_sum(ptg_class_all_liquid_loc, ptg_class_all_liquid_glb)
-                call s_mpi_allreduce_sum(ptg_class_ambiguous_loc, ptg_class_ambiguous_glb)
-                call s_mpi_allreduce_sum(ptg_fail_ls_nondescent_loc, ptg_fail_ls_nondescent_glb)
-                call s_mpi_allreduce_sum(ptg_fail_ml_lo_bound_loc, ptg_fail_ml_lo_bound_glb)
-                call s_mpi_allreduce_sum(ptg_fail_ml_hi_bound_loc, ptg_fail_ml_hi_bound_glb)
-                call s_mpi_allreduce_sum(ptg_fail_p_bound_loc, ptg_fail_p_bound_glb)
-                call s_mpi_allreduce_max(ptg_fail_res_ratio_max_loc, ptg_fail_res_ratio_max_glb)
-            else
-                pt_iter_max_glb = pt_iter_max_loc
-                pt_cap_hits_glb = pt_cap_hits_loc
-                ptg_cells_glb = ptg_cells_loc
-                ptg_iter_max_glb = ptg_iter_max_loc
-                ptg_cap_hits_glb = ptg_cap_hits_loc
-                ptg_failures_glb = ptg_failures_loc
-                ptg_ls_max_glb = ptg_ls_max_loc
-                ptg_cap_res_max_glb = ptg_cap_res_max_loc
-                ptg_conv_iter_max_glb = ptg_conv_iter_max_loc
-                ptg_conv_gt100_glb = ptg_conv_gt100_loc
-                ptg_conv_gt500_glb = ptg_conv_gt500_loc
-                ptg_conv_gt1000_glb = ptg_conv_gt1000_loc
-                ptg_class_all_vapor_glb = ptg_class_all_vapor_loc
-                ptg_class_all_liquid_glb = ptg_class_all_liquid_loc
-                ptg_class_ambiguous_glb = ptg_class_ambiguous_loc
-                ptg_fail_ls_nondescent_glb = ptg_fail_ls_nondescent_loc
-                ptg_fail_ml_lo_bound_glb = ptg_fail_ml_lo_bound_loc
-                ptg_fail_ml_hi_bound_glb = ptg_fail_ml_hi_bound_loc
-                ptg_fail_p_bound_glb = ptg_fail_p_bound_loc
-                ptg_fail_res_ratio_max_glb = ptg_fail_res_ratio_max_loc
-            end if
-
-            if (proc_rank == 0) then
-                print '(" PHASE PERF step=", I0, " pt_iter_max=", I0, " pt_cap_hits=", I0, &
-                    & " ptg_cells=", I0, " ptg_iter_max=", I0, " ptg_cap_hits=", I0, &
-                    & " ptg_failures=", I0, " ptg_ls_max=", I0, " ptg_cap_res_max=", ES12.5, " ptg_conv_iter_max=", I0, &
-                    & " ptg_conv_gt100=", I0, " ptg_conv_gt500=", I0, " ptg_conv_gt1000=", I0, &
-                    & " ptg_class_all_vapor=", I0, " ptg_class_all_liquid=", I0, " ptg_class_ambiguous=", I0, &
-                    & " ptg_fail_ls_nondescent=", I0, " ptg_fail_ml_lo_bound=", I0, " ptg_fail_ml_hi_bound=", I0, &
-                    & " ptg_fail_p_bound=", I0, " ptg_fail_res_ratio_max=", ES12.5)', &
-                    & phase_perf_step, nint(pt_iter_max_glb), nint(pt_cap_hits_glb), nint(ptg_cells_glb), &
-                    & nint(ptg_iter_max_glb), nint(ptg_cap_hits_glb), nint(ptg_failures_glb), nint(ptg_ls_max_glb), &
-                    & ptg_cap_res_max_glb, nint(ptg_conv_iter_max_glb), nint(ptg_conv_gt100_glb), nint(ptg_conv_gt500_glb), &
-                    & nint(ptg_conv_gt1000_glb), nint(ptg_class_all_vapor_glb), nint(ptg_class_all_liquid_glb), &
-                    & nint(ptg_class_ambiguous_glb), nint(ptg_fail_ls_nondescent_glb), nint(ptg_fail_ml_lo_bound_glb), &
-                    & nint(ptg_fail_ml_hi_bound_glb), nint(ptg_fail_p_bound_glb), ptg_fail_res_ratio_max_glb
-            end if
-        end if
-
     end subroutine s_infinite_relaxation_k
 
     !> Add accepted vaporized fuel mass to the coupled gas species state exactly once.
@@ -439,7 +292,7 @@ contains
 
     !> Apply pT-equilibrium relaxation for N fluids
     !! @param MFL flag: 0=gas, 1=liquid, 2=mixture
-    subroutine s_infinite_pt_relaxation_k(j, k, l, MFL, pS, p_infpT, q_cons_vf, rhoe, TS, pt_iter, pt_cap_hit)
+    subroutine s_infinite_pt_relaxation_k(j, k, l, MFL, pS, p_infpT, q_cons_vf, rhoe, TS)
 
         $:GPU_ROUTINE(function_name='s_infinite_pt_relaxation_k', parallelism='[seq]', cray_noinline=True)
 
@@ -450,14 +303,10 @@ contains
         type(scalar_field), dimension(sys_size), intent(in) :: q_cons_vf
         real(wp), intent(in)                                :: rhoe
         real(wp), intent(out)                               :: TS
-        integer, intent(out)                                :: pt_iter
-        integer, intent(out)                                :: pt_cap_hit
         real(wp)                                            :: gp, gpp, hp, pO, mCP, mQ  !< variables for the Newton Solver
         real(wp)                                            :: p_infpT_sum
         integer                                             :: i, ns                     !< generic loop iterators
         ! auxiliary variables for the pT-equilibrium solver
-        pt_iter = 0
-        pt_cap_hit = 0
         mCP = 0.0_wp; mQ = 0.0_wp; p_infpT_sum = 0._wp
         $:GPU_LOOP(parallelism='[seq]')
         do i = 1, num_fluids
@@ -511,10 +360,8 @@ contains
         do while ((abs(pS - pO) > palpha_eps) .and. (abs(pS - pO) > (palpha_eps/1.e4_wp)*abs(pO)) .or. (ns == 0))
             ! increasing counter
             ns = ns + 1
-            pt_iter = ns
             ! guard against non-convergence: accept the last iterate rather than looping forever
             if (ns >= max_iter) then
-                pt_cap_hit = 1
                 exit
             end if
 
@@ -665,9 +512,7 @@ contains
     !! rhoe-relative branch). Every step is projected onto the physical bounds 0 <= ml <= mT, pS > pmin. This converges in a handful
     !! of iterations with a bounded, uniform count (no GPU warp divergence), unlike the former fixed 1e-3 underrelaxation that
     !! stalled far from the root.
-    subroutine s_infinite_ptg_relaxation_k(j, k, l, pS, rhoe, q_cons_vf, TS, ptg_iter, ptg_cap_hit, ptg_failed, &
-                                           & ptg_ls_iter, ptg_resnorm_final, ptg_ls_nondescent, ptg_ml_lo_bound, &
-                                           & ptg_ml_hi_bound, ptg_p_bound, ptg_fail_res_ratio)
+    subroutine s_infinite_ptg_relaxation_k(j, k, l, pS, rhoe, q_cons_vf, TS, ptg_failed)
 
         $:GPU_ROUTINE(function_name='s_infinite_ptg_relaxation_k', parallelism='[seq]', cray_noinline=True)
 
@@ -676,29 +521,15 @@ contains
         real(wp), intent(in)                                   :: rhoe
         type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
         real(wp), intent(inout)                                :: TS
-        integer, intent(out)                                   :: ptg_iter, ptg_cap_hit, ptg_failed, ptg_ls_iter
-        real(wp), intent(out)                                  :: ptg_resnorm_final
-        integer, intent(out)                                   :: ptg_ls_nondescent, ptg_ml_lo_bound, ptg_ml_hi_bound, ptg_p_bound
-        real(wp), intent(out)                                  :: ptg_fail_res_ratio
+        integer, intent(out)                                   :: ptg_failed
         real(wp), dimension(2, 2)                              :: Jac, InvJac
         real(wp), dimension(2)                                 :: R2D, R2D_try, DeltamP
         real(wp)                                               :: mCP, mCPD, mCVGP, mCVGP2, mQ
         real(wp)                                               :: ml, ml_try, mT, pS_try, pmin, lambda, resnorm, resnorm_try
-        real(wp)                                               :: initial_resnorm, iter_start_resnorm
-        real(wp)                                               :: ml_unprojected, pS_unprojected
         real(wp)                                               :: dFdT, dTdm, dTdp, detJ
         integer                                                :: ns, ls
 
-        ptg_iter = 0
-        ptg_cap_hit = 0
         ptg_failed = 0
-        ptg_ls_iter = 0
-        ptg_resnorm_final = 0._wp
-        ptg_ls_nondescent = 0
-        ptg_ml_lo_bound = 0
-        ptg_ml_hi_bound = 0
-        ptg_p_bound = 0
-        ptg_fail_res_ratio = 0._wp
 
         ! total reacting mass is conserved; the liquid mass ml is the primary unknown, vapor mass = mT - ml
         mT = q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, l) + q_cons_vf(vp + eqn_idx%cont%beg - 1)%sf(j, k, l)
@@ -716,12 +547,10 @@ contains
 
         call s_compute_ptg_residual(ml, mT, pS, j, k, l, q_cons_vf, rhoe, R2D, TS, mCP, mQ, mCVGP, mCVGP2, mCPD)
         resnorm = sqrt(R2D(1)**2 + R2D(2)**2)
-        initial_resnorm = resnorm
 
         do ns = 1, ptg_max_iter
             ! converged on the absolute residual, or on the rhoe-relative residual (multiply form, rhoe > 0)
             if ((resnorm <= ptgalpha_eps) .or. (resnorm <= (ptgalpha_eps/1.e6_wp)*rhoe)) exit
-            ptg_iter = ns
 
             ! 2x2 Jacobian of (Gibbs equality, energy) with respect to (ml, pS) at the current state
             dFdT = -(cvs(lp)*gs_min(lp) - cvs(vp)*gs_min(vp))*log(TS) - (qvps(lp) - qvps(vp)) + cvs(lp)*(gs_min(lp) - 1)*log(pS &
@@ -763,13 +592,7 @@ contains
             ! backtracking line search: halve the step until the residual decreases, keeping the state
             ! physical (0 <= ml <= mT, pS above the stiffened-gas floor)
             lambda = 1.0_wp
-            iter_start_resnorm = resnorm
             do ls = 1, ptg_ls_max
-                ml_unprojected = ml + lambda*DeltamP(1)
-                pS_unprojected = pS + lambda*DeltamP(2)
-                if (ml_unprojected < 0.0_wp) ptg_ml_lo_bound = 1
-                if (ml_unprojected > mT) ptg_ml_hi_bound = 1
-                if (pS_unprojected < pmin) ptg_p_bound = 1
                 ml_try = min(max(ml + lambda*DeltamP(1), 0.0_wp), mT)
                 pS_try = max(pS + lambda*DeltamP(2), pmin)
                 call s_compute_ptg_residual(ml_try, mT, pS_try, j, k, l, q_cons_vf, rhoe, R2D_try, TS, mCP, mQ, mCVGP, mCVGP2, mCPD)
@@ -777,20 +600,15 @@ contains
                 if ((resnorm_try < resnorm) .or. (ls == ptg_ls_max)) exit
                 lambda = 0.5_wp*lambda
             end do
-            ptg_ls_iter = max(ptg_ls_iter, ls)
-            if (.not. (resnorm_try < iter_start_resnorm)) ptg_ls_nondescent = 1
 
             ! accept the trial state (TS, mCP, mQ, mCVGP, mCVGP2, mCPD already set to it by the last call)
             ml = ml_try; pS = pS_try; R2D = R2D_try; resnorm = resnorm_try
             if (ns == ptg_max_iter) then
                 if (.not. ((resnorm <= ptgalpha_eps) .or. (resnorm <= (ptgalpha_eps/1.e6_wp)*rhoe))) then
-                    ptg_cap_hit = 1
                     ptg_failed = 1
                 end if
             end if
         end do
-        ptg_resnorm_final = resnorm
-        if (ptg_failed /= 0) ptg_fail_res_ratio = resnorm/max(initial_resnorm, tiny(initial_resnorm))
 
         ! commit the reacting masses (mT conserved) and set the common temperature
         q_cons_vf(lp + eqn_idx%cont%beg - 1)%sf(j, k, l) = ml

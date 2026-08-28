@@ -184,14 +184,12 @@ contains
     !! an explicit source would overshoot and diverge, and relaxes to the correct chemical equilibrium rather than over-heating.
     !! Reaction is split from the flow update at first order (Lie-Trotter), and each sub-step renormalizes the mass fractions to sum
     !! to one (which does not strictly conserve elemental composition).
-    subroutine s_chemistry_reaction_substep(q_cons_vf, q_T_sf, dtime, bounds, nsub_selected, stiff_max_selected)
+    subroutine s_chemistry_reaction_substep(q_cons_vf, q_T_sf, dtime, bounds)
 
         type(scalar_field), dimension(sys_size), intent(inout) :: q_cons_vf
         type(scalar_field), intent(inout)                      :: q_T_sf
         real(wp), intent(in)                                   :: dtime
         type(int_bounds_info), dimension(1:3), intent(in)      :: bounds
-        integer, optional, intent(out)                         :: nsub_selected
-        real(wp), optional, intent(out)                        :: stiff_max_selected
         integer                                                :: x, y, z, eqn, s, nsub
         real(wp)                                               :: rho, energy, T, T_new, dt_sub, Ysum
         real(wp)                                               :: rho_g_stored, alpha_g, rho_g_intrinsic, rhoY_sum, sumY
@@ -272,8 +270,6 @@ contains
         else
             nsub = chem_params%reaction_substeps
         end if
-        if (present(nsub_selected)) nsub_selected = nsub
-        if (present(stiff_max_selected)) stiff_max_selected = stiff_max
         dt_sub = dtime/real(nsub, wp)
 
         $:GPU_PARALLEL_LOOP(collapse=3, private='[Ys, cdot, ddot, y0, prod0, Lloss, alp, eqn, s, rho, energy, T, T_new, Ysum, r, &
