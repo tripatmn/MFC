@@ -15,7 +15,7 @@ module m_rhs
     use m_variables_conversion
     use m_weno
     use m_constants, only: riemann_solver_hll, riemann_solver_hlld, model_eqns_6eq, int_comp_mthinc, recon_type_weno, &
-        & recon_type_muscl
+        & recon_type_muscl, sgm_eps
     use m_muscl
     use m_riemann_solvers
     use m_cbc
@@ -76,9 +76,10 @@ module m_rhs
     type(vector_field), allocatable, dimension(:) :: flux_n
     type(vector_field), allocatable, dimension(:) :: flux_src_n
     type(vector_field), allocatable, dimension(:) :: flux_gsrc_n
+    type(scalar_field), allocatable, dimension(:) :: chem_diff_energy_flux_n
 
 #if defined(MFC_OpenACC)
-    $:GPU_DECLARE(create='[flux_n, flux_src_n, flux_gsrc_n]')
+    $:GPU_DECLARE(create='[flux_n, flux_src_n, flux_gsrc_n, chem_diff_energy_flux_n]')
 #endif
     !> @}
 
@@ -207,6 +208,9 @@ contains
             @:ALLOCATE(flux_n(1:num_dims))
             @:ALLOCATE(flux_src_n(1:num_dims))
             @:ALLOCATE(flux_gsrc_n(1:num_dims))
+            if (chemistry .and. chem_params%diffusion .and. model3_chemistry_coupling) then
+                @:ALLOCATE(chem_diff_energy_flux_n(1:num_dims))
+            end if
 
             do i = 1, num_dims
                 @:ALLOCATE(flux_n(i)%vf(1:sys_size))
@@ -266,6 +270,12 @@ contains
                         @:ALLOCATE(flux_gsrc_n(i)%vf(l)%sf(idwbuff(1)%beg:idwbuff(1)%end, idwbuff(2)%beg:idwbuff(2)%end, &
                                    & idwbuff(3)%beg:idwbuff(3)%end))
                     end do
+                end if
+
+                if (chemistry .and. chem_params%diffusion .and. model3_chemistry_coupling) then
+                    @:ALLOCATE(chem_diff_energy_flux_n(i)%sf(idwbuff(1)%beg:idwbuff(1)%end, &
+                               & idwbuff(2)%beg:idwbuff(2)%end, idwbuff(3)%beg:idwbuff(3)%end))
+                    @:ACC_SETUP_SFs(chem_diff_energy_flux_n(i))
                 end if
 
                 @:ACC_SETUP_VFs(flux_n(i))
@@ -721,7 +731,13 @@ contains
                     ! RHS for diffusion
                     if (chemistry .and. chem_params%diffusion) then
                         call nvtxStartRange("RHS-CHEM-DIFFUSION")
-                        call s_compute_chemistry_diffusion_flux(id, q_prim_qp%vf, flux_src_n(id)%vf, irx, iry, irz, q_T_sf)
+                        if (model3_chemistry_coupling) then
+                            call s_compute_chemistry_diffusion_flux(id, q_cons_qp%vf, q_prim_qp%vf, flux_src_n(id)%vf, &
+                                                                    & irx, iry, irz, q_T_sf, chem_diff_energy_flux_n(id))
+                        else
+                            call s_compute_chemistry_diffusion_flux(id, q_cons_qp%vf, q_prim_qp%vf, flux_src_n(id)%vf, &
+                                                                    & irx, iry, irz, q_T_sf)
+                        end if
                         call nvtxEndRange
                     end if
 
@@ -730,6 +746,9 @@ contains
                         call nvtxStartRange("RHS-ADD-PHYSICS")
                         call s_compute_additional_physics_rhs(id, q_prim_qp%vf, rhs_vf, flux_src_n(id)%vf, dq_prim_dx_qp(1)%vf, &
                                                               & dq_prim_dy_qp(1)%vf, dq_prim_dz_qp(1)%vf)
+                        if (chemistry .and. chem_params%diffusion .and. model3_chemistry_coupling) then
+                            call s_apply_model3_chemistry_diffusion_energy_rhs(id, q_prim_qp%vf, rhs_vf, chem_diff_energy_flux_n(id))
+                        end if
                         call nvtxEndRange
                     end if
 
@@ -1779,7 +1798,7 @@ contains
                                            & l) - flux_src_n_in(i)%sf(j, k, l))
                                 end do
 
-                                if (.not. viscous) then
+                                if ((.not. viscous) .and. (.not. model3_chemistry_coupling)) then
                                     rhs_vf(eqn_idx%E)%sf(j, k, l) = rhs_vf(eqn_idx%E)%sf(j, k, &
                                            & l) + 1._wp/dx(j)*(flux_src_n_in(eqn_idx%E)%sf(j - 1, k, &
                                            & l) - flux_src_n_in(eqn_idx%E)%sf(j, k, l))
@@ -1863,7 +1882,7 @@ contains
                                         rhs_vf(i)%sf(j, k, l) = rhs_vf(i)%sf(j, k, l) + 1._wp/dy(k)*(flux_src_n_in(i)%sf(j, &
                                                & k - 1, l) - flux_src_n_in(i)%sf(j, k, l))
                                     end do
-                                    if (.not. viscous) then
+                                    if ((.not. viscous) .and. (.not. model3_chemistry_coupling)) then
                                         rhs_vf(eqn_idx%E)%sf(j, k, l) = rhs_vf(eqn_idx%E)%sf(j, k, &
                                                & l) + 1._wp/dy(k)*(flux_src_n_in(eqn_idx%E)%sf(j, k - 1, &
                                                & l) - flux_src_n_in(eqn_idx%E)%sf(j, k, l))
@@ -1955,7 +1974,7 @@ contains
                                     rhs_vf(i)%sf(j, k, l) = rhs_vf(i)%sf(j, k, l) + 1._wp/dz(l)*(flux_src_n_in(i)%sf(j, k, &
                                            & l - 1) - flux_src_n_in(i)%sf(j, k, l))
                                 end do
-                                if (.not. viscous) then
+                                if ((.not. viscous) .and. (.not. model3_chemistry_coupling)) then
                                     rhs_vf(eqn_idx%E)%sf(j, k, l) = rhs_vf(eqn_idx%E)%sf(j, k, &
                                            & l) + 1._wp/dz(l)*(flux_src_n_in(eqn_idx%E)%sf(j, k, &
                                            & l - 1) - flux_src_n_in(eqn_idx%E)%sf(j, k, l))
@@ -2097,6 +2116,98 @@ contains
     end subroutine s_reconstruct_cell_boundary_values_first_order
 
     !> Module deallocation and/or disassociation procedures
+
+    !> Add the coupled Model-3 chemistry-diffusion energy RHS and redistribute it to gas phasic internal energies.
+    subroutine s_apply_model3_chemistry_diffusion_energy_rhs(idir, q_prim_vf, rhs_vf, chem_diff_energy_flux_sf)
+
+        integer, intent(in)                                    :: idir
+        type(scalar_field), dimension(sys_size), intent(in)    :: q_prim_vf
+        type(scalar_field), dimension(sys_size), intent(inout) :: rhs_vf
+        type(scalar_field), intent(in)                         :: chem_diff_energy_flux_sf
+        integer                                                :: j, k, l
+        real(wp)                                               :: inv_ds, chem_energy_rhs, flux_face1, flux_face2
+        real(wp)                                               :: alpha_2, alpha_3, denom, w2, w3
+
+        select case (idir)
+        case (1)
+            $:GPU_PARALLEL_LOOP(collapse=3, private='[j, k, l, inv_ds, chem_energy_rhs, flux_face1, flux_face2, alpha_2, alpha_3, denom, w2, w3]')
+            do l = 0, p
+                do k = 0, n
+                    do j = 0, m
+                        inv_ds = 1._wp/dx(j)
+                        flux_face1 = chem_diff_energy_flux_sf%sf(j - 1, k, l)
+                        flux_face2 = chem_diff_energy_flux_sf%sf(j, k, l)
+                        chem_energy_rhs = inv_ds*(flux_face1 - flux_face2)
+                        alpha_2 = q_prim_vf(eqn_idx%adv%beg + 1)%sf(j, k, l)
+                        alpha_3 = q_prim_vf(eqn_idx%adv%beg + 2)%sf(j, k, l)
+                        denom = alpha_2*gammas(2) + alpha_3*gammas(3)
+                        if (denom > sgm_eps) then
+                            w2 = alpha_2*gammas(2)/denom
+                            w3 = alpha_3*gammas(3)/denom
+                            rhs_vf(eqn_idx%E)%sf(j, k, l) = rhs_vf(eqn_idx%E)%sf(j, k, l) + chem_energy_rhs
+                            rhs_vf(eqn_idx%int_en%beg + 1)%sf(j, k, l) = rhs_vf(eqn_idx%int_en%beg + 1)%sf(j, k, l) &
+                                                                        & + w2*chem_energy_rhs
+                            rhs_vf(eqn_idx%int_en%beg + 2)%sf(j, k, l) = rhs_vf(eqn_idx%int_en%beg + 2)%sf(j, k, l) &
+                                                                        & + w3*chem_energy_rhs
+                        end if
+                    end do
+                end do
+            end do
+            $:END_GPU_PARALLEL_LOOP()
+        case (2)
+            $:GPU_PARALLEL_LOOP(collapse=3, private='[j, k, l, inv_ds, chem_energy_rhs, flux_face1, flux_face2, alpha_2, alpha_3, denom, w2, w3]')
+            do l = 0, p
+                do k = 0, n
+                    do j = 0, m
+                        inv_ds = 1._wp/dy(k)
+                        flux_face1 = chem_diff_energy_flux_sf%sf(j, k - 1, l)
+                        flux_face2 = chem_diff_energy_flux_sf%sf(j, k, l)
+                        chem_energy_rhs = inv_ds*(flux_face1 - flux_face2)
+                        alpha_2 = q_prim_vf(eqn_idx%adv%beg + 1)%sf(j, k, l)
+                        alpha_3 = q_prim_vf(eqn_idx%adv%beg + 2)%sf(j, k, l)
+                        denom = alpha_2*gammas(2) + alpha_3*gammas(3)
+                        if (denom > sgm_eps) then
+                            w2 = alpha_2*gammas(2)/denom
+                            w3 = alpha_3*gammas(3)/denom
+                            rhs_vf(eqn_idx%E)%sf(j, k, l) = rhs_vf(eqn_idx%E)%sf(j, k, l) + chem_energy_rhs
+                            rhs_vf(eqn_idx%int_en%beg + 1)%sf(j, k, l) = rhs_vf(eqn_idx%int_en%beg + 1)%sf(j, k, l) &
+                                                                        & + w2*chem_energy_rhs
+                            rhs_vf(eqn_idx%int_en%beg + 2)%sf(j, k, l) = rhs_vf(eqn_idx%int_en%beg + 2)%sf(j, k, l) &
+                                                                        & + w3*chem_energy_rhs
+                        end if
+                    end do
+                end do
+            end do
+            $:END_GPU_PARALLEL_LOOP()
+        case (3)
+            $:GPU_PARALLEL_LOOP(collapse=3, private='[j, k, l, inv_ds, chem_energy_rhs, flux_face1, flux_face2, alpha_2, alpha_3, denom, w2, w3]')
+            do l = 0, p
+                do k = 0, n
+                    do j = 0, m
+                        inv_ds = 1._wp/dz(l)
+                        flux_face1 = chem_diff_energy_flux_sf%sf(j, k, l - 1)
+                        flux_face2 = chem_diff_energy_flux_sf%sf(j, k, l)
+                        chem_energy_rhs = inv_ds*(flux_face1 - flux_face2)
+                        alpha_2 = q_prim_vf(eqn_idx%adv%beg + 1)%sf(j, k, l)
+                        alpha_3 = q_prim_vf(eqn_idx%adv%beg + 2)%sf(j, k, l)
+                        denom = alpha_2*gammas(2) + alpha_3*gammas(3)
+                        if (denom > sgm_eps) then
+                            w2 = alpha_2*gammas(2)/denom
+                            w3 = alpha_3*gammas(3)/denom
+                            rhs_vf(eqn_idx%E)%sf(j, k, l) = rhs_vf(eqn_idx%E)%sf(j, k, l) + chem_energy_rhs
+                            rhs_vf(eqn_idx%int_en%beg + 1)%sf(j, k, l) = rhs_vf(eqn_idx%int_en%beg + 1)%sf(j, k, l) &
+                                                                        & + w2*chem_energy_rhs
+                            rhs_vf(eqn_idx%int_en%beg + 2)%sf(j, k, l) = rhs_vf(eqn_idx%int_en%beg + 2)%sf(j, k, l) &
+                                                                        & + w3*chem_energy_rhs
+                        end if
+                    end do
+                end do
+            end do
+            $:END_GPU_PARALLEL_LOOP()
+        end select
+
+    end subroutine s_apply_model3_chemistry_diffusion_energy_rhs
+
     impure subroutine s_finalize_rhs_module
 
         integer :: i, j, l
@@ -2204,6 +2315,9 @@ contains
                         nullify (flux_src_n(i)%vf(l)%sf)
                         @:DEALLOCATE(flux_gsrc_n(i)%vf(l)%sf)
                     end do
+                    if (chemistry .and. chem_params%diffusion .and. model3_chemistry_coupling) then
+                        @:DEALLOCATE(chem_diff_energy_flux_n(i)%sf)
+                    end if
                 else
                     do l = 1, sys_size
                         @:DEALLOCATE(flux_n(i)%vf(l)%sf)
@@ -2231,12 +2345,19 @@ contains
                     end if
 
                     @:DEALLOCATE(flux_src_n(i)%vf(eqn_idx%adv%beg)%sf)
+
+                    if (chemistry .and. chem_params%diffusion .and. model3_chemistry_coupling) then
+                        @:DEALLOCATE(chem_diff_energy_flux_n(i)%sf)
+                    end if
                 end if
 
                 @:DEALLOCATE(flux_n(i)%vf, flux_src_n(i)%vf, flux_gsrc_n(i)%vf)
             end do
 
             @:DEALLOCATE(flux_n, flux_src_n, flux_gsrc_n)
+            if (chemistry .and. chem_params%diffusion .and. model3_chemistry_coupling) then
+                @:DEALLOCATE(chem_diff_energy_flux_n)
+            end if
             do i = 1, num_dims
                 do l = eqn_idx%mom%beg, eqn_idx%mom%end
                     @:DEALLOCATE(qL_prim(i)%vf(l)%sf)

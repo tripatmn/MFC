@@ -244,8 +244,8 @@ class TestModel3ChemistryCoupling(ConstraintTestCase):
     def test_accepts_reacting_aqss_with_valid_substeps(self):
         self.assertAccepts({**MODEL3_CHEM_COUPLING, "chem_params%reactions": "T", "chem_params%reaction_substeps": 2})
 
-    def test_rejects_stage1_diffusion(self):
-        self.assertRejects({**MODEL3_CHEM_COUPLING, "chem_params%diffusion": "T"}, "Model-3 reacting diffusion is planned")
+    def test_accepts_model3_coupled_diffusion(self):
+        self.assertAccepts({**MODEL3_CHEM_COUPLING, "chem_params%diffusion": "T"})
 
     def test_rejects_invalid_fuel_species_id(self):
         self.assertRejects({**MODEL3_CHEM_COUPLING, "fuel_species_id": 0}, "fuel_species_id >= 1")

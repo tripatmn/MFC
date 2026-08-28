@@ -44,6 +44,55 @@ contains
 
     end subroutine compute_viscosity_and_inversion
 
+    !> Extract the coupled Model-3 gas state for diffusion from converted, ghost-populated primitive variables.
+    subroutine s_get_model3_chemistry_diffusion_state(q_prim_vf, q_T_sf, x, y, z, rho_g_stored, alpha_g, rho_g_intrinsic, Ys, &
+                                                     & rhoY_sum, sumY, species_closure_error, species_closure_relerr, &
+                                                     & gas_pressure, gas_temperature, active_gas)
+
+        $:GPU_ROUTINE(function_name='s_get_model3_chemistry_diffusion_state',parallelism='[seq]', cray_inline=True)
+
+        type(scalar_field), dimension(sys_size), intent(in) :: q_prim_vf
+        type(scalar_field), intent(in)                      :: q_T_sf
+        integer, intent(in)                                 :: x, y, z
+        real(wp), intent(out)                                :: rho_g_stored, alpha_g, rho_g_intrinsic
+        real(wp), dimension(num_species), intent(out)        :: Ys
+        real(wp), intent(out)                                :: rhoY_sum, sumY
+        real(wp), intent(out)                                :: species_closure_error, species_closure_relerr
+        real(wp), intent(out)                                :: gas_pressure, gas_temperature
+        logical, intent(out)                                 :: active_gas
+        integer                                              :: eqn
+
+        rho_g_stored = q_prim_vf(eqn_idx%cont%beg + 1)%sf(x, y, z) + q_prim_vf(eqn_idx%cont%beg + 2)%sf(x, y, z)
+        alpha_g = q_prim_vf(eqn_idx%adv%beg + 1)%sf(x, y, z) + q_prim_vf(eqn_idx%adv%beg + 2)%sf(x, y, z)
+
+        rho_g_intrinsic = 0._wp
+        rhoY_sum = 0._wp
+        sumY = 0._wp
+        species_closure_error = 0._wp
+        species_closure_relerr = 0._wp
+        gas_pressure = 0._wp
+        gas_temperature = 0._wp
+        Ys(:) = 0._wp
+
+        active_gas = (alpha_g > sgm_eps) .and. (rho_g_stored > sgm_eps)
+        if (.not. active_gas) return
+
+        rho_g_intrinsic = rho_g_stored/alpha_g
+
+        $:GPU_LOOP(parallelism='[seq]')
+        do eqn = 1, num_species
+            Ys(eqn) = q_prim_vf(eqn_idx%species%beg + eqn - 1)%sf(x, y, z)
+            sumY = sumY + Ys(eqn)
+        end do
+
+        rhoY_sum = rho_g_stored*sumY
+        species_closure_error = rhoY_sum - rho_g_stored
+        species_closure_relerr = species_closure_error/max(rho_g_stored, sgm_eps)
+        gas_pressure = q_prim_vf(eqn_idx%E)%sf(x, y, z)
+        gas_temperature = q_T_sf%sf(x, y, z)
+
+    end subroutine s_get_model3_chemistry_diffusion_state
+
     !> Initialize the temperature field from conservative variables by inverting the energy equation.
     subroutine s_compute_q_T_sf(q_T_sf, q_cons_vf, bounds)
 
@@ -396,13 +445,16 @@ contains
     end subroutine s_chemistry_reaction_substep
 
     !> Compute species mass diffusion fluxes at cell interfaces using mixture-averaged diffusivities.
-    subroutine s_compute_chemistry_diffusion_flux(idir, q_prim_qp, flux_src_vf, irx, iry, irz, q_T_sf)
+    subroutine s_compute_chemistry_diffusion_flux(idir, q_cons_qp, q_prim_qp, flux_src_vf, irx, iry, irz, q_T_sf, &
+                                                 & chem_diff_energy_flux_sf)
 
+        type(scalar_field), dimension(sys_size), intent(in)    :: q_cons_qp
         type(scalar_field), dimension(sys_size), intent(in)    :: q_prim_qp
         type(scalar_field), dimension(sys_size), intent(inout) :: flux_src_vf
         type(int_bounds_info), intent(in)                      :: irx, iry, irz
         integer, intent(in)                                    :: idir
         type(scalar_field), intent(in)                         :: q_T_sf
+        type(scalar_field), intent(inout), optional            :: chem_diff_energy_flux_sf
 
         #:if not MFC_CASE_OPTIMIZATION and USING_AMD
             real(wp), dimension(10) :: Xs_L, Xs_R, Xs_cell, Ys_L, Ys_R, Ys_cell
@@ -422,6 +474,10 @@ contains
         real(wp)              :: Cp_L, Cp_R
         real(wp)              :: diffusivity_L, diffusivity_R, diffusivity_cell
         real(wp)              :: hmix_L, hmix_R, dh_dxi
+        real(wp)              :: rho_g_stored_L, rho_g_stored_R, alpha_g_L, alpha_g_R, rho_g_intrinsic_L, rho_g_intrinsic_R
+        real(wp)              :: rhoY_sum_L, rhoY_sum_R, sumY_L, sumY_R, closure_err_L, closure_err_R, closure_relerr_L, closure_relerr_R
+        real(wp)              :: gas_pressure_L, gas_pressure_R, gas_temperature_L, gas_temperature_R, alpha_g_face
+        logical               :: active_gas_L, active_gas_R
         integer               :: x, y, z, i, n, eqn
         integer, dimension(3) :: offsets
 
@@ -433,14 +489,20 @@ contains
             ! Set offsets based on direction using array indexing
             offsets = 0
             offsets(idir) = 1
+            if (model3_chemistry_coupling .and. .not. present(chem_diff_energy_flux_sf)) then
+                error stop 'Model-3 chemistry diffusion requires a separate chemistry energy flux field.'
+            end if
             ! Model 1: Mixture-Average Transport
             if (chem_params%transport_model == 1) then
-                ! Note: Added 'i' and 'eqn' to private list.
-                $:GPU_PARALLEL_LOOP(collapse=3,  private='[x, y, z, i, eqn, Ys_L, Ys_R, Ys_cell, Xs_L, Xs_R, &
+                $:GPU_PARALLEL_LOOP(collapse=3, private='[x, y, z, i, eqn, Ys_L, Ys_R, Ys_cell, Xs_L, Xs_R, &
                                     & mass_diffusivities_mixavg1, mass_diffusivities_mixavg2, mass_diffusivities_mixavg_Cell, &
                                     & h_l, h_r, Xs_cell, h_k, dXk_dxi, Mass_Diffu_Flux, Mass_Diffu_Energy, MW_L, MW_R, MW_cell, &
                                     & T_L, T_R, P_L, P_R, rho_L, rho_R, rho_cell, rho_Vic, lambda_L, lambda_R, lambda_Cell, &
-                                    & dT_dxi, grid_spacing]', copyin='[offsets]')
+                                    & dT_dxi, grid_spacing, rho_g_stored_L, rho_g_stored_R, alpha_g_L, alpha_g_R, &
+                                    & rho_g_intrinsic_L, rho_g_intrinsic_R, rhoY_sum_L, rhoY_sum_R, sumY_L, sumY_R, &
+                                    & closure_err_L, closure_err_R, closure_relerr_L, closure_relerr_R, gas_pressure_L, &
+                                    & gas_pressure_R, gas_temperature_L, gas_temperature_R, alpha_g_face, active_gas_L, &
+                                    & active_gas_R]', copyin='[offsets]')
                 do z = isc3%beg, isc3%end
                     do y = isc2%beg, isc2%end
                         do x = isc1%beg, isc1%end
@@ -454,11 +516,52 @@ contains
                                 grid_spacing = z_cc(z + 1) - z_cc(z)
                             end select
 
-                            ! Extract species mass fractions
+                            alpha_g_face = 1._wp
+                            if (model3_chemistry_coupling) then
+                                call s_get_model3_chemistry_diffusion_state(q_prim_qp, q_T_sf, x, y, z, rho_g_stored_L, &
+                                                                 & alpha_g_L, rho_g_intrinsic_L, Ys_L, rhoY_sum_L, sumY_L, &
+                                                                 & closure_err_L, closure_relerr_L, gas_pressure_L, &
+                                                                 & gas_temperature_L, active_gas_L)
+                                call s_get_model3_chemistry_diffusion_state(q_prim_qp, q_T_sf, x + offsets(1), y + offsets(2), &
+                                                                 & z + offsets(3), rho_g_stored_R, alpha_g_R, &
+                                                                 & rho_g_intrinsic_R, Ys_R, rhoY_sum_R, sumY_R, &
+                                                                 & closure_err_R, closure_relerr_R, gas_pressure_R, &
+                                                                 & gas_temperature_R, active_gas_R)
+                                if (.not. (active_gas_L .and. active_gas_R)) then
+                                    chem_diff_energy_flux_sf%sf(x, y, z) = 0._wp
+                                    $:GPU_LOOP(parallelism='[seq]')
+                                    do eqn = eqn_idx%species%beg, eqn_idx%species%end
+                                        flux_src_vf(eqn)%sf(x, y, z) = 0._wp
+                                    end do
+                                    cycle
+                                end if
+                                alpha_g_face = 0.5_wp*(alpha_g_L + alpha_g_R)
+                                P_L = gas_pressure_L
+                                P_R = gas_pressure_R
+                                rho_L = rho_g_intrinsic_L
+                                rho_R = rho_g_intrinsic_R
+                                T_L = gas_temperature_L
+                                T_R = gas_temperature_R
+                            else
+                                ! Extract species mass fractions
+                                $:GPU_LOOP(parallelism='[seq]')
+                                do i = eqn_idx%species%beg, eqn_idx%species%end
+                                    Ys_L(i - eqn_idx%species%beg + 1) = q_prim_qp(i)%sf(x, y, z)
+                                    Ys_R(i - eqn_idx%species%beg + 1) = q_prim_qp(i)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+                                end do
+
+                                P_L = q_prim_qp(eqn_idx%E)%sf(x, y, z)
+                                P_R = q_prim_qp(eqn_idx%E)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+
+                                rho_L = q_prim_qp(1)%sf(x, y, z)
+                                rho_R = q_prim_qp(1)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+
+                                T_L = q_T_sf%sf(x, y, z)
+                                T_R = q_T_sf%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+                            end if
+
                             $:GPU_LOOP(parallelism='[seq]')
                             do i = eqn_idx%species%beg, eqn_idx%species%end
-                                Ys_L(i - eqn_idx%species%beg + 1) = q_prim_qp(i)%sf(x, y, z)
-                                Ys_R(i - eqn_idx%species%beg + 1) = q_prim_qp(i)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
                                 Ys_cell(i - eqn_idx%species%beg + 1) = 0.5_wp*(Ys_L(i - eqn_idx%species%beg + 1) + Ys_R(i &
                                         & - eqn_idx%species%beg + 1))
                             end do
@@ -470,15 +573,6 @@ contains
 
                             call get_mole_fractions(MW_L, Ys_L, Xs_L)
                             call get_mole_fractions(MW_R, Ys_R, Xs_R)
-
-                            P_L = q_prim_qp(eqn_idx%E)%sf(x, y, z)
-                            P_R = q_prim_qp(eqn_idx%E)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
-
-                            rho_L = q_prim_qp(1)%sf(x, y, z)
-                            rho_R = q_prim_qp(1)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
-
-                            T_L = q_T_sf%sf(x, y, z)
-                            T_R = q_T_sf%sf(x + offsets(1), y + offsets(2), z + offsets(3))
 
                             rho_cell = 0.5_wp*(rho_L + rho_R)
                             dT_dxi = (T_R - T_L)/grid_spacing
@@ -544,13 +638,23 @@ contains
                             ! Add thermal conduction contribution
                             Mass_Diffu_Energy = lambda_Cell*dT_dxi + Mass_Diffu_Energy
 
-                            ! Update flux arrays
-                            flux_src_vf(eqn_idx%E)%sf(x, y, z) = flux_src_vf(eqn_idx%E)%sf(x, y, z) - Mass_Diffu_Energy
+                            if (model3_chemistry_coupling) then
+                                $:GPU_LOOP(parallelism='[seq]')
+                                do eqn = eqn_idx%species%beg, eqn_idx%species%end
+                                    Mass_Diffu_Flux(eqn - eqn_idx%species%beg + 1) = alpha_g_face*Mass_Diffu_Flux(eqn &
+                                                    & - eqn_idx%species%beg + 1)
+                                end do
+                                Mass_Diffu_Energy = alpha_g_face*Mass_Diffu_Energy
+                                chem_diff_energy_flux_sf%sf(x, y, z) = -Mass_Diffu_Energy
+                            else
+                                flux_src_vf(eqn_idx%E)%sf(x, y, z) = flux_src_vf(eqn_idx%E)%sf(x, y, z) - Mass_Diffu_Energy
+                            end if
 
+                            ! Update flux arrays
                             $:GPU_LOOP(parallelism='[seq]')
                             do eqn = eqn_idx%species%beg, eqn_idx%species%end
-                                flux_src_vf(eqn)%sf(x, y, z) = flux_src_vf(eqn)%sf(x, y, &
-                                            & z) - Mass_Diffu_Flux(eqn - eqn_idx%species%beg + 1)
+                                flux_src_vf(eqn)%sf(x, y, &
+                                            & z) = flux_src_vf(eqn)%sf(x, y, z) - Mass_Diffu_Flux(eqn - eqn_idx%species%beg + 1)
                             end do
                         end do
                     end do
@@ -559,11 +663,14 @@ contains
 
                 ! Model 2: Unity Lewis Number
             else if (chem_params%transport_model == 2) then
-                ! Note: Added ALL scalars and 'i'/'eqn' to private list to prevent race conditions.
                 $:GPU_PARALLEL_LOOP(collapse=3, private='[x, y, z, i, eqn, Ys_L, Ys_R, Ys_cell, dYk_dxi, Mass_Diffu_Flux, &
                                     & grid_spacing, MW_L, MW_R, MW_cell, P_L, P_R, rho_L, rho_R, rho_cell, T_L, T_R, Cp_L, Cp_R, &
                                     & hmix_L, hmix_R, dh_dxi, lambda_L, lambda_R, lambda_Cell, diffusivity_L, diffusivity_R, &
-                                    & diffusivity_cell, Mass_Diffu_Energy]', copyin='[offsets]')
+                                    & diffusivity_cell, Mass_Diffu_Energy, rho_Vic, rho_g_stored_L, rho_g_stored_R, alpha_g_L, &
+                                    & alpha_g_R, rho_g_intrinsic_L, rho_g_intrinsic_R, rhoY_sum_L, rhoY_sum_R, sumY_L, sumY_R, &
+                                    & closure_err_L, closure_err_R, closure_relerr_L, closure_relerr_R, gas_pressure_L, &
+                                    & gas_pressure_R, gas_temperature_L, gas_temperature_R, alpha_g_face, active_gas_L, &
+                                    & active_gas_R]', copyin='[offsets]')
                 do z = isc3%beg, isc3%end
                     do y = isc2%beg, isc2%end
                         do x = isc1%beg, isc1%end
@@ -577,11 +684,52 @@ contains
                                 grid_spacing = z_cc(z + 1) - z_cc(z)
                             end select
 
-                            ! Extract species mass fractions
+                            alpha_g_face = 1._wp
+                            if (model3_chemistry_coupling) then
+                                call s_get_model3_chemistry_diffusion_state(q_prim_qp, q_T_sf, x, y, z, rho_g_stored_L, &
+                                                                 & alpha_g_L, rho_g_intrinsic_L, Ys_L, rhoY_sum_L, sumY_L, &
+                                                                 & closure_err_L, closure_relerr_L, gas_pressure_L, &
+                                                                 & gas_temperature_L, active_gas_L)
+                                call s_get_model3_chemistry_diffusion_state(q_prim_qp, q_T_sf, x + offsets(1), y + offsets(2), &
+                                                                 & z + offsets(3), rho_g_stored_R, alpha_g_R, &
+                                                                 & rho_g_intrinsic_R, Ys_R, rhoY_sum_R, sumY_R, &
+                                                                 & closure_err_R, closure_relerr_R, gas_pressure_R, &
+                                                                 & gas_temperature_R, active_gas_R)
+                                if (.not. (active_gas_L .and. active_gas_R)) then
+                                    chem_diff_energy_flux_sf%sf(x, y, z) = 0._wp
+                                    $:GPU_LOOP(parallelism='[seq]')
+                                    do eqn = eqn_idx%species%beg, eqn_idx%species%end
+                                        flux_src_vf(eqn)%sf(x, y, z) = 0._wp
+                                    end do
+                                    cycle
+                                end if
+                                alpha_g_face = 0.5_wp*(alpha_g_L + alpha_g_R)
+                                P_L = gas_pressure_L
+                                P_R = gas_pressure_R
+                                rho_L = rho_g_intrinsic_L
+                                rho_R = rho_g_intrinsic_R
+                                T_L = gas_temperature_L
+                                T_R = gas_temperature_R
+                            else
+                                ! Extract species mass fractions
+                                $:GPU_LOOP(parallelism='[seq]')
+                                do i = eqn_idx%species%beg, eqn_idx%species%end
+                                    Ys_L(i - eqn_idx%species%beg + 1) = q_prim_qp(i)%sf(x, y, z)
+                                    Ys_R(i - eqn_idx%species%beg + 1) = q_prim_qp(i)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+                                end do
+
+                                P_L = q_prim_qp(eqn_idx%E)%sf(x, y, z)
+                                P_R = q_prim_qp(eqn_idx%E)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+
+                                rho_L = q_prim_qp(1)%sf(x, y, z)
+                                rho_R = q_prim_qp(1)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+
+                                T_L = q_T_sf%sf(x, y, z)
+                                T_R = q_T_sf%sf(x + offsets(1), y + offsets(2), z + offsets(3))
+                            end if
+
                             $:GPU_LOOP(parallelism='[seq]')
                             do i = eqn_idx%species%beg, eqn_idx%species%end
-                                Ys_L(i - eqn_idx%species%beg + 1) = q_prim_qp(i)%sf(x, y, z)
-                                Ys_R(i - eqn_idx%species%beg + 1) = q_prim_qp(i)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
                                 Ys_cell(i - eqn_idx%species%beg + 1) = 0.5_wp*(Ys_L(i - eqn_idx%species%beg + 1) + Ys_R(i &
                                         & - eqn_idx%species%beg + 1))
                             end do
@@ -590,15 +738,6 @@ contains
                             call get_mixture_molecular_weight(Ys_L, MW_L)
                             call get_mixture_molecular_weight(Ys_R, MW_R)
                             MW_cell = 0.5_wp*(MW_L + MW_R)
-
-                            P_L = q_prim_qp(eqn_idx%E)%sf(x, y, z)
-                            P_R = q_prim_qp(eqn_idx%E)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
-
-                            rho_L = q_prim_qp(1)%sf(x, y, z)
-                            rho_R = q_prim_qp(1)%sf(x + offsets(1), y + offsets(2), z + offsets(3))
-
-                            T_L = q_T_sf%sf(x, y, z)
-                            T_R = q_T_sf%sf(x + offsets(1), y + offsets(2), z + offsets(3))
 
                             rho_cell = 0.5_wp*(rho_L + rho_R)
 
@@ -623,7 +762,6 @@ contains
                             diffusivity_L = lambda_L/rho_L/Cp_L
                             diffusivity_R = lambda_R/rho_R/Cp_R
 
-                            lambda_Cell = 0.5_wp*(lambda_R + lambda_L)
                             diffusivity_cell = 0.5_wp*(diffusivity_R + diffusivity_L)
 
                             ! Calculate mass diffusion fluxes
@@ -636,13 +774,29 @@ contains
                             end do
                             Mass_Diffu_Energy = rho_cell*diffusivity_cell*dh_dxi
 
-                            ! Update flux arrays
-                            flux_src_vf(eqn_idx%E)%sf(x, y, z) = flux_src_vf(eqn_idx%E)%sf(x, y, z) - Mass_Diffu_Energy
+                            if (model3_chemistry_coupling) then
+                                rho_Vic = 0._wp
+                                $:GPU_LOOP(parallelism='[seq]')
+                                do eqn = eqn_idx%species%beg, eqn_idx%species%end
+                                    rho_Vic = rho_Vic + Mass_Diffu_Flux(eqn - eqn_idx%species%beg + 1)
+                                end do
+                                $:GPU_LOOP(parallelism='[seq]')
+                                do eqn = eqn_idx%species%beg, eqn_idx%species%end
+                                    Mass_Diffu_Flux(eqn - eqn_idx%species%beg + 1) = alpha_g_face*(Mass_Diffu_Flux(eqn &
+                                                    & - eqn_idx%species%beg + 1) - rho_Vic*Ys_cell(eqn &
+                                                    & - eqn_idx%species%beg + 1))
+                                end do
+                                Mass_Diffu_Energy = alpha_g_face*Mass_Diffu_Energy
+                                chem_diff_energy_flux_sf%sf(x, y, z) = -Mass_Diffu_Energy
+                            else
+                                flux_src_vf(eqn_idx%E)%sf(x, y, z) = flux_src_vf(eqn_idx%E)%sf(x, y, z) - Mass_Diffu_Energy
+                            end if
 
+                            ! Update flux arrays
                             $:GPU_LOOP(parallelism='[seq]')
                             do eqn = eqn_idx%species%beg, eqn_idx%species%end
-                                flux_src_vf(eqn)%sf(x, y, z) = flux_src_vf(eqn)%sf(x, y, &
-                                            & z) - Mass_Diffu_Flux(eqn - eqn_idx%species%beg + 1)
+                                flux_src_vf(eqn)%sf(x, y, &
+                                            & z) = flux_src_vf(eqn)%sf(x, y, z) - Mass_Diffu_Flux(eqn - eqn_idx%species%beg + 1)
                             end do
                         end do
                     end do

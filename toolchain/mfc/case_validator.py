@@ -1827,10 +1827,6 @@ class CaseValidator:
             "model3_chemistry_coupling requires chem_params%reaction_substeps > 0; coupled explicit chemistry is not implemented",
         )
         self.prohibit(
-            model3_chemistry_coupling and diffusion,
-            "model3_chemistry_coupling does not support chem_params%diffusion = T in Stage 1; Model-3 reacting diffusion is planned but not yet implemented",
-        )
-        self.prohibit(
             model3_chemistry_coupling and (fuel_species_id is None or fuel_species_id < 1),
             "model3_chemistry_coupling requires fuel_species_id >= 1",
         )

@@ -73,6 +73,24 @@ def _primitive_to_conservative_source() -> str:
     return re.sub(r"[\s&]+", "", match.group("body"))
 
 
+def _rhs_source() -> str:
+    text = (REPO_ROOT / "src" / "simulation" / "m_rhs.fpp").read_text()
+    return re.sub(r"[\s&]+", "", text)
+
+
+def _chemistry_diffusion_source() -> str:
+    text = CHEMISTRY_SRC.read_text()
+    match = re.search(
+        r"subroutine s_compute_chemistry_diffusion_flux\b(?P<body>.*?)"
+        r"end subroutine s_compute_chemistry_diffusion_flux",
+        text,
+        flags=re.S,
+    )
+    if match is None:
+        raise AssertionError("s_compute_chemistry_diffusion_flux not found")
+    return re.sub(r"[\s&]+", "", match.group("body"))
+
+
 def _temperature_init_source() -> str:
     text = CHEMISTRY_SRC.read_text()
     match = re.search(
@@ -228,7 +246,7 @@ class TestModel3PhaseChangeVaporDelta(unittest.TestCase):
         self.assertIn("no_transfer_TS=TS", text)
         self.assertIn("call s_infinite_ptg_relaxation_k".replace(" ", ""), text)
         self.assertIn("vapor_mass_after=q_cons_vf(vp+eqn_idx%cont%beg-1)%sf(j,k,l)", text)
-        self.assertIn("if(vapor_mass_after<vapor_mass_before)then", text)
+        self.assertIn("if((ptg_failed/=0).or.(vapor_mass_after<vapor_mass_before))then", text)
         self.assertIn("q_cons_vf(lp+eqn_idx%cont%beg-1)%sf(j,k,l)=m1", text)
         self.assertIn("q_cons_vf(vp+eqn_idx%cont%beg-1)%sf(j,k,l)=m2", text)
         self.assertIn("pS=no_transfer_pS", text)
@@ -286,7 +304,7 @@ class TestModel3PhaseChangeVaporDelta(unittest.TestCase):
 
 
 class TestModel3AqssOrdering(unittest.TestCase):
-    COUPLED_AQSS_CALL = "calls_chemistry_reaction_substep(q_cons_ts(1)%vf,q_T_sf,dt,idwint,aqss_nsub,aqss_stiff_local)"
+    COUPLED_AQSS_CALL = "calls_chemistry_reaction_substep(q_cons_ts(1)%vf,q_T_sf,dt,idwint)"
 
     def test_upstream_aqss_call_is_gated_off_for_coupled_mode(self):
         text = _compact_fortran(TIME_STEPPERS_SRC)
@@ -625,3 +643,34 @@ class TestModel3HllcSpeciesFlux(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestModel3ChemistryDiffusion(unittest.TestCase):
+    def test_coupled_diffusion_uses_model3_gas_state_and_alpha_weight_once(self):
+        src = _chemistry_diffusion_source()
+        self.assertIn("calls_get_model3_chemistry_diffusion_state(q_prim_qp,q_T_sf,x,y,z,rho_g_stored_L,alpha_g_L,rho_g_intrinsic_L", src)
+        self.assertIn("calls_get_model3_chemistry_diffusion_state(q_prim_qp,q_T_sf,x+offsets(1),y+offsets(2),z+offsets(3),rho_g_stored_R,alpha_g_R,rho_g_intrinsic_R", src)
+        self.assertNotIn("calls_get_model3_chemistry_gas_state(q_cons_qp,x,y,z,rho_g_stored_L", src)
+        self.assertIn("rho_L=rho_g_intrinsic_L", src)
+        self.assertIn("rho_R=rho_g_intrinsic_R", src)
+        self.assertIn("alpha_g_face=0.5_wp*(alpha_g_L+alpha_g_R)", src)
+        self.assertIn("Mass_Diffu_Flux(eqn-eqn_idx%species%beg+1)=alpha_g_face*Mass_Diffu_Flux", src)
+        self.assertNotIn("alpha_g_face=min(alpha_g_L,alpha_g_R)", src)
+
+    def test_coupled_diffusion_energy_is_separate_and_cell_redistributed(self):
+        chem_src = _chemistry_diffusion_source()
+        rhs_src = _rhs_source()
+        self.assertIn("chem_diff_energy_flux_sf%sf(x,y,z)=-Mass_Diffu_Energy", chem_src)
+        self.assertIn("subroutines_apply_model3_chemistry_diffusion_energy_rhs", rhs_src)
+        self.assertIn("denom=alpha_2*gammas(2)+alpha_3*gammas(3)", rhs_src)
+        self.assertIn("w2=alpha_2*gammas(2)/denom", rhs_src)
+        self.assertIn("w3=alpha_3*gammas(3)/denom", rhs_src)
+        self.assertIn("rhs_vf(eqn_idx%E)%sf(j,k,l)=rhs_vf(eqn_idx%E)%sf(j,k,l)+chem_energy_rhs", rhs_src)
+        self.assertIn("rhs_vf(eqn_idx%int_en%beg+1)%sf(j,k,l)=rhs_vf(eqn_idx%int_en%beg+1)%sf(j,k,l)+w2*chem_energy_rhs", rhs_src)
+        self.assertIn("rhs_vf(eqn_idx%int_en%beg+2)%sf(j,k,l)=rhs_vf(eqn_idx%int_en%beg+2)%sf(j,k,l)+w3*chem_energy_rhs", rhs_src)
+
+    def test_noncoupled_diffusion_formulas_remain_present(self):
+        src = _chemistry_diffusion_source()
+        self.assertIn("rho_L=q_prim_qp(1)%sf(x,y,z)", src)
+        self.assertIn("rho_cell=0.5_wp*(rho_L+rho_R)", src)
+        self.assertIn("flux_src_vf(eqn_idx%E)%sf(x,y,z)=flux_src_vf(eqn_idx%E)%sf(x,y,z)-Mass_Diffu_Energy", src)
