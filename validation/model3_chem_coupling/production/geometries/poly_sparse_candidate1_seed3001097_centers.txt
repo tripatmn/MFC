@@ -1,0 +1,282 @@
+SPARSE POLYDISPERSE CIRCULAR CLOUD — FROZEN GEOMETRY
+=====================================================
+
+Candidate              = 1
+Seed                   = 3001097
+Number of droplets     = 43
+Reference D            = 50.000 um
+Cloud radius Rc        = 250.000 um
+Rc/Dref                = 5.000
+Cloud center x/Dref    = 10.000000
+Cloud center y/Dref    = 8.000000
+Area fraction          = 14.000000 %
+Diameter range         = 10.0 - 50.0 um
+Minimum surface gap    = 10.399697 um
+Mean normalized S*     = 1.961301
+Minimum normalized S*  = 1.341573
+Area centroid offset/Rc= 0.004501
+
+Patch  ID   D_um   R_um   x_local/Dref   y_local/Dref   x_centroid/Dref   y_centroid/Dref   x_um   y_um
+---------------------------------------------------------------------------------------------------------------
+    3    1   30.0   15.0      3.119355      2.027384        13.119355        10.027384    655.968    501.369
+    4    2   50.0   25.0     -3.966477      1.970796         6.033523         9.970796    301.676    498.540
+    5    3   30.0   15.0      0.946975     -3.404239        10.946975         4.595761    547.349    229.788
+    6    4   40.0   20.0     -0.858544      2.152031         9.141456        10.152031    457.073    507.602
+    7    5   50.0   25.0     -1.983539     -3.713420         8.016461         4.286580    400.823    214.329
+    8    6   10.0    5.0     -1.044773     -2.755273         8.955227         5.244727    447.761    262.236
+    9    7   10.0    5.0      0.712493     -0.830431        10.712493         7.169569    535.625    358.478
+   10    8   10.0    5.0     -0.431801     -3.481399         9.568199         4.518601    478.410    225.930
+   11    9   10.0    5.0     -4.176187     -1.070464         5.823813         6.929536    291.191    346.477
+   12   10   10.0    5.0     -2.649008      2.920255         7.350992        10.920255    367.550    546.013
+   13   11   10.0    5.0      1.588310     -0.232464        11.588310         7.767536    579.416    388.377
+   14   12   20.0   10.0      0.307185      2.759646        10.307185        10.759646    515.359    537.982
+   15   13   20.0   10.0      1.020496      4.369872        11.020496        12.369872    551.025    618.494
+   16   14   20.0   10.0      2.091520      1.319006        12.091520         9.319006    604.576    465.950
+   17   15   40.0   20.0      3.184182     -1.835489        13.184182         6.164511    659.209    308.226
+   18   16   20.0   10.0     -0.479567     -2.191151         9.520433         5.808849    476.022    290.442
+   19   17   10.0    5.0     -1.721593      1.626702         8.278407         9.626702    413.920    481.335
+   20   18   10.0    5.0      1.793932     -2.372089        11.793932         5.627911    589.697    281.396
+   21   19   20.0   10.0      3.522056      3.118755        13.522056        11.118755    676.103    555.938
+   22   20   40.0   20.0     -3.706488      0.737011         6.293512         8.737011    314.676    436.851
+   23   21   50.0   25.0      1.947722      2.255405        11.947722        10.255405    597.386    512.770
+   24   22   30.0   15.0     -1.631125     -0.584226         8.368875         7.415774    418.444    370.789
+   25   23   10.0    5.0     -0.145509      4.731770         9.854491        12.731770    492.725    636.588
+   26   24   40.0   20.0     -2.474244      1.266466         7.525756         9.266466    376.288    463.323
+   27   25   30.0   15.0     -4.164692     -2.059574         5.835308         5.940426    291.765    297.021
+   28   26   20.0   10.0      2.818258     -3.857366        12.818258         4.142634    640.913    207.132
+   29   27   50.0   25.0      2.453280     -0.059041        12.453280         7.940959    622.664    397.048
+   30   28   10.0    5.0      3.285230     -3.418076        13.285230         4.581924    664.261    229.096
+   31   29   20.0   10.0      2.701481      3.831071        12.701481        11.831071    635.074    591.554
+   32   30   20.0   10.0     -4.580209      0.542648         5.419791         8.542648    270.990    427.132
+   33   31   30.0   15.0      3.876231      0.156495        13.876231         8.156495    693.812    407.825
+   34   32   30.0   15.0     -2.824973     -0.947569         7.175027         7.052431    358.751    352.622
+   35   33   30.0   15.0      3.974172      2.232706        13.974172        10.232706    698.709    511.635
+   36   34   50.0   25.0      0.824580      1.521669        10.824580         9.521669    541.229    476.083
+   37   35   20.0   10.0      0.527028     -1.762246        10.527028         6.237754    526.351    311.888
+   38   36   10.0    5.0      4.691680     -0.017656        14.691680         7.982344    734.584    399.117
+   39   37   20.0   10.0     -1.732716      3.706163         8.267284        11.706163    413.364    585.308
+   40   38   40.0   20.0     -0.125960     -4.119926         9.874040         3.880074    493.702    194.004
+   41   39   20.0   10.0     -0.136457     -2.729423         9.863543         5.270577    493.177    263.529
+   42   40   40.0   20.0      0.619049     -0.114603        10.619049         7.885397    530.952    394.270
+   43   41   10.0    5.0     -1.001641     -4.103008         8.998359         3.896992    449.918    194.850
+   44   42   30.0   15.0      1.853742     -3.697787        11.853742         4.302213    592.687    215.111
+   45   43   10.0    5.0     -3.330651      3.384970         6.669349        11.384970    333.467    569.248
+
+
+MFC-STYLE PATCH COORDINATES
+===========================
+
+"patch_icpp(3)%x_centroid": 13.119355 * D,
+"patch_icpp(3)%y_centroid": 10.027384 * D,
+"patch_icpp(3)%radius": 0.300000 * D,
+# diameter = 30.0 um
+
+"patch_icpp(4)%x_centroid": 6.033523 * D,
+"patch_icpp(4)%y_centroid": 9.970796 * D,
+"patch_icpp(4)%radius": 0.500000 * D,
+# diameter = 50.0 um
+
+"patch_icpp(5)%x_centroid": 10.946975 * D,
+"patch_icpp(5)%y_centroid": 4.595761 * D,
+"patch_icpp(5)%radius": 0.300000 * D,
+# diameter = 30.0 um
+
+"patch_icpp(6)%x_centroid": 9.141456 * D,
+"patch_icpp(6)%y_centroid": 10.152031 * D,
+"patch_icpp(6)%radius": 0.400000 * D,
+# diameter = 40.0 um
+
+"patch_icpp(7)%x_centroid": 8.016461 * D,
+"patch_icpp(7)%y_centroid": 4.286580 * D,
+"patch_icpp(7)%radius": 0.500000 * D,
+# diameter = 50.0 um
+
+"patch_icpp(8)%x_centroid": 8.955227 * D,
+"patch_icpp(8)%y_centroid": 5.244727 * D,
+"patch_icpp(8)%radius": 0.100000 * D,
+# diameter = 10.0 um
+
+"patch_icpp(9)%x_centroid": 10.712493 * D,
+"patch_icpp(9)%y_centroid": 7.169569 * D,
+"patch_icpp(9)%radius": 0.100000 * D,
+# diameter = 10.0 um
+
+"patch_icpp(10)%x_centroid": 9.568199 * D,
+"patch_icpp(10)%y_centroid": 4.518601 * D,
+"patch_icpp(10)%radius": 0.100000 * D,
+# diameter = 10.0 um
+
+"patch_icpp(11)%x_centroid": 5.823813 * D,
+"patch_icpp(11)%y_centroid": 6.929536 * D,
+"patch_icpp(11)%radius": 0.100000 * D,
+# diameter = 10.0 um
+
+"patch_icpp(12)%x_centroid": 7.350992 * D,
+"patch_icpp(12)%y_centroid": 10.920255 * D,
+"patch_icpp(12)%radius": 0.100000 * D,
+# diameter = 10.0 um
+
+"patch_icpp(13)%x_centroid": 11.588310 * D,
+"patch_icpp(13)%y_centroid": 7.767536 * D,
+"patch_icpp(13)%radius": 0.100000 * D,
+# diameter = 10.0 um
+
+"patch_icpp(14)%x_centroid": 10.307185 * D,
+"patch_icpp(14)%y_centroid": 10.759646 * D,
+"patch_icpp(14)%radius": 0.200000 * D,
+# diameter = 20.0 um
+
+"patch_icpp(15)%x_centroid": 11.020496 * D,
+"patch_icpp(15)%y_centroid": 12.369872 * D,
+"patch_icpp(15)%radius": 0.200000 * D,
+# diameter = 20.0 um
+
+"patch_icpp(16)%x_centroid": 12.091520 * D,
+"patch_icpp(16)%y_centroid": 9.319006 * D,
+"patch_icpp(16)%radius": 0.200000 * D,
+# diameter = 20.0 um
+
+"patch_icpp(17)%x_centroid": 13.184182 * D,
+"patch_icpp(17)%y_centroid": 6.164511 * D,
+"patch_icpp(17)%radius": 0.400000 * D,
+# diameter = 40.0 um
+
+"patch_icpp(18)%x_centroid": 9.520433 * D,
+"patch_icpp(18)%y_centroid": 5.808849 * D,
+"patch_icpp(18)%radius": 0.200000 * D,
+# diameter = 20.0 um
+
+"patch_icpp(19)%x_centroid": 8.278407 * D,
+"patch_icpp(19)%y_centroid": 9.626702 * D,
+"patch_icpp(19)%radius": 0.100000 * D,
+# diameter = 10.0 um
+
+"patch_icpp(20)%x_centroid": 11.793932 * D,
+"patch_icpp(20)%y_centroid": 5.627911 * D,
+"patch_icpp(20)%radius": 0.100000 * D,
+# diameter = 10.0 um
+
+"patch_icpp(21)%x_centroid": 13.522056 * D,
+"patch_icpp(21)%y_centroid": 11.118755 * D,
+"patch_icpp(21)%radius": 0.200000 * D,
+# diameter = 20.0 um
+
+"patch_icpp(22)%x_centroid": 6.293512 * D,
+"patch_icpp(22)%y_centroid": 8.737011 * D,
+"patch_icpp(22)%radius": 0.400000 * D,
+# diameter = 40.0 um
+
+"patch_icpp(23)%x_centroid": 11.947722 * D,
+"patch_icpp(23)%y_centroid": 10.255405 * D,
+"patch_icpp(23)%radius": 0.500000 * D,
+# diameter = 50.0 um
+
+"patch_icpp(24)%x_centroid": 8.368875 * D,
+"patch_icpp(24)%y_centroid": 7.415774 * D,
+"patch_icpp(24)%radius": 0.300000 * D,
+# diameter = 30.0 um
+
+"patch_icpp(25)%x_centroid": 9.854491 * D,
+"patch_icpp(25)%y_centroid": 12.731770 * D,
+"patch_icpp(25)%radius": 0.100000 * D,
+# diameter = 10.0 um
+
+"patch_icpp(26)%x_centroid": 7.525756 * D,
+"patch_icpp(26)%y_centroid": 9.266466 * D,
+"patch_icpp(26)%radius": 0.400000 * D,
+# diameter = 40.0 um
+
+"patch_icpp(27)%x_centroid": 5.835308 * D,
+"patch_icpp(27)%y_centroid": 5.940426 * D,
+"patch_icpp(27)%radius": 0.300000 * D,
+# diameter = 30.0 um
+
+"patch_icpp(28)%x_centroid": 12.818258 * D,
+"patch_icpp(28)%y_centroid": 4.142634 * D,
+"patch_icpp(28)%radius": 0.200000 * D,
+# diameter = 20.0 um
+
+"patch_icpp(29)%x_centroid": 12.453280 * D,
+"patch_icpp(29)%y_centroid": 7.940959 * D,
+"patch_icpp(29)%radius": 0.500000 * D,
+# diameter = 50.0 um
+
+"patch_icpp(30)%x_centroid": 13.285230 * D,
+"patch_icpp(30)%y_centroid": 4.581924 * D,
+"patch_icpp(30)%radius": 0.100000 * D,
+# diameter = 10.0 um
+
+"patch_icpp(31)%x_centroid": 12.701481 * D,
+"patch_icpp(31)%y_centroid": 11.831071 * D,
+"patch_icpp(31)%radius": 0.200000 * D,
+# diameter = 20.0 um
+
+"patch_icpp(32)%x_centroid": 5.419791 * D,
+"patch_icpp(32)%y_centroid": 8.542648 * D,
+"patch_icpp(32)%radius": 0.200000 * D,
+# diameter = 20.0 um
+
+"patch_icpp(33)%x_centroid": 13.876231 * D,
+"patch_icpp(33)%y_centroid": 8.156495 * D,
+"patch_icpp(33)%radius": 0.300000 * D,
+# diameter = 30.0 um
+
+"patch_icpp(34)%x_centroid": 7.175027 * D,
+"patch_icpp(34)%y_centroid": 7.052431 * D,
+"patch_icpp(34)%radius": 0.300000 * D,
+# diameter = 30.0 um
+
+"patch_icpp(35)%x_centroid": 13.974172 * D,
+"patch_icpp(35)%y_centroid": 10.232706 * D,
+"patch_icpp(35)%radius": 0.300000 * D,
+# diameter = 30.0 um
+
+"patch_icpp(36)%x_centroid": 10.824580 * D,
+"patch_icpp(36)%y_centroid": 9.521669 * D,
+"patch_icpp(36)%radius": 0.500000 * D,
+# diameter = 50.0 um
+
+"patch_icpp(37)%x_centroid": 10.527028 * D,
+"patch_icpp(37)%y_centroid": 6.237754 * D,
+"patch_icpp(37)%radius": 0.200000 * D,
+# diameter = 20.0 um
+
+"patch_icpp(38)%x_centroid": 14.691680 * D,
+"patch_icpp(38)%y_centroid": 7.982344 * D,
+"patch_icpp(38)%radius": 0.100000 * D,
+# diameter = 10.0 um
+
+"patch_icpp(39)%x_centroid": 8.267284 * D,
+"patch_icpp(39)%y_centroid": 11.706163 * D,
+"patch_icpp(39)%radius": 0.200000 * D,
+# diameter = 20.0 um
+
+"patch_icpp(40)%x_centroid": 9.874040 * D,
+"patch_icpp(40)%y_centroid": 3.880074 * D,
+"patch_icpp(40)%radius": 0.400000 * D,
+# diameter = 40.0 um
+
+"patch_icpp(41)%x_centroid": 9.863543 * D,
+"patch_icpp(41)%y_centroid": 5.270577 * D,
+"patch_icpp(41)%radius": 0.200000 * D,
+# diameter = 20.0 um
+
+"patch_icpp(42)%x_centroid": 10.619049 * D,
+"patch_icpp(42)%y_centroid": 7.885397 * D,
+"patch_icpp(42)%radius": 0.400000 * D,
+# diameter = 40.0 um
+
+"patch_icpp(43)%x_centroid": 8.998359 * D,
+"patch_icpp(43)%y_centroid": 3.896992 * D,
+"patch_icpp(43)%radius": 0.100000 * D,
+# diameter = 10.0 um
+
+"patch_icpp(44)%x_centroid": 11.853742 * D,
+"patch_icpp(44)%y_centroid": 4.302213 * D,
+"patch_icpp(44)%radius": 0.300000 * D,
+# diameter = 30.0 um
+
+"patch_icpp(45)%x_centroid": 6.669349 * D,
+"patch_icpp(45)%y_centroid": 11.384970 * D,
+"patch_icpp(45)%radius": 0.100000 * D,
+# diameter = 10.0 um

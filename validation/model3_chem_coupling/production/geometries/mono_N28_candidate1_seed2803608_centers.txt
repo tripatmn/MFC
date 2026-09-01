@@ -1,0 +1,158 @@
+MONODISPERSE CIRCULAR CLOUD COORDINATES
+========================================
+
+N               = 28
+Candidate       = 1
+Seed            = 2803608
+D               = 50.000000 um
+Rc/D            = 5.000000
+Cloud center x/D = 10.000000
+Cloud center y/D = 8.000000
+Droplet radius/D = 0.500000
+
+Patch  ID   x_local/D   y_local/D   x_centroid/D   y_centroid/D   x_um   y_um   radius/D
+------------------------------------------------------------------------------------------
+    3    1   -3.748650    0.971532       6.251350       8.971532    312.568    448.577  0.500000
+    4    2   -2.948427   -0.025651       7.051573       7.974349    352.579    398.717  0.500000
+    5    3    0.914180    2.299754      10.914180      10.299754    545.709    514.988  0.500000
+    6    4   -0.422669   -1.557404       9.577331       6.442596    478.867    322.130  0.500000
+    7    5    1.213754    3.689264      11.213754      11.689264    560.688    584.463  0.500000
+    8    6   -1.779547   -3.295019       8.220453       4.704981    411.023    235.249  0.500000
+    9    7   -2.573991    2.061763       7.426009      10.061763    371.300    503.088  0.500000
+   10    8    0.557850   -0.737473      10.557850       7.262527    527.892    363.126  0.500000
+   11    9   -0.895374    4.055741       9.104626      12.055741    455.231    602.787  0.500000
+   12   10   -1.196712    2.666242       8.803288      10.666242    440.164    533.312  0.500000
+   13   11   -1.797917   -0.663098       8.202083       7.336902    410.104    366.845  0.500000
+   14   12   -1.319611    1.131385       8.680389       9.131385    434.019    456.569  0.500000
+   15   13    2.298869   -2.122272      12.298869       5.877728    614.943    293.886  0.500000
+   16   14   -3.083038   -1.546894       6.916962       6.453106    345.848    322.655  0.500000
+   17   15    4.028972   -0.729930      14.028972       7.270070    701.449    363.503  0.500000
+   18   16    0.602467   -2.673065      10.602467       5.326935    530.123    266.347  0.500000
+   19   17    2.524938    0.097237      12.524938       8.097237    626.247    404.862  0.500000
+   20   18    3.482669    1.035358      13.482669       9.035358    674.133    451.768  0.500000
+   21   19    2.806869    3.432154      12.806869      11.432154    640.343    571.608  0.500000
+   22   20    0.091779   -4.001716      10.091779       3.998284    504.589    199.914  0.500000
+   23   21    1.999264   -4.014528      11.999264       3.985472    599.963    199.274  0.500000
+   24   22    0.923436    1.031982      10.923436       9.031982    546.172    451.599  0.500000
+   25   23   -1.615052   -2.037679       8.384948       5.962321    419.247    298.116  0.500000
+   26   24    3.667676   -2.094484      13.667676       5.905516    683.384    295.276  0.500000
+   27   25    2.127683    1.875500      12.127683       9.875500    606.384    493.775  0.500000
+   28   26   -3.210509   -2.765385       6.789491       5.234615    339.475    261.731  0.500000
+   29   27   -0.080670    0.326587       9.919330       8.326587    495.967    416.329  0.500000
+   30   28   -2.592265    3.305456       7.407735      11.305456    370.387    565.273  0.500000
+
+
+MFC-STYLE PATCH COORDINATES
+===========================
+
+"patch_icpp(3)%x_centroid": 6.251350 * D,
+"patch_icpp(3)%y_centroid": 8.971532 * D,
+"patch_icpp(3)%radius": 0.500000 * D,
+
+"patch_icpp(4)%x_centroid": 7.051573 * D,
+"patch_icpp(4)%y_centroid": 7.974349 * D,
+"patch_icpp(4)%radius": 0.500000 * D,
+
+"patch_icpp(5)%x_centroid": 10.914180 * D,
+"patch_icpp(5)%y_centroid": 10.299754 * D,
+"patch_icpp(5)%radius": 0.500000 * D,
+
+"patch_icpp(6)%x_centroid": 9.577331 * D,
+"patch_icpp(6)%y_centroid": 6.442596 * D,
+"patch_icpp(6)%radius": 0.500000 * D,
+
+"patch_icpp(7)%x_centroid": 11.213754 * D,
+"patch_icpp(7)%y_centroid": 11.689264 * D,
+"patch_icpp(7)%radius": 0.500000 * D,
+
+"patch_icpp(8)%x_centroid": 8.220453 * D,
+"patch_icpp(8)%y_centroid": 4.704981 * D,
+"patch_icpp(8)%radius": 0.500000 * D,
+
+"patch_icpp(9)%x_centroid": 7.426009 * D,
+"patch_icpp(9)%y_centroid": 10.061763 * D,
+"patch_icpp(9)%radius": 0.500000 * D,
+
+"patch_icpp(10)%x_centroid": 10.557850 * D,
+"patch_icpp(10)%y_centroid": 7.262527 * D,
+"patch_icpp(10)%radius": 0.500000 * D,
+
+"patch_icpp(11)%x_centroid": 9.104626 * D,
+"patch_icpp(11)%y_centroid": 12.055741 * D,
+"patch_icpp(11)%radius": 0.500000 * D,
+
+"patch_icpp(12)%x_centroid": 8.803288 * D,
+"patch_icpp(12)%y_centroid": 10.666242 * D,
+"patch_icpp(12)%radius": 0.500000 * D,
+
+"patch_icpp(13)%x_centroid": 8.202083 * D,
+"patch_icpp(13)%y_centroid": 7.336902 * D,
+"patch_icpp(13)%radius": 0.500000 * D,
+
+"patch_icpp(14)%x_centroid": 8.680389 * D,
+"patch_icpp(14)%y_centroid": 9.131385 * D,
+"patch_icpp(14)%radius": 0.500000 * D,
+
+"patch_icpp(15)%x_centroid": 12.298869 * D,
+"patch_icpp(15)%y_centroid": 5.877728 * D,
+"patch_icpp(15)%radius": 0.500000 * D,
+
+"patch_icpp(16)%x_centroid": 6.916962 * D,
+"patch_icpp(16)%y_centroid": 6.453106 * D,
+"patch_icpp(16)%radius": 0.500000 * D,
+
+"patch_icpp(17)%x_centroid": 14.028972 * D,
+"patch_icpp(17)%y_centroid": 7.270070 * D,
+"patch_icpp(17)%radius": 0.500000 * D,
+
+"patch_icpp(18)%x_centroid": 10.602467 * D,
+"patch_icpp(18)%y_centroid": 5.326935 * D,
+"patch_icpp(18)%radius": 0.500000 * D,
+
+"patch_icpp(19)%x_centroid": 12.524938 * D,
+"patch_icpp(19)%y_centroid": 8.097237 * D,
+"patch_icpp(19)%radius": 0.500000 * D,
+
+"patch_icpp(20)%x_centroid": 13.482669 * D,
+"patch_icpp(20)%y_centroid": 9.035358 * D,
+"patch_icpp(20)%radius": 0.500000 * D,
+
+"patch_icpp(21)%x_centroid": 12.806869 * D,
+"patch_icpp(21)%y_centroid": 11.432154 * D,
+"patch_icpp(21)%radius": 0.500000 * D,
+
+"patch_icpp(22)%x_centroid": 10.091779 * D,
+"patch_icpp(22)%y_centroid": 3.998284 * D,
+"patch_icpp(22)%radius": 0.500000 * D,
+
+"patch_icpp(23)%x_centroid": 11.999264 * D,
+"patch_icpp(23)%y_centroid": 3.985472 * D,
+"patch_icpp(23)%radius": 0.500000 * D,
+
+"patch_icpp(24)%x_centroid": 10.923436 * D,
+"patch_icpp(24)%y_centroid": 9.031982 * D,
+"patch_icpp(24)%radius": 0.500000 * D,
+
+"patch_icpp(25)%x_centroid": 8.384948 * D,
+"patch_icpp(25)%y_centroid": 5.962321 * D,
+"patch_icpp(25)%radius": 0.500000 * D,
+
+"patch_icpp(26)%x_centroid": 13.667676 * D,
+"patch_icpp(26)%y_centroid": 5.905516 * D,
+"patch_icpp(26)%radius": 0.500000 * D,
+
+"patch_icpp(27)%x_centroid": 12.127683 * D,
+"patch_icpp(27)%y_centroid": 9.875500 * D,
+"patch_icpp(27)%radius": 0.500000 * D,
+
+"patch_icpp(28)%x_centroid": 6.789491 * D,
+"patch_icpp(28)%y_centroid": 5.234615 * D,
+"patch_icpp(28)%radius": 0.500000 * D,
+
+"patch_icpp(29)%x_centroid": 9.919330 * D,
+"patch_icpp(29)%y_centroid": 8.326587 * D,
+"patch_icpp(29)%radius": 0.500000 * D,
+
+"patch_icpp(30)%x_centroid": 7.407735 * D,
+"patch_icpp(30)%y_centroid": 11.305456 * D,
+"patch_icpp(30)%radius": 0.500000 * D,

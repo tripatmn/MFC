@@ -10,6 +10,7 @@ exercises configurations that are meant to pass).
 import unittest
 
 from .case_validator import CaseConstraintError, CaseValidator
+from .params import REGISTRY
 
 # A minimal 1D case that passes simulation validation.
 BASE = {
@@ -142,9 +143,19 @@ class ConstraintTestCase(unittest.TestCase):
         the test, rather than being stringified into something an assertion
         might accept.
         """
+        return self.errors_for_stage(params, "simulation")
+
+    def errors_for_stage(self, params, stage: str) -> str:
+        """Return constraint violations for one target stage, or "" if it validates.
+
+        Only CaseConstraintError is caught. Anything else -- a KeyError or
+        TypeError from a regression in the validator -- propagates and fails
+        the test, rather than being stringified into something an assertion
+        might accept.
+        """
         validator = CaseValidator(dict(params))
         try:
-            validator.validate("simulation")
+            validator.validate(stage)
         except CaseConstraintError as exc:
             return str(exc)
         return ""
@@ -163,6 +174,49 @@ class ConstraintTestCase(unittest.TestCase):
         silently satisfying a narrower check.
         """
         self.assertEqual(self.errors_for(params), "")
+
+    def assertRejectsStage(self, params, stage: str, expected: str):
+        """params must fail validation for stage, and expected must name the reason."""
+        errors = self.errors_for_stage(params, stage)
+        self.assertNotEqual(errors, "", f"expected {stage} validation to fail with {expected!r}, but the case was accepted")
+        self.assertIn(expected, errors)
+
+    def assertAcceptsStage(self, params, stage: str):
+        """params must validate cleanly for one target stage."""
+        self.assertEqual(self.errors_for_stage(params, stage), "")
+
+
+class TestInitialConditionPatchCapacity(ConstraintTestCase):
+    def _patch_case(self, num_patches):
+        params = {**BASE, "num_patches": num_patches}
+        for i in range(2, num_patches + 1):
+            px = f"patch_icpp({i})%"
+            params.update({
+                f"{px}geometry": 1,
+                f"{px}x_centroid": 0.5,
+                f"{px}length_x": 1.0,
+                f"{px}vel(1)": 0.0,
+                f"{px}pres": 1.0,
+                f"{px}alpha_rho(1)": 1.0,
+                f"{px}alpha(1)": 1.0,
+                f"{px}alter_patch(1)": "T",
+            })
+        return params
+
+    def test_registry_recognizes_patch_30_attributes(self):
+        self.assertTrue(REGISTRY.is_known_param("patch_icpp(30)%geometry"))
+        self.assertTrue(REGISTRY.is_known_param("patch_icpp(30)%alpha_rho(1)"))
+        self.assertTrue(REGISTRY.is_known_param("patch_icpp(30)%vel(1)"))
+        self.assertTrue(REGISTRY.is_known_param("patch_icpp(30)%alter_patch(29)"))
+
+    def test_registry_rejects_patch_above_max(self):
+        self.assertFalse(REGISTRY.is_known_param("patch_icpp(65)%geometry"))
+
+    def test_accepts_30_initial_condition_patches(self):
+        self.assertAcceptsStage(self._patch_case(30), "pre_process")
+
+    def test_rejects_more_than_num_patches_max(self):
+        self.assertRejectsStage(self._patch_case(65), "pre_process", "num_patches must be <= 64")
 
 
 class TestImmersedBoundaryFlags(ConstraintTestCase):

@@ -29,15 +29,13 @@ def _fc(name: str, default: int) -> int:
 NF = _fc("num_fluids_max", 10)  # fluid_pp
 NPR = _fc("num_probes_max", 10)  # probe, acoustic
 NB = _fc("num_bc_patches_max", 10)  # patch_bc
-NUM_PATCHES_MAX = _fc("num_patches_max", 10)  # patch_icpp (Fortran array bound)
+NUM_PATCHES_MAX = _fc("num_patches_max", 64)  # patch_icpp (Fortran array bound)
 NIB = _fc("num_ib_patches_max_namelist", 54000)  # patch_ib namelist array bound
 NAF = _fc("num_ib_airfoils_max", 5)  # ib_airfoil (Fortran array bound)
 NSM = _fc("num_stl_models_max", 10)  # stl_models (Fortran array bound)
 NPB = _fc("num_particle_clouds_max", 10)  # particle_cloud (Fortran array bound)
 # Enumeration limits for families not yet converted to IndexedFamily.
-# These are smaller than the Fortran array bounds to keep the registry compact.
-# The CONSTRAINTS dict below uses the Fortran constants for validation.
-NP = 10  # patch_icpp: has per-index variations, can't easily be IndexedFamily
+NP = NUM_PATCHES_MAX  # patch_icpp: has per-index variations, can't easily be IndexedFamily
 NA = 4  # acoustic sources: enumerated individually
 
 
@@ -854,7 +852,7 @@ def _load():
 
     # INDEXED PARAMETERS
 
-    # patch_icpp (10 patches)
+    # patch_icpp
     for i in range(1, NP + 1):
         px = f"patch_icpp({i})%"
         for a in ["geometry", "smooth_patch_id", "hcid", "model_id"]:
